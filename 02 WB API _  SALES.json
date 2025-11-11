@@ -1,0 +1,952 @@
+{
+  "name": "02 WB API |  SALES",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node: вычисляет dateFrom + добавляет сводку text + ограничивает поток по приоритету\n *\n * Правила dateFrom:\n * 1) sales_status == null → dateFrom = (МСк сегодня − 15 дней), YYYY-MM-DD\n * 2) status == 'left':\n *    2.1) если maxDateFrom >  (МСк сегодня − 180 дней) → dateFrom = (МСк сегодня − 180 дней)\n *    2.2) если maxDateFrom <= (МСк сегодня − 180 дней) → dateFrom = rightBoundary (YYYY-MM-DD)\n * 3) status == 'right' → dateFrom = (rightBoundary − 15 дней), YYYY-MM-DD\n * Fallback: lastDateFrom → maxDateFrom → (МСк сегодня − 15 дней)\n *\n * Ограничение потока (приоритеты):\n * 1) если есть \"новые\" (sales_status == null) → пропускаем всех \"new\", остальные ✖️\n * 2) иначе, если есть \"left\" → пропускаем только ОДНОГО left (с самым старым sales_status.nowTime), остальные ✖️\n * 3) иначе, если все \"right\" → пропускаем всех right\n * 4) иначе (смешанные статусы, например есть 'error') → никого не пропускаем\n *\n * В поле text каждой пропущенной записи — сводка по всем селлерам:\n * \"<status> | dateFrom: <YYYY-MM-DD> | <wb_api_brand> <✅/✖️>\"\n */\n\nconst items = $input.all();\n\n/* ── Утилиты времени ─────────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst nowMskDate = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst ymdMskMinusDays = (days) => {\n  const mskNow = nowMskDate();\n  const shifted = new Date(mskNow.getTime() - days * MS_DAY);\n  return ymdUTC(shifted);\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst subDaysFromYMD = (ymd, days) => {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(String(ymd));\n  if (!m) return null;\n  const t = Date.UTC(+m[1], +m[2] - 1, +m[3]) - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\n/* ── Порог 180 дней ─────────────────────────── */\nconst threshold180 = ymdMskMinusDays(180);\n\n/* ── Шаг 1. Посчитаем dateFrom для каждой строки и соберём по селлерам ── */\nconst perSeller = new Map(); // seller_id -> { brand, statusCat, dateFrom, nowTime, idx, rows: [] }\nconst processed = items.map((it, idx) => {\n  const j = { ...it.json };\n  const os = j.sales_status ?? null;\n\n  let dateFrom;\n\n  if (os == null) {\n    // Новый селлер\n    dateFrom = ymdMskMinusDays(15);\n  } else {\n    const status    = os.status ?? null;\n    const rbYMD     = firstYMD(os.rightBoundary);\n    const lastDFYMD = firstYMD(os.lastDateFrom);\n    const maxDFYMD  = firstYMD(os.maxDateFrom);\n\n    if (status === 'right') {\n      // Правое «доскачивание»\n      dateFrom = rbYMD\n        ? (subDaysFromYMD(rbYMD, 15) ?? ymdMskMinusDays(15))\n        : (lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15));\n    } else if (status === 'left') {\n      // Вилка для left — строгое разделение > и <=\n      if (maxDFYMD && maxDFYMD > threshold180) {\n        // Ещё НЕ пробовали 180 дней — пробуем\n        dateFrom = threshold180;\n      } else if (maxDFYMD && maxDFYMD <= threshold180) {\n        // Уже пробовали 180 (или раньше) — упёрлись в 80k → идём от правой границы\n        dateFrom = rbYMD ?? threshold180 ?? ymdMskMinusDays(15);\n      } else {\n        // maxDateFrom отсутствует — мягкие фоллбеки\n        dateFrom = lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15);\n      }\n    } else {\n      // Прочие статусы/пусто — стандартные фоллбеки\n      dateFrom = lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15);\n    }\n  }\n\n  j.dateFrom = dateFrom;\n\n  const sellerId = String(j.seller_id ?? '').trim();\n  if (sellerId) {\n    const brand = (String(j.wb_api_brand ?? '').trim()) || sellerId;\n    const statusRaw = os?.status ?? (os == null ? null : undefined);\n    const statusCat = (os == null) ? 'new' : (statusRaw === 'left' ? 'left' : (statusRaw === 'right' ? 'right' : 'other'));\n    const nowTime = (os && typeof os.nowTime === 'string') ? os.nowTime : null;\n\n    const bucket = perSeller.get(sellerId) || {\n      brand,\n      statusCat,\n      dateFrom,       // возьмём первый посчитанный dateFrom как репрезентативный\n      nowTime,\n      idx,            // индекс первого появления для стабильного выбора\n      rows: [],\n    };\n    // обновим только то, что пусто — чтобы сохранять стабильность\n    if (!bucket.brand)     bucket.brand = brand;\n    if (!bucket.dateFrom)  bucket.dateFrom = dateFrom;\n    if (!bucket.nowTime && nowTime) bucket.nowTime = nowTime;\n    // если встретился более приоритетный statusCat для этого seller (не должен меняться в батче, но на всякий)\n    const rank = { new: 3, left: 2, right: 1, other: 0 };\n    if (rank[statusCat] > rank[bucket.statusCat]) bucket.statusCat = statusCat;\n\n    bucket.rows.push(j);\n    perSeller.set(sellerId, bucket);\n  }\n\n  return { json: j };\n});\n\n/* ── Шаг 2. Выберем, кого пропускать ─────────────────────── */\n\nconst allSellers = Array.from(perSeller.entries()).map(([seller_id, info]) => ({ seller_id, ...info }));\nconst newGroup   = allSellers.filter(s => s.statusCat === 'new');\nconst leftGroup  = allSellers.filter(s => s.statusCat === 'left');\nconst rightGroup = allSellers.filter(s => s.statusCat === 'right');\nconst otherGroup = allSellers.filter(s => s.statusCat === 'other');\n\nconst allowSet = new Set();\n\nif (newGroup.length > 0) {\n  // Пропускаем всех новых\n  for (const s of newGroup) allowSet.add(s.seller_id);\n} else if (leftGroup.length > 0) {\n  // Пропускаем ровно одного left: с самым старым nowTime; если нет nowTime — по порядку входа\n  const parseTs = (s) => {\n    const m = String(s.nowTime ?? '').match(/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2}):(\\d{2})$/);\n    if (!m) return Number.POSITIVE_INFINITY; // без nowTime уводим в конец\n    // Превратим в timestamp UTC для сравнения\n    const ts = Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]);\n    return ts;\n  };\n  leftGroup.sort((a, b) => {\n    const ta = parseTs(a);\n    const tb = parseTs(b);\n    if (ta !== tb) return ta - tb;        // старее → раньше\n    return a.idx - b.idx;                 // стабильность по порядку входа\n  });\n  allowSet.add(leftGroup[0].seller_id);\n} else {\n  // Нет new/left → если ВСЕ right, то пропускаем всех right\n  if (rightGroup.length > 0 && rightGroup.length === allSellers.length) {\n    for (const s of rightGroup) allowSet.add(s.seller_id);\n  } else {\n    // Смешанные статусы (например, есть 'other') — никого не пропускаем\n  }\n}\n\n/* ── Шаг 3. Сформируем сводку с отметками и отфильтруем поток ───────── */\n\nconst lines = allSellers\n  .sort((a, b) => a.brand.localeCompare(b.brand, 'ru'))\n  .map(s => {\n    const statusForText = s.statusCat;\n    const mark = allowSet.has(s.seller_id) ? '✅' : '✖️';\n    return `${statusForText} | dateFrom: ${s.dateFrom} | ${s.brand} ${mark}`;\n  });\n\nconst summaryText = lines.join('\\n');\n\n/* Проставим text в каждый проходящий item */\nconst passed = [];\nfor (const it of processed) {\n  const sid = String(it.json.seller_id ?? '').trim();\n  if (allowSet.has(sid)) {\n    it.json.text = summaryText;\n    passed.push(it);\n  }\n}\n\n/* Возвращаем ТОЛЬКО пропущенных по приоритету */\nreturn passed;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        -672
+      ],
+      "id": "ae9168bb-86ba-489a-bc42-9122fd7ef4d6",
+      "name": "create_dateFrom"
+    },
+    {
+      "parameters": {
+        "url": "https://statistics-api.wildberries.ru/api/v1/supplier/sales",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "dateFrom",
+              "value": "={{ $json.dateFrom }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.wb_api_key }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f51e04b3-6012-498d-b5ec-b78e4a7a8d40",
+      "name": "get_orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        -400
+      ],
+      "alwaysOutputData": true,
+      "notesInFlow": true,
+      "onError": "continueRegularOutput",
+      "notes": "1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        1424,
+        -416
+      ],
+      "id": "433391b4-a925-41fe-8630-2ec0b59aefd9",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2560,
+        -416
+      ],
+      "id": "570e0716-b573-4f18-b4f3-48711721f9d6",
+      "name": "send_logs_finish1",
+      "webhookId": "7bdca7df-f3e1-49bd-b7dc-96e616f65f52",
+      "retryOnFail": false,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1072,
+        -672
+      ],
+      "id": "bcd70af3-2609-461a-910e-f09681624cb1",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "batchSize": 5000,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1936,
+        -688
+      ],
+      "id": "a4d495f3-002f-4287-82ae-4298cb7a0759",
+      "name": "Loop1"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node\n * Вывод: ровно один item { json: { text: \"<строки по селлерам>\" } }\n * Формат строки: \"YYYY-MM-DD(min) · YYYY-MM-DD(max) · <count spaced> · wb_api_brand\"\n */\n\nconst items = $input.all();\n\n/* Утилиты */\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\nconst minStr = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxStr = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n// Форматирование числа с пробелами между тысячами\nconst fmtInt = (n) =>\n  new Intl.NumberFormat('ru-RU').format(Number(n) || 0).replace(/\\u00A0/g, ' ');\n\n/* Агрегируем по seller_id (бренд берём из wb_api_brand, fallback — seller_id) */\nconst bySeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim() || 'unknown';\n  const brand    = String(json.wb_api_brand ?? '').trim() || sellerId;\n\n  const ymd = firstYMD(json.date) ?? firstYMD(json.lastChangeDate);\n\n  const entry = bySeller.get(sellerId) || { brand, min: null, max: null, cnt: 0 };\n  entry.cnt += 1;\n  if (ymd) {\n    entry.min = minStr(entry.min, ymd);\n    entry.max = maxStr(entry.max, ymd);\n  }\n  entry.brand = entry.brand || brand;\n  bySeller.set(sellerId, entry);\n}\n\n/* Формируем строки; сортировка по бренду */\nconst lines = Array.from(bySeller.values())\n  .sort((a, b) => a.brand.localeCompare(b.brand, 'ru'))\n  .map(e => `${e.min ?? '-'} · ${e.max ?? '-'} · ${fmtInt(e.cnt)} · ${e.brand}`);\n\nreturn [{ json: { text: lines.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1936,
+        -992
+      ],
+      "id": "4058f325-259a-449c-b347-6b5b7a407cad",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все входящие элементы\nconst items = $input.all();\n\n// Безопасно получаем стартовое время из узла\nconst startNode = $node[\"send_start\"];\nconst startTime = startNode?.json?.result?.date;\n\n// Заголовок\nlet summaryMessage = `<b>02 WB API | Sales</b> завершен ✅\\n`;\n\nif (startTime) {\n  const endTime = Math.floor(Date.now() / 1000);\n  const executionTime = endTime - startTime;\n  const minutes = Math.floor(executionTime / 60);\n  const seconds = executionTime % 60;\n  summaryMessage += `<blockquote>Время: ${minutes} мин ${seconds} сек</blockquote>`;\n}\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2560,
+        -704
+      ],
+      "id": "96138c84-e17f-4492-ae0f-f7acec71de5c",
+      "name": "collapse2",
+      "executeOnce": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Собираем заказы из WB [Метод](https://dev.wildberries.ru/openapi/reports/#tag/Osnovnye-otchyoty/paths/~1api~1v1~1supplier~1orders/get)\n",
+        "height": 552,
+        "width": 628
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        992,
+        -752
+      ],
+      "id": "4cb20fca-9c6b-4fe3-94a3-bbfdf304c6ce",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## Сохраняем в БД\n\n",
+        "height": 388,
+        "width": 624
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -752
+      ],
+      "id": "87fdbf02-e68a-4774-b5d7-0300ab489b58",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — обновление sales_status по каждому seller_id\n *\n * Вход: много строк-заказов от разных селлеров.\n * Выход: по одному item на селлера:\n *   {\n *     json: {\n *       seller_id: \"...\",\n *       sales_status: {\n *         maxDateFrom, status, lastTotalSales,\n *         leftBoundary, rightBoundary, lastDateFrom, nowTime\n *       }\n *     }\n *   }\n *\n * Правила (кратко):\n * - Если sales_status == null (впервые видим селлера):\n *     maxDateFrom = текущий dateFrom\n *     status = 'left'\n *     lastTotalSales = кол-во строк по селлеру в этом батче\n *     leftBoundary/rightBoundary = min/max по полю date (YYYY-MM-DD)\n *     lastDateFrom = текущий dateFrom\n *     nowTime = текущее время по МСК (YYYY-MM-DD HH:MM:SS)\n *\n * - Если sales_status != null:\n *     maxDateFrom = min(старый maxDateFrom, текущий dateFrom)\n *     status = 'right', если:\n *        (A) старый status уже 'right'\n *        ИЛИ\n *        (B) текущий dateFrom <= (МСК сегодня - 180 дней) И lastTotalSales в (1..79999)\n *        ИЛИ\n *        (C) старый maxDateFrom <= (МСК сегодня - 180 дней) И lastTotalSales в (1..79999)\n *       иначе status = 'left'\n *     Остальные поля обновляются аналогично впервые.\n */\n\nconst items = $input.all();\n\n/* ── Утилиты ─────────────────────────────────────────────── */\n\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\n\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  const t = d.getTime() - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMD = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Группируем вход по seller_id ────────────────────────── */\n\nconst perSeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  const bucket = perSeller.get(sellerId) || {\n    rows: [],\n    // возьмём первый ненулевой sales_status как \"старый\"\n    prevStatus: null,\n    // возьмём первый dateFrom (обычно он одинаковый для всех строк селлера)\n    dateFromYMD: null,\n  };\n\n  bucket.rows.push(json);\n\n  if (!bucket.prevStatus && json.sales_status) {\n    bucket.prevStatus = json.sales_status;\n  }\n\n  // зафиксируем dateFrom из строки (ожидаем одинаковый для селлера)\n  if (!bucket.dateFromYMD && json.dateFrom) {\n    bucket.dateFromYMD = firstYMD(json.dateFrom);\n  }\n\n  perSeller.set(sellerId, bucket);\n}\n\n/* ── Порог для 180 дней ──────────────────────────────────── */\n\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обрабатываем каждого селлера ────────────────────────── */\n\nconst out = [];\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const rows = bucket.rows;\n  const count = rows.length;\n\n  // Границы по дате заказа (поле `date`)\n  let leftBoundary = null;\n  let rightBoundary = null;\n\n  for (const r of rows) {\n    const ymd = firstYMD(r.date) ?? firstYMD(r.lastChangeDate);\n    if (ymd) {\n      leftBoundary = minYMD(leftBoundary, ymd);\n      rightBoundary = maxYMD(rightBoundary, ymd);\n    }\n  }\n\n  // Текущий dateFrom из батча\n  const currentDateFrom = bucket.dateFromYMD || null;\n\n  // Предыдущее состояние (как пришло во входе ДО обновления)\n  const prev = bucket.prevStatus ?? null;\n  const prevStatus = prev?.status ?? null;\n  const prevMaxDateFrom = firstYMD(prev?.maxDateFrom);\n\n  // Вычисляем новые поля\n  let newMaxDateFrom;\n  let newStatus;\n\n  if (!prev) {\n    // Впервые видим селлера\n    newMaxDateFrom = currentDateFrom || null;\n    newStatus = 'left';\n  } else {\n    // maxDateFrom = более левая (ранняя) из старой и текущей\n    newMaxDateFrom = minYMD(prevMaxDateFrom, currentDateFrom) || prevMaxDateFrom || currentDateFrom || null;\n\n    const countOk = count > 0 && count < 80000;\n    const condB = currentDateFrom && (currentDateFrom <= threshold180) && countOk;\n    const condC = prevMaxDateFrom && (prevMaxDateFrom <= threshold180) && countOk;\n\n    if (prevStatus === 'right' || condB || condC) {\n      newStatus = 'right';\n    } else {\n      newStatus = 'left';\n    }\n  }\n\n  const result = {\n    seller_id: sellerId,\n    sales_status: {\n      maxDateFrom: newMaxDateFrom || null,\n      status: newStatus,\n      lastTotalSales: count,\n      leftBoundary: leftBoundary || null,\n      rightBoundary: rightBoundary || null,\n      lastDateFrom: currentDateFrom || null,\n      nowTime: ymdHmsUTC(nowMSK()), // текущее время по МСК\n    },\n  };\n\n  out.push({ json: result });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1936,
+        -256
+      ],
+      "id": "fc258205-e1e1-4525-8352-d25f4d01d720",
+      "name": "create_status"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": {
+          "__rl": true,
+          "value": "WB_sellers_updates",
+          "mode": "list",
+          "cachedResultName": "WB_sellers_updates"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_id",
+        "valueToMatchOn": "={{ $json.seller_id }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "sales_status",
+              "value": "={{ JSON.stringify($json.sales_status) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2256,
+        -256
+      ],
+      "id": "b6b7023b-c9ed-4db1-af05-850d19273ef3",
+      "name": "ins_upd_orders1",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM `WB_sellers` WHERE `gs_rnp_access`='1'",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        368,
+        -672
+      ],
+      "id": "e1413914-99d8-44c3-8b9a-6cc1317c9e23",
+      "name": "get_allsellers_accessrnp",
+      "executeOnce": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = items.map(item => item.json);\n\n// Собираем список брендов\nconst brandLines = data.map(entry => `▫️${entry.wb_api_brand} | ${entry.wb_api_nameseller}`);\n\n// Создаем текстовое сообщение\nconst text = `<b>Запускаю обновление  РНП</b>\n<blockquote><b>В работу взяты ${brandLines.length} брендов:</b>\n${brandLines.join('\\n')}\n</blockquote>`;\n\nreturn [{ json: { text } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        -384
+      ],
+      "id": "215bc894-8ff3-4ec3-b55d-8d51748126c9",
+      "name": "Code2",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "content": "Добавление в список обновления РНП",
+        "height": 520,
+        "width": 676
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -128,
+        -720
+      ],
+      "id": "d6799730-478b-4a27-a545-767fd87041be",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO WB_sellers_updates (\n    seller_id,\n    telegram_username,\n    wb_api_nameseller,\n    wb_api_brand,\n    in_workrnp\n)\nSELECT\n    seller_id,\n    telegram_username,\n    wb_api_nameseller,\n    wb_api_brand,\n    gs_rnp_access AS in_workrnp\nFROM WB_sellers\nWHERE gs_rnp_access = 1\nON DUPLICATE KEY UPDATE\n    telegram_username   = VALUES(telegram_username),\n    wb_api_nameseller   = VALUES(wb_api_nameseller),\n    wb_api_brand        = VALUES(wb_api_brand),\n    in_workrnp          = VALUES(in_workrnp);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        160,
+        -672
+      ],
+      "id": "29a0232f-6988-4942-8bb7-815f941ffb8c",
+      "name": "get_active_list",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  s.seller_id,\n  s.wb_api_key,\n  s.wb_api_brand,\n  su.sales_status\nFROM WB_sellers AS s\nJOIN WB_sellers_updates AS su\n  ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        672,
+        -384
+      ],
+      "id": "d8a94fff-1dd2-416f-ad1c-6058cedf68ae",
+      "name": "get_all_token",
+      "executeOnce": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        144,
+        -384
+      ],
+      "id": "45b885aa-e469-4167-8dc8-6a1985bac6f6",
+      "name": "send_start",
+      "webhookId": "73bcc341-5a9c-4ee3-a5ea-8027ea976464",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "disabled": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        368,
+        -384
+      ],
+      "id": "6c523f9b-0f16-45c5-a8b4-af35819ec2fa",
+      "name": "Wait",
+      "webhookId": "6c6d848b-31fa-40ae-8b4a-080280a1f5a7",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_create').first().json.result.message_id }}",
+        "text": "=<b>02 WB API</b> | Sales\n<blockquote><b>Собраны данные из WB</b>\n{{ $json.text }}</blockquote> ",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2240,
+        -992
+      ],
+      "id": "c890e8c3-b1c8-457a-bd3d-eae7e324d784",
+      "name": "send_logs_finish",
+      "webhookId": "76e85503-acb2-4520-896b-a7adcb35f650",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>02 WB API</b> | Sales\n<blockquote>{{ $json.text }}</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        848,
+        -816
+      ],
+      "id": "bd2c497c-941a-4b7e-900d-e0147d37f2e7",
+      "name": "send_create",
+      "webhookId": "26b3d10a-750c-4be9-a3cb-08cadbf6d7f0",
+      "retryOnFail": false,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Отправка количества заказов в тг\n\n\n",
+        "height": 244,
+        "width": 624
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -1056
+      ],
+      "id": "bb2ec11b-d10c-490f-97c0-704e8e560508",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Формирование статуса\n\n\n",
+        "height": 420,
+        "width": 624
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -320
+      ],
+      "id": "71975785-dd3a-43a5-8b2f-5137890ced38",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>02 WB API</b> | Sales\n<blockquote>Статус обновлен ✅</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1952,
+        -48
+      ],
+      "id": "be70a77f-a326-4808-b80f-8a247baa616f",
+      "name": "send_create1",
+      "webhookId": "aae4a473-2aa1-4a36-9c27-794f7b994377",
+      "retryOnFail": false,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "WB_sales",
+          "mode": "list",
+          "cachedResultName": "WB_sales"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "srid_seller_sale_key",
+        "valueToMatchOn": "={{ $json.srid + \"_\" + $json.seller_id + \"_\" + $json.saleID }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "date",
+              "value": "={{ $json.date }}"
+            },
+            {
+              "column": "lastChangeDate",
+              "value": "={{ $json.lastChangeDate }}"
+            },
+            {
+              "column": "warehouseName",
+              "value": "={{ $json.warehouseName }}"
+            },
+            {
+              "column": "warehouseType",
+              "value": "={{ $json.warehouseType }}"
+            },
+            {
+              "column": "countryName",
+              "value": "={{ $json.countryName }}"
+            },
+            {
+              "column": "oblastOkrugName",
+              "value": "={{ $json.oblastOkrugName }}"
+            },
+            {
+              "column": "regionName",
+              "value": "={{ $json.regionName }}"
+            },
+            {
+              "column": "supplierArticle",
+              "value": "={{ $json.supplierArticle }}"
+            },
+            {
+              "column": "nmId",
+              "value": "={{ $json.nmId }}"
+            },
+            {
+              "column": "barcode",
+              "value": "={{ $json.barcode }}"
+            },
+            {
+              "column": "category",
+              "value": "={{ $json.category }}"
+            },
+            {
+              "column": "subject",
+              "value": "={{ $json.subject }}"
+            },
+            {
+              "column": "brand",
+              "value": "={{ $json.brand }}"
+            },
+            {
+              "column": "techSize",
+              "value": "={{ $json.techSize }}"
+            },
+            {
+              "column": "incomeID",
+              "value": "={{ $json.incomeID }}"
+            },
+            {
+              "column": "isSupply",
+              "value": "={{ $json.isSupply }}"
+            },
+            {
+              "column": "isRealization",
+              "value": "={{ $json.isRealization }}"
+            },
+            {
+              "column": "totalPrice",
+              "value": "={{ $json.totalPrice }}"
+            },
+            {
+              "column": "discountPercent",
+              "value": "={{ $json.discountPercent }}"
+            },
+            {
+              "column": "spp",
+              "value": "={{ $json.spp }}"
+            },
+            {
+              "column": "paymentSaleAmount",
+              "value": "={{ $json.paymentSaleAmount }}"
+            },
+            {
+              "column": "forPay",
+              "value": "={{ $json.forPay }}"
+            },
+            {
+              "column": "finishedPrice",
+              "value": "={{ $json.finishedPrice }}"
+            },
+            {
+              "column": "priceWithDisc",
+              "value": "={{ $json.priceWithDisc }}"
+            },
+            {
+              "column": "saleID",
+              "value": "={{ $json.saleID }}"
+            },
+            {
+              "column": "orderType",
+              "value": "={{ $json.orderType }}"
+            },
+            {
+              "column": "sticker",
+              "value": "={{ $json.sticker }}"
+            },
+            {
+              "column": "gNumber",
+              "value": "={{ $json.gNumber }}"
+            },
+            {
+              "column": "srid",
+              "value": "={{ $json.srid }}"
+            },
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2256,
+        -560
+      ],
+      "id": "e75ab1ea-39a0-42e9-b6fb-5baa616e9240",
+      "name": "ins_upd_sales",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -64,
+        -672
+      ],
+      "id": "48a243fb-4a0b-4a75-a827-f0fa6a208f13",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "kZrBYNYETgmdgov1",
+          "mode": "list",
+          "cachedResultName": "03 WB API | PRODUCTS"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        -48
+      ],
+      "id": "9190c854-3c6e-4f12-8ebe-9340d5a73bd9",
+      "name": "Call '03 WB API | PRODUCTS'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_orders": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "create_status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop1": {
+      "main": [
+        [
+          {
+            "node": "collapse2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ins_upd_sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_dateFrom": {
+      "main": [
+        [
+          {
+            "node": "send_create",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse2": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_status": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_orders1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_allsellers_accessrnp": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "send_start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_active_list": {
+      "main": [
+        [
+          {
+            "node": "get_allsellers_accessrnp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_start": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_token": {
+      "main": [
+        [
+          {
+            "node": "create_dateFrom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "get_all_token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_orders1": {
+      "main": [
+        [
+          {
+            "node": "send_create1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_sales": {
+      "main": [
+        [
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "get_active_list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_create1": {
+      "main": [
+        [
+          {
+            "node": "Call '03 WB API | PRODUCTS'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveExecutionProgress": true
+  },
+  "versionId": "cabb4f7c-7a9a-4705-9e51-f8abe4d0ad90",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "EnXfwoHHhxEQp9vr",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    }
+  ]
+}

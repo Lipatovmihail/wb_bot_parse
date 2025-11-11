@@ -1,0 +1,906 @@
+{
+  "name": "01 WB API | ORDERS copy",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node: вычисляет dateFrom + добавляет сводку text + ограничивает поток по приоритету\n *\n * Правила dateFrom:\n * 1) orders_status == null → dateFrom = (МСк сегодня − 15 дней), YYYY-MM-DD\n * 2) status == 'left':\n *    2.1) если maxDateFrom >  (МСк сегодня − 180 дней) → dateFrom = (МСк сегодня − 180 дней)\n *    2.2) если maxDateFrom <= (МСк сегодня − 180 дней) → dateFrom = rightBoundary (YYYY-MM-DD)\n * 3) status == 'right' → dateFrom = (rightBoundary − 15 дней), YYYY-MM-DD\n * Fallback: lastDateFrom → maxDateFrom → (МСк сегодня − 15 дней)\n *\n * Ограничение потока (приоритеты):\n * 1) если есть \"новые\" (orders_status == null) → пропускаем всех \"new\", остальные ✖️\n * 2) иначе, если есть \"left\" → пропускаем только ОДНОГО left (с самым старым orders_status.nowTime), остальные ✖️\n * 3) иначе, если все \"right\" → пропускаем всех right\n * 4) иначе (смешанные статусы, например есть 'error') → никого не пропускаем\n *\n * В поле text каждой пропущенной записи — сводка по всем селлерам:\n * \"<status> | dateFrom: <YYYY-MM-DD> | <wb_api_brand> <✅/✖️>\"\n */\n\nconst items = $input.all();\n\n/* ── Утилиты времени ─────────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst nowMskDate = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst ymdMskMinusDays = (days) => {\n  const mskNow = nowMskDate();\n  const shifted = new Date(mskNow.getTime() - days * MS_DAY);\n  return ymdUTC(shifted);\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst subDaysFromYMD = (ymd, days) => {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(String(ymd));\n  if (!m) return null;\n  const t = Date.UTC(+m[1], +m[2] - 1, +m[3]) - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\n/* ── Порог 180 дней ─────────────────────────── */\nconst threshold180 = ymdMskMinusDays(180);\n\n/* ── Шаг 1. Посчитаем dateFrom для каждой строки и соберём по селлерам ── */\nconst perSeller = new Map(); // seller_id -> { brand, statusCat, dateFrom, nowTime, idx, rows: [] }\nconst processed = items.map((it, idx) => {\n  const j = { ...it.json };\n  const os = j.orders_status ?? null;\n\n  let dateFrom;\n\n  if (os == null) {\n    // Новый селлер\n    dateFrom = ymdMskMinusDays(15);\n  } else {\n    const status    = os.status ?? null;\n    const rbYMD     = firstYMD(os.rightBoundary);\n    const lastDFYMD = firstYMD(os.lastDateFrom);\n    const maxDFYMD  = firstYMD(os.maxDateFrom);\n\n    if (status === 'right') {\n      // Правое «доскачивание»\n      dateFrom = rbYMD\n        ? (subDaysFromYMD(rbYMD, 15) ?? ymdMskMinusDays(15))\n        : (lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15));\n    } else if (status === 'left') {\n      // Вилка для left — строгое разделение > и <=\n      if (maxDFYMD && maxDFYMD > threshold180) {\n        // Ещё НЕ пробовали 180 дней — пробуем\n        dateFrom = threshold180;\n      } else if (maxDFYMD && maxDFYMD <= threshold180) {\n        // Уже пробовали 180 (или раньше) — упёрлись в 80k → идём от правой границы\n        dateFrom = rbYMD ?? threshold180 ?? ymdMskMinusDays(15);\n      } else {\n        // maxDateFrom отсутствует — мягкие фоллбеки\n        dateFrom = lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15);\n      }\n    } else {\n      // Прочие статусы/пусто — стандартные фоллбеки\n      dateFrom = lastDFYMD ?? maxDFYMD ?? ymdMskMinusDays(15);\n    }\n  }\n\n  j.dateFrom = dateFrom;\n\n  const sellerId = String(j.seller_id ?? '').trim();\n  if (sellerId) {\n    const brand = (String(j.wb_api_brand ?? '').trim()) || sellerId;\n    const statusRaw = os?.status ?? (os == null ? null : undefined);\n    const statusCat = (os == null) ? 'new' : (statusRaw === 'left' ? 'left' : (statusRaw === 'right' ? 'right' : 'other'));\n    const nowTime = (os && typeof os.nowTime === 'string') ? os.nowTime : null;\n\n    const bucket = perSeller.get(sellerId) || {\n      brand,\n      statusCat,\n      dateFrom,       // возьмём первый посчитанный dateFrom как репрезентативный\n      nowTime,\n      idx,            // индекс первого появления для стабильного выбора\n      rows: [],\n    };\n    // обновим только то, что пусто — чтобы сохранять стабильность\n    if (!bucket.brand)     bucket.brand = brand;\n    if (!bucket.dateFrom)  bucket.dateFrom = dateFrom;\n    if (!bucket.nowTime && nowTime) bucket.nowTime = nowTime;\n    // если встретился более приоритетный statusCat для этого seller (не должен меняться в батче, но на всякий)\n    const rank = { new: 3, left: 2, right: 1, other: 0 };\n    if (rank[statusCat] > rank[bucket.statusCat]) bucket.statusCat = statusCat;\n\n    bucket.rows.push(j);\n    perSeller.set(sellerId, bucket);\n  }\n\n  return { json: j };\n});\n\n/* ── Шаг 2. Выберем, кого пропускать ─────────────────────── */\n\nconst allSellers = Array.from(perSeller.entries()).map(([seller_id, info]) => ({ seller_id, ...info }));\nconst newGroup   = allSellers.filter(s => s.statusCat === 'new');\nconst leftGroup  = allSellers.filter(s => s.statusCat === 'left');\nconst rightGroup = allSellers.filter(s => s.statusCat === 'right');\nconst otherGroup = allSellers.filter(s => s.statusCat === 'other');\n\nconst allowSet = new Set();\n\nif (newGroup.length > 0) {\n  // Пропускаем всех новых\n  for (const s of newGroup) allowSet.add(s.seller_id);\n} else if (leftGroup.length > 0) {\n  // Пропускаем ровно одного left: с самым старым nowTime; если нет nowTime — по порядку входа\n  const parseTs = (s) => {\n    const m = String(s.nowTime ?? '').match(/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2}):(\\d{2})$/);\n    if (!m) return Number.POSITIVE_INFINITY; // без nowTime уводим в конец\n    // Превратим в timestamp UTC для сравнения\n    const ts = Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]);\n    return ts;\n  };\n  leftGroup.sort((a, b) => {\n    const ta = parseTs(a);\n    const tb = parseTs(b);\n    if (ta !== tb) return ta - tb;        // старее → раньше\n    return a.idx - b.idx;                 // стабильность по порядку входа\n  });\n  allowSet.add(leftGroup[0].seller_id);\n} else {\n  // Нет new/left → если ВСЕ right, то пропускаем всех right\n  if (rightGroup.length > 0 && rightGroup.length === allSellers.length) {\n    for (const s of rightGroup) allowSet.add(s.seller_id);\n  } else {\n    // Смешанные статусы (например, есть 'other') — никого не пропускаем\n  }\n}\n\n/* ── Шаг 3. Сформируем сводку с отметками и отфильтруем поток ───────── */\n\nconst lines = allSellers\n  .sort((a, b) => a.brand.localeCompare(b.brand, 'ru'))\n  .map(s => {\n    const statusForText = s.statusCat;\n    const mark = allowSet.has(s.seller_id) ? '✅' : '✖️';\n    return `${statusForText} | dateFrom: ${s.dateFrom} | ${s.brand} ${mark}`;\n  });\n\nconst summaryText = lines.join('\\n');\n\n/* Проставим text в каждый проходящий item */\nconst passed = [];\nfor (const it of processed) {\n  const sid = String(it.json.seller_id ?? '').trim();\n  if (allowSet.has(sid)) {\n    it.json.text = summaryText;\n    passed.push(it);\n  }\n}\n\n/* Возвращаем ТОЛЬКО пропущенных по приоритету */\nreturn passed;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        -672
+      ],
+      "id": "7db4eea2-40dd-41a3-821d-595c0c32755e",
+      "name": "create_dateFrom"
+    },
+    {
+      "parameters": {
+        "url": "https://statistics-api.wildberries.ru/api/v1/supplier/orders",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "dateFrom",
+              "value": "={{ $json.dateFrom }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.wb_api_key }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "8681785f-bb12-47ab-bb0e-3d888249d706",
+      "name": "get_orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        -384
+      ],
+      "alwaysOutputData": true,
+      "notesInFlow": true,
+      "onError": "continueRegularOutput",
+      "notes": "1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        1424,
+        -400
+      ],
+      "id": "c303bb21-adc8-44b8-ad95-5b4e154c84ff",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1072,
+        -672
+      ],
+      "id": "1f479865-bdf0-4724-90b9-d5fed399faa7",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node\n * Вывод: ровно один item { json: { text: \"<строки по селлерам>\" } }\n * Формат строки: \"YYYY-MM-DD(min) · YYYY-MM-DD(max) · <count spaced> · wb_api_brand\"\n */\n\nconst items = $input.all();\n\n/* Утилиты */\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\nconst minStr = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxStr = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n// Форматирование числа с пробелами между тысячами\nconst fmtInt = (n) =>\n  new Intl.NumberFormat('ru-RU').format(Number(n) || 0).replace(/\\u00A0/g, ' ');\n\n/* Агрегируем по seller_id (бренд берём из wb_api_brand, fallback — seller_id) */\nconst bySeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim() || 'unknown';\n  const brand    = String(json.wb_api_brand ?? '').trim() || sellerId;\n\n  const ymd = firstYMD(json.date) ?? firstYMD(json.lastChangeDate);\n\n  const entry = bySeller.get(sellerId) || { brand, min: null, max: null, cnt: 0 };\n  entry.cnt += 1;\n  if (ymd) {\n    entry.min = minStr(entry.min, ymd);\n    entry.max = maxStr(entry.max, ymd);\n  }\n  entry.brand = entry.brand || brand;\n  bySeller.set(sellerId, entry);\n}\n\n/* Формируем строки; сортировка по бренду */\nconst lines = Array.from(bySeller.values())\n  .sort((a, b) => a.brand.localeCompare(b.brand, 'ru'))\n  .map(e => `${e.min ?? '-'} · ${e.max ?? '-'} · ${fmtInt(e.cnt)} · ${e.brand}`);\n\nreturn [{ json: { text: lines.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1936,
+        -992
+      ],
+      "id": "59715642-c23d-4fa6-bff2-ee613ec726ab",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "content": "## Собираем заказы из WB [Метод](https://dev.wildberries.ru/openapi/reports/#tag/Osnovnye-otchyoty/paths/~1api~1v1~1supplier~1orders/get)\n",
+        "height": 552,
+        "width": 628
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        992,
+        -752
+      ],
+      "id": "a16feff5-7bbf-477c-ba60-4cebf230a40a",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM `WB_sellers` WHERE `gs_rnp_access`='1'",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        368,
+        -672
+      ],
+      "id": "f207635f-f4c4-4e1b-8abc-34265db6a9c1",
+      "name": "get_allsellers_accessrnp",
+      "credentials": {
+        "mySql": {
+          "id": "DUWK3IJqIgfeRfb4",
+          "name": "MacMini DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = items.map(item => item.json);\n\n// Собираем список брендов\nconst brandLines = data.map(entry => `▫️${entry.wb_api_brand} | ${entry.wb_api_nameseller}`);\n\n// Создаем текстовое сообщение\nconst text = `<b>Запускаю обновление  РНП</b>\n<blockquote><b>В работу взяты ${brandLines.length} брендов:</b>\n${brandLines.join('\\n')}\n</blockquote>`;\n\nreturn [{ json: { text } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        -384
+      ],
+      "id": "cf2e8c7b-7260-459e-9f6f-8b9e8edf04e0",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "content": "Добавление в список обновления РНП",
+        "height": 520,
+        "width": 676
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -128,
+        -720
+      ],
+      "id": "50287650-0784-4695-a9b2-8f4faafffc8b",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO WB_sellers_updates (\n    seller_id,\n    telegram_username,\n    wb_api_nameseller,\n    wb_api_brand,\n    in_workrnp\n)\nSELECT\n    seller_id,\n    telegram_username,\n    wb_api_nameseller,\n    wb_api_brand,\n    gs_rnp_access AS in_workrnp\nFROM WB_sellers\nWHERE gs_rnp_access = 1\nON DUPLICATE KEY UPDATE\n    telegram_username   = VALUES(telegram_username),\n    wb_api_nameseller   = VALUES(wb_api_nameseller),\n    wb_api_brand        = VALUES(wb_api_brand),\n    in_workrnp          = VALUES(in_workrnp);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        160,
+        -672
+      ],
+      "id": "e0680bc4-c3e6-49e9-91de-1eae3c3edbfb",
+      "name": "get_active_list",
+      "credentials": {
+        "mySql": {
+          "id": "DUWK3IJqIgfeRfb4",
+          "name": "MacMini DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  s.seller_id,\n  s.wb_api_key,\n  s.wb_api_brand,\n  su.orders_status\nFROM WB_sellers AS s\nJOIN WB_sellers_updates AS su\n  ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        672,
+        -384
+      ],
+      "id": "674c0722-34fb-4606-99ca-e3c5bc827709",
+      "name": "get_all_token",
+      "credentials": {
+        "mySql": {
+          "id": "DUWK3IJqIgfeRfb4",
+          "name": "MacMini DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        144,
+        -384
+      ],
+      "id": "e14bc157-c30b-48f9-9589-85883fdb6821",
+      "name": "send_start",
+      "webhookId": "e269386d-beaa-4e52-9692-6c770113c3d6",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        368,
+        -384
+      ],
+      "id": "da775c73-32f6-4a1b-8b49-e157befcd092",
+      "name": "Wait",
+      "webhookId": "70ee4795-8d92-4f29-ab5a-29d4fc866622"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_create').first().json.result.message_id }}",
+        "text": "=<b>01 WB API</b> | Orders\n<blockquote><b>Собраны данные из WB</b>\n{{ $json.text }}</blockquote> ",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2240,
+        -992
+      ],
+      "id": "58712160-861a-4fd5-8ca2-8d0145f26546",
+      "name": "send_logs_finish",
+      "webhookId": "94bede3e-5215-483c-85ec-47ed9c6fb42e",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>01 WB API</b> | Orders\n<blockquote>{{ $json.text }}</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        848,
+        -816
+      ],
+      "id": "b2325139-7f82-4386-95da-683913d335b3",
+      "name": "send_create",
+      "webhookId": "88567b27-40df-4c35-b646-0def27ddddb3",
+      "retryOnFail": false,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Отправка количества заказов в тг\n\n\n",
+        "height": 244,
+        "width": 624
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -1056
+      ],
+      "id": "e849021f-e8f0-4526-ad06-5001328aae47",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {},
+      "id": "846c2cc9-2192-4b76-9e15-2827c0cff755",
+      "name": "On clicking 'execute'",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -64,
+        -672
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все входящие элементы\nconst items = $input.all();\n\n// Безопасно получаем стартовое время из узла\nconst startNode = $node[\"send_start\"];\nconst startTime = startNode?.json?.result?.date;\n\n// Заголовок\nlet summaryMessage = `<b>01 WB API | Orders</b> завершен ✅\\n`;\n\nif (startTime) {\n  const endTime = Math.floor(Date.now() / 1000);\n  const executionTime = endTime - startTime;\n  const minutes = Math.floor(executionTime / 60);\n  const seconds = executionTime % 60;\n  summaryMessage += `<blockquote>Время: ${minutes} мин ${seconds} сек</blockquote>`;\n}\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2800,
+        -704
+      ],
+      "id": "9f125dbf-a896-4e1c-af90-2591758fc1e5",
+      "name": "collapse2",
+      "executeOnce": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction toMySqlDate(value) {\n  if (!value) return null;\n  // WB часто шлёт \"0001-01-01T00:00:00\" как пустую дату\n  if (typeof value === 'string' && value.startsWith('0001-01-01')) return null;\n  // ISO -> 'YYYY-MM-DD HH:MM:SS'\n  return value.replace('T', ' ').replace('Z', '');\n}\n\nreturn items.map(({ json }) => {\n  const o = json;\n\n  const sellerId = o.seller_id || o.sellerId || null;\n  const srid = o.srid || null;\n\n  return {\n    json: {\n      // порядок ПОД WB_orders\n      date: toMySqlDate(o.date),\n      lastChangeDate: toMySqlDate(o.lastChangeDate),\n      warehouseName: o.warehouseName || null,\n      warehouseType: o.warehouseType || null,\n      countryName: o.countryName || null,\n      oblastOkrugName: o.oblastOkrugName || null,\n      regionName: o.regionName || null,\n\n      supplierArticle: o.supplierArticle || null,\n      nmId: o.nmId ?? null,\n      barcode: o.barcode || null,\n      category: o.category || null,\n      subject: o.subject || null,\n      brand: o.brand || null,\n      techSize: o.techSize || null,\n\n      incomeID: o.incomeID ?? null,\n      isSupply: o.isSupply ? 1 : 0,\n      isRealization: o.isRealization ? 1 : 0,\n\n      totalPrice: o.totalPrice ?? null,\n      discountPercent: o.discountPercent ?? null,\n      spp: o.spp ?? null,\n      finishedPrice: o.finishedPrice ?? null,\n      priceWithDisc: o.priceWithDisc ?? null,\n\n      isCancel: o.isCancel ? 1 : 0,\n      cancelDate: toMySqlDate(o.cancelDate),\n\n      orderType: o.orderType || null,\n      sticker: o.sticker || null,\n      gNumber: o.gNumber || null,\n      srid,\n\n      seller_id: sellerId,\n      srid_seller_key: (srid && sellerId) ? `${srid}_${sellerId}` : null,\n    },\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1968,
+        -448
+      ],
+      "id": "b01b512e-e726-470f-8a7e-7f0cb9815429",
+      "name": "create_json"
+    },
+    {
+      "parameters": {
+        "operation": "toFile",
+        "fileFormat": "csv",
+        "options": {
+          "fileName": "WB_orders_import.csv",
+          "headerRow": true
+        }
+      },
+      "id": "c2994846-f500-4bf9-ae4a-2a41ffd637a5",
+      "name": "create_file",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "position": [
+        2192,
+        -448
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "/data/csv/WB_orders_import.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        -448
+      ],
+      "id": "08c743ab-be30-4bd4-9c5f-633aa070a551",
+      "name": "save_file"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_start').first().json.result.message_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2800,
+        -464
+      ],
+      "id": "2960f041-2e87-4e9c-813c-7e6e587e322a",
+      "name": "send_finish",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "LOAD DATA INFILE '/var/lib/mysql-files/csv/WB_orders_import.csv'\nREPLACE\nINTO TABLE WB_orders\nCHARACTER SET utf8mb4\nFIELDS TERMINATED BY ','\nENCLOSED BY '\"'\nLINES TERMINATED BY '\\n'\nIGNORE 1 LINES\n(\n  date,\n  lastChangeDate,\n  warehouseName,\n  warehouseType,\n  countryName,\n  oblastOkrugName,\n  regionName,\n  supplierArticle,\n  nmId,\n  barcode,\n  category,\n  subject,\n  brand,\n  techSize,\n  incomeID,\n  isSupply,\n  isRealization,\n  totalPrice,\n  discountPercent,\n  spp,\n  finishedPrice,\n  priceWithDisc,\n  isCancel,\n  cancelDate,\n  orderType,\n  sticker,\n  gNumber,\n  srid,\n  seller_id,\n  srid_seller_key\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2576,
+        -448
+      ],
+      "id": "4a86b23a-c3a2-4734-b9c5-fb9cf819f313",
+      "name": "load_data",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "DUWK3IJqIgfeRfb4",
+          "name": "MacMini DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Сохраняем в БД\n\n",
+        "height": 516,
+        "width": 896
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -752
+      ],
+      "id": "128e98e8-695f-4d21-93fe-9960df127477",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — обновление orders_status по каждому seller_id\n *\n * Вход: много строк-заказов от разных селлеров.\n * Выход: по одному item на селлера:\n *   {\n *     json: {\n *       seller_id: \"...\",\n *       orders_status: {\n *         maxDateFrom, status, lastTotalOrders,\n *         leftBoundary, rightBoundary, lastDateFrom, nowTime\n *       }\n *     }\n *   }\n *\n * Правила (кратко):\n * - Если orders_status == null (впервые видим селлера):\n *     maxDateFrom = текущий dateFrom\n *     status = 'left'\n *     lastTotalOrders = кол-во строк по селлеру в этом батче\n *     leftBoundary/rightBoundary = min/max по полю date (YYYY-MM-DD)\n *     lastDateFrom = текущий dateFrom\n *     nowTime = текущее время по МСК (YYYY-MM-DD HH:MM:SS)\n *\n * - Если orders_status != null:\n *     maxDateFrom = min(старый maxDateFrom, текущий dateFrom)\n *     status = 'right', если:\n *        (A) старый status уже 'right'\n *        ИЛИ\n *        (B) текущий dateFrom <= (МСК сегодня - 180 дней) И lastTotalOrders в (1..79999)\n *        ИЛИ\n *        (C) старый maxDateFrom <= (МСК сегодня - 180 дней) И lastTotalOrders в (1..79999)\n *       иначе status = 'left'\n *     Остальные поля обновляются аналогично впервые.\n *\n * - Дополнение:\n *     Если по селлеру в этом запуске только ошибка WB и нет валидных заказов —\n *     возвращаем предыдущий orders_status без изменений.\n */\n\nconst items = $input.all();\n\n/* ── Утилиты ─────────────────────────────────────────────── */\n\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\n\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  const t = d.getTime() - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMD = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Группируем вход по seller_id ────────────────────────── */\n\nconst perSeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  const bucket =\n    perSeller.get(sellerId) ||\n    {\n      rows: [],\n      prevStatus: null,   // первый ненулевой orders_status\n      dateFromYMD: null,  // первый dateFrom\n      hasError: false,    // флаг ошибки WB для этого селлера\n    };\n\n  // Детектируем \"похожее на заказ\"\n  const looksLikeOrder =\n    json.date ||\n    json.lastChangeDate ||\n    json.srid ||\n    json.nmId ||\n    json.barcode ||\n    json.gNumber;\n\n  // Детектируем \"похожее на ошибку WB\"\n  const looksLikeError =\n    !looksLikeOrder &&\n    !json.orders_status &&\n    (\n      json.error ||\n      json.errorMessage ||\n      json.message ||\n      json.code ||\n      json.statusCode >= 400 ||\n      json.wb_error\n    );\n\n  if (looksLikeError) {\n    bucket.hasError = true;\n    // не добавляем в rows, это не данные заказов\n  } else {\n    bucket.rows.push(json);\n  }\n\n  // сохраняем предыдущий агрегированный статус, если есть\n  if (!bucket.prevStatus && json.orders_status) {\n    bucket.prevStatus = json.orders_status;\n  }\n\n  // фиксируем dateFrom (ожидаем одинаковый внутри селлера)\n  if (!bucket.dateFromYMD && json.dateFrom) {\n    bucket.dateFromYMD = firstYMD(json.dateFrom);\n  }\n\n  perSeller.set(sellerId, bucket);\n}\n\n/* ── Порог для 180 дней ──────────────────────────────────── */\n\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обрабатываем каждого селлера ────────────────────────── */\n\nconst out = [];\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const rows = bucket.rows;\n  const count = rows.length;\n  const prev = bucket.prevStatus ?? null;\n\n  // 1) Если в этом запуске только ошибка WB, но есть прошлый статус —\n  //    ничего не пересчитываем, просто возвращаем старый orders_status.\n  if (bucket.hasError && count === 0 && prev) {\n    out.push({\n      json: {\n        seller_id: sellerId,\n        orders_status: prev,\n      },\n    });\n    continue;\n  }\n\n  // 2) Если нет ни валидных строк, ни предыдущего статуса — пропускаем селлера.\n  if (count === 0 && !prev) {\n    continue;\n  }\n\n  // 3) Границы по дате заказа (только текущий батч)\n  let leftBoundary = null;\n  let rightBoundary = null;\n\n  for (const r of rows) {\n    const ymd = firstYMD(r.date) ?? firstYMD(r.lastChangeDate);\n    if (ymd) {\n      leftBoundary = minYMD(leftBoundary, ymd);\n      rightBoundary = maxYMD(rightBoundary, ymd);\n    }\n  }\n\n  // Текущий dateFrom из батча\n  const currentDateFrom = bucket.dateFromYMD || null;\n\n  // Предыдущее состояние\n  const prevStatus = prev?.status ?? null;\n  const prevMaxDateFrom = firstYMD(prev?.maxDateFrom);\n\n  // Вычисляем новые поля\n  let newMaxDateFrom;\n  let newStatus;\n\n  if (!prev) {\n    // Впервые видим селлера\n    newMaxDateFrom = currentDateFrom || null;\n    newStatus = 'left';\n  } else {\n    // maxDateFrom = более левая (ранняя) из старой и текущей\n    newMaxDateFrom =\n      minYMD(prevMaxDateFrom, currentDateFrom) ||\n      prevMaxDateFrom ||\n      currentDateFrom ||\n      null;\n\n    const countOk = count > 0 && count < 80000; // как было\n    const condB = currentDateFrom && (currentDateFrom <= threshold180) && countOk;\n    const condC = prevMaxDateFrom && (prevMaxDateFrom <= threshold180) && countOk;\n\n    if (prevStatus === 'right' || condB || condC) {\n      newStatus = 'right';\n    } else {\n      newStatus = 'left';\n    }\n  }\n\n  const result = {\n    seller_id: sellerId,\n    orders_status: {\n      maxDateFrom: newMaxDateFrom || null,\n      status: newStatus,\n      lastTotalOrders: count,\n      leftBoundary: leftBoundary || null,\n      rightBoundary: rightBoundary || null,\n      lastDateFrom: currentDateFrom || null,\n      nowTime: ymdHmsUTC(nowMSK()),\n    },\n  };\n\n  out.push({ json: result });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1936,
+        -128
+      ],
+      "id": "9105c107-374d-4666-95c3-f9a6e773d4a9",
+      "name": "create_status"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": {
+          "__rl": true,
+          "value": "WB_sellers_updates",
+          "mode": "list",
+          "cachedResultName": "WB_sellers_updates"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_id",
+        "valueToMatchOn": "={{ $json.seller_id }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "orders_status",
+              "value": "={{ JSON.stringify($json.orders_status) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2256,
+        -128
+      ],
+      "id": "b3cc9d3a-248c-4199-a526-83588736a079",
+      "name": "ins_upd_orders1",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "DUWK3IJqIgfeRfb4",
+          "name": "MacMini DB"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Формирование статуса\n\n\n",
+        "height": 452,
+        "width": 624
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        -192
+      ],
+      "id": "9e23b025-1d55-4b21-a0f8-e3db46868556",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>01 WB API</b> | Orders\n<blockquote>Статус обновлен ✅</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1936,
+        80
+      ],
+      "id": "741581f8-f4e5-4114-b49b-3a039e8584bf",
+      "name": "send_create1",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "EnXfwoHHhxEQp9vr",
+          "mode": "list",
+          "cachedResultName": "02 WB API |  SALES"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        80
+      ],
+      "id": "95b965fc-3c94-4d04-9bed-4f901140e741",
+      "name": "Call 'WB API |  WB API | SALES'"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — обновление orders_status по каждому seller_id\n *\n * Вход: много строк-заказов от разных селлеров.\n * Выход: по одному item на селлера:\n *   {\n *     json: {\n *       seller_id: \"...\",\n *       orders_status: {\n *         maxDateFrom, status, lastTotalOrders,\n *         leftBoundary, rightBoundary, lastDateFrom, nowTime\n *       }\n *     }\n *   }\n *\n * Правила (кратко):\n * - Если orders_status == null (впервые видим селлера):\n *     maxDateFrom = текущий dateFrom\n *     status = 'left'\n *     lastTotalOrders = кол-во строк по селлеру в этом батче\n *     leftBoundary/rightBoundary = min/max по полю date (YYYY-MM-DD)\n *     lastDateFrom = текущий dateFrom\n *     nowTime = текущее время по МСК (YYYY-MM-DD HH:MM:SS)\n *\n * - Если orders_status != null:\n *     maxDateFrom = min(старый maxDateFrom, текущий dateFrom)\n *     status = 'right', если:\n *        (A) старый status уже 'right'\n *        ИЛИ\n *        (B) текущий dateFrom <= (МСК сегодня - 180 дней) И lastTotalOrders в (1..79999)\n *        ИЛИ\n *        (C) старый maxDateFrom <= (МСК сегодня - 180 дней) И lastTotalOrders в (1..79999)\n *       иначе status = 'left'\n *     Остальные поля обновляются аналогично впервые.\n */\n\nconst items = $input.all();\n\n/* ── Утилиты ─────────────────────────────────────────────── */\n\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\n\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  const t = d.getTime() - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMD = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Группируем вход по seller_id ────────────────────────── */\n\nconst perSeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  const bucket = perSeller.get(sellerId) || {\n    rows: [],\n    // возьмём первый ненулевой orders_status как \"старый\"\n    prevStatus: null,\n    // возьмём первый dateFrom (обычно он одинаковый для всех строк селлера)\n    dateFromYMD: null,\n  };\n\n  bucket.rows.push(json);\n\n  if (!bucket.prevStatus && json.orders_status) {\n    bucket.prevStatus = json.orders_status;\n  }\n\n  // зафиксируем dateFrom из строки (ожидаем одинаковый для селлера)\n  if (!bucket.dateFromYMD && json.dateFrom) {\n    bucket.dateFromYMD = firstYMD(json.dateFrom);\n  }\n\n  perSeller.set(sellerId, bucket);\n}\n\n/* ── Порог для 180 дней ──────────────────────────────────── */\n\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обрабатываем каждого селлера ────────────────────────── */\n\nconst out = [];\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const rows = bucket.rows;\n  const count = rows.length;\n\n  // Границы по дате заказа (поле `date`)\n  let leftBoundary = null;\n  let rightBoundary = null;\n\n  for (const r of rows) {\n    const ymd = firstYMD(r.date) ?? firstYMD(r.lastChangeDate);\n    if (ymd) {\n      leftBoundary = minYMD(leftBoundary, ymd);\n      rightBoundary = maxYMD(rightBoundary, ymd);\n    }\n  }\n\n  // Текущий dateFrom из батча\n  const currentDateFrom = bucket.dateFromYMD || null;\n\n  // Предыдущее состояние (как пришло во входе ДО обновления)\n  const prev = bucket.prevStatus ?? null;\n  const prevStatus = prev?.status ?? null;\n  const prevMaxDateFrom = firstYMD(prev?.maxDateFrom);\n\n  // Вычисляем новые поля\n  let newMaxDateFrom;\n  let newStatus;\n\n  if (!prev) {\n    // Впервые видим селлера\n    newMaxDateFrom = currentDateFrom || null;\n    newStatus = 'left';\n  } else {\n    // maxDateFrom = более левая (ранняя) из старой и текущей\n    newMaxDateFrom = minYMD(prevMaxDateFrom, currentDateFrom) || prevMaxDateFrom || currentDateFrom || null;\n\n    const countOk = count > 0 && count < 80000;\n    const condB = currentDateFrom && (currentDateFrom <= threshold180) && countOk;\n    const condC = prevMaxDateFrom && (prevMaxDateFrom <= threshold180) && countOk;\n\n    if (prevStatus === 'right' || condB || condC) {\n      newStatus = 'right';\n    } else {\n      newStatus = 'left';\n    }\n  }\n\n  const result = {\n    seller_id: sellerId,\n    orders_status: {\n      maxDateFrom: newMaxDateFrom || null,\n      status: newStatus,\n      lastTotalOrders: count,\n      leftBoundary: leftBoundary || null,\n      rightBoundary: rightBoundary || null,\n      lastDateFrom: currentDateFrom || null,\n      nowTime: ymdHmsUTC(nowMSK()), // текущее время по МСК\n    },\n  };\n\n  out.push({ json: result });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        928
+      ],
+      "id": "3e9b0118-0897-4ef6-b993-9ce3e5e238c9",
+      "name": "create_status_old"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — обновление orders_status по каждому seller_id\n *\n * Вход:\n *   - строки заказов WB (date, srid, и т.д.)\n *   - опционально предыдущие агрегаты { seller_id, orders_status }\n *   - опционально строки-ошибки WB\n *\n * Выход: по одному item на seller_id:\n *   {\n *     json: {\n *       seller_id: \"...\",\n *       orders_status: {\n *         maxDateFrom,\n *         status,\n *         lastTotalOrders,\n *         leftBoundary,\n *         rightBoundary,\n *         lastDateFrom,\n *         nowTime\n *       }\n *     }\n *   }\n *\n * Правки:\n * 1) Если по селлеру в этом запуске только ошибка WB и нет валидных заказов —\n *    возвращаем предыдущий orders_status без изменений.\n * 2) leftBoundary / rightBoundary считаются на основе:\n *      мин/макс дат ТЕКУЩЕГО батча + прошлых leftBoundary/rightBoundary,\n *    т.е. расширяются до реальных глобальных границ.\n * 3) Логика maxDateFrom / status сохранена.\n */\n\nconst items = $input.all();\n\n/* ── Утилиты ─────────────────────────────────────────────── */\n\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\n\nconst ymdUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\n\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  const t = d.getTime() - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\n\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMD = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Группируем вход по seller_id ────────────────────────── */\n\nconst perSeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  const bucket =\n    perSeller.get(sellerId) ||\n    {\n      rows: [],\n      prevStatus: null,\n      dateFromYMD: null,\n      hasError: false,\n    };\n\n  // Определяем, похоже ли это на строку заказа\n  const looksLikeOrder =\n    json.date ||\n    json.lastChangeDate ||\n    json.srid ||\n    json.nmId ||\n    json.barcode ||\n    json.gNumber;\n\n  // Фиксируем старый статус (агрегат из предыдущих запусков)\n  if (!bucket.prevStatus && json.orders_status) {\n    bucket.prevStatus = json.orders_status;\n  }\n\n  // Сохраняем dateFrom для этого селлера (из нормальных строк)\n  if (!bucket.dateFromYMD && json.dateFrom) {\n    bucket.dateFromYMD = firstYMD(json.dateFrom);\n  }\n\n  if (looksLikeOrder) {\n    bucket.rows.push(json);\n  } else {\n    // Пытаемся детектить ошибку WB:\n    // есть признаки ошибки и нет orders_status / нормальных полей заказа\n    if (\n      !json.orders_status &&\n      (json.error ||\n        json.errorMessage ||\n        json.message ||\n        json.code ||\n        json.wb_error)\n    ) {\n      bucket.hasError = true;\n    }\n  }\n\n  perSeller.set(sellerId, bucket);\n}\n\n/* ── Порог для 180 дней ──────────────────────────────────── */\n\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обрабатываем каждого селлера ────────────────────────── */\n\nconst out = [];\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const rows = bucket.rows;\n  const count = rows.length;\n  const prev = bucket.prevStatus ?? null;\n\n  // 1) Если только ошибка WB и есть старый статус — просто его возвращаем\n  if (bucket.hasError && count === 0 && prev) {\n    out.push({\n      json: {\n        seller_id: sellerId,\n        orders_status: prev,\n      },\n    });\n    continue;\n  }\n\n  // 2) Если нет ни заказов, ни предыдущего статуса — пропускаем\n  if (count === 0 && !prev) {\n    continue;\n  }\n\n  // 3) Границы по датам в ТЕКУЩЕМ батче\n  let leftBoundary = null;\n  let rightBoundary = null;\n\n  for (const r of rows) {\n    const ymd = firstYMD(r.date) ?? firstYMD(r.lastChangeDate);\n    if (ymd) {\n      leftBoundary = minYMD(leftBoundary, ymd);\n      rightBoundary = maxYMD(rightBoundary, ymd);\n    }\n  }\n\n  // 4) Подключаем ПРЕДЫДУЩИЕ границы, чтобы расширять до реальной истории\n  const prevLeft = firstYMD(prev?.leftBoundary);\n  const prevRight = firstYMD(prev?.rightBoundary);\n\n  leftBoundary = minYMD(prevLeft, leftBoundary);\n  rightBoundary = maxYMD(prevRight, rightBoundary);\n\n  // Текущий dateFrom из батча\n  const currentDateFrom = bucket.dateFromYMD || null;\n\n  // Предыдущее состояние для логики maxDateFrom/status\n  const prevStatus = prev?.status ?? null;\n  const prevMaxDateFrom = firstYMD(prev?.maxDateFrom);\n\n  // Вычисляем новые поля\n  let newMaxDateFrom;\n  let newStatus;\n\n  if (!prev) {\n    // Впервые видим селлера\n    newMaxDateFrom = currentDateFrom || null;\n    newStatus = 'left';\n  } else {\n    // maxDateFrom = более ранняя из старой и текущей, если обе есть\n    newMaxDateFrom =\n      minYMD(prevMaxDateFrom, currentDateFrom) ||\n      prevMaxDateFrom ||\n      currentDateFrom ||\n      null;\n\n    const countOk = count > 0 && count < 80000;\n    const condB =\n      currentDateFrom && currentDateFrom <= threshold180 && countOk;\n    const condC =\n      prevMaxDateFrom && prevMaxDateFrom <= threshold180 && countOk;\n\n    if (prevStatus === 'right' || condB || condC) {\n      newStatus = 'right';\n    } else {\n      newStatus = 'left';\n    }\n  }\n\n  const result = {\n    seller_id: sellerId,\n    orders_status: {\n      maxDateFrom: newMaxDateFrom || null,\n      status: newStatus,\n      lastTotalOrders: count,\n      leftBoundary: leftBoundary || null,\n      rightBoundary: rightBoundary || null,\n      lastDateFrom: currentDateFrom || null,\n      nowTime: ymdHmsUTC(nowMSK()), // текущее время по МСК\n    },\n  };\n\n  out.push({ json: result });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2096,
+        960
+      ],
+      "id": "1974a6f6-7a25-46c8-94a8-cd112a9b100f",
+      "name": "create_status1"
+    },
+    {
+      "parameters": {
+        "batchSize": 20000,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1920,
+        -688
+      ],
+      "id": "a4c41784-b53f-4191-ac27-ade9b77597d6",
+      "name": "Loop1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_orders": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "create_status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_dateFrom": {
+      "main": [
+        [
+          {
+            "node": "send_create",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_allsellers_accessrnp": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "send_start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_active_list": {
+      "main": [
+        [
+          {
+            "node": "get_allsellers_accessrnp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_start": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_token": {
+      "main": [
+        [
+          {
+            "node": "create_dateFrom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "get_all_token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On clicking 'execute'": {
+      "main": [
+        [
+          {
+            "node": "get_active_list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse2": {
+      "main": [
+        [
+          {
+            "node": "send_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_json": {
+      "main": [
+        [
+          {
+            "node": "create_file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_file": {
+      "main": [
+        [
+          {
+            "node": "save_file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_file": {
+      "main": [
+        [
+          {
+            "node": "load_data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "load_data": {
+      "main": [
+        [
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_status": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_orders1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_orders1": {
+      "main": [
+        [
+          {
+            "node": "send_create1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop1": {
+      "main": [
+        [
+          {
+            "node": "collapse2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "create_json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveExecutionProgress": true,
+    "errorWorkflow": "mlqZ2w1LQS9LsOjP"
+  },
+  "versionId": "f6bd1994-9354-489e-a23f-7f9e0a3595e9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "ZiyZgCcmOaaK1isV",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    }
+  ]
+}
