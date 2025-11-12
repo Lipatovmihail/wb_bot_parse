@@ -47,6 +47,7 @@ RIGHT_COOLDOWN_MINUTES = int(os.environ.get("WB_RIGHT_COOLDOWN_MINUTES", "30"))
 PRODUCTS_COOLDOWN_MINUTES = int(os.environ.get("WB_PRODUCTS_COOLDOWN_MINUTES", "60"))
 ADS_COOLDOWN_MINUTES = int(os.environ.get("WB_ADS_COOLDOWN_MINUTES", "60"))
 AD_STATS_COOLDOWN_MINUTES = int(os.environ.get("WB_AD_STATS_COOLDOWN_MINUTES", "60"))
+AD_STATS_RIGHT_COOLDOWN_MINUTES = 30
 WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
 WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
@@ -660,6 +661,26 @@ def build_ad_list_status_message(details: List[Dict]) -> str:
     return "\n".join([header, summary_line, body, closing])
 
 
+def build_ad_stats_status_message(details: List[Dict]) -> str:
+    header = "<b>05 WB API</b> | Ad Stats\n<blockquote>Статус обновлён ✅"
+    total_sellers = len(details)
+    total_rows = sum(item.get("count", 0) for item in details)
+    summary_line = f"Всего селлеров: {total_sellers} | всего строк: {total_rows}"
+    lines = []
+    for item in sorted(details, key=lambda x: (x.get("brand") or x.get("seller_id") or "").lower()):
+        brand_name = html.escape(item.get("brand") or item.get("seller_id") or "")
+        from_status = item.get("from", "null")
+        to_status = item.get("to", "null")
+        count = item.get("count", 0)
+        max_begin_date = item.get("maxBeginDate", "")
+        line = f"{max_begin_date or 'null'} | {from_status} → {to_status} | {count} | {brand_name}"
+        lines.append(html.escape(line))
+
+    body = "<code>" + ("\n".join(lines) if lines else "нет данных") + "</code>"
+    closing = "</blockquote>"
+    return "\n".join([header, summary_line, body, closing])
+
+
 def build_completion_message(prefix: str, entity: str, elapsed_seconds: int) -> str:
     safe_elapsed = max(0, int(elapsed_seconds))
     minutes, seconds = divmod(safe_elapsed, 60)
@@ -706,17 +727,17 @@ AD_LIST_CSV_COLUMNS = [
 ]
 
 AD_STATS_CSV_COLUMNS = [
+    "seller_advert_date_key",
     "seller_id",
-    "brand",
     "advertId",
     "date",
     "nmId",
-    "name",
     "appType",
     "views",
     "clicks",
     "ctr",
     "cpc",
+    "ad_expenses",
     "atbs",
     "orders",
     "shks",
@@ -1255,6 +1276,7 @@ def prepare_ad_stats_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List
                 "status_cat": status_cat,
                 "now_time": now_time,
                 "campaign_ids": sorted(campaign_ids),
+                "campaign_ids_list": list(sorted(campaign_ids)),  # для передачи в update_ad_stats_status
                 "excluded_count": excluded_count,
                 "intervals": intervals,
                 "ad_stats_status": status_obj,
@@ -1268,6 +1290,17 @@ def prepare_ad_stats_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List
             return float("inf")
         return dt.timestamp()
 
+    def ad_stats_right_cooldown_minutes(status_obj: Optional[Dict]) -> float:
+        if not status_obj:
+            return 0.0
+        now_time_str = status_obj.get("nowTime")
+        dt = parse_msk_datetime(now_time_str)
+        if dt is None:
+            return 0.0
+        age_min = minutes_since_msk(dt)
+        remaining = AD_STATS_RIGHT_COOLDOWN_MINUTES - age_min
+        return max(0.0, remaining)
+
     new_group = [s for s in processed if s["status_cat"] == "new"]
     left_group = [s for s in processed if s["status_cat"] == "left"]
     right_group = [s for s in processed if s["status_cat"] == "right"]
@@ -1275,22 +1308,45 @@ def prepare_ad_stats_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List
     allow_set: Set[str] = set()
     if new_group:
         allow_set.update(s["seller_id"] for s in new_group)
-    elif left_group:
+    if left_group:
         left_group_sorted = sorted(left_group, key=lambda s: (parse_now_time(s["now_time"]), s["idx"]))
         if left_group_sorted:
             allow_set.add(left_group_sorted[0]["seller_id"])
-    elif right_group and len(right_group) == len(processed):
-        allow_set.update(s["seller_id"] for s in right_group)
+    if right_group:
+        for s in right_group:
+            cooldown_remaining = ad_stats_right_cooldown_minutes(s.get("ad_stats_status"))
+            if cooldown_remaining <= 0:
+                allow_set.add(s["seller_id"])
 
     summary_lines = []
     for s in sorted(processed, key=lambda item: item["brand"].lower()):
         intervals = s["intervals"]
-        first_interval = intervals[0] if intervals else {"beginDate": "-", "endDate": "-"}
-        begin_short = format_date_short(first_interval["beginDate"])
-        end_short = format_date_short(first_interval["endDate"])
+        
+        # Вычисляем минуты с последнего прогона
+        minutes_ago = ""
+        if s.get("now_time"):
+            dt = parse_msk_datetime(s["now_time"])
+            if dt:
+                minutes_ago_int = int(minutes_since_msk(dt))
+                minutes_ago = f"{minutes_ago_int}min | "
+        
+        # Вычисляем мин/макс границы дат из всех интервалов
+        min_begin_date = None
+        max_end_date = None
+        if intervals:
+            for interval in intervals:
+                begin_date = first_ymd(interval.get("beginDate"))
+                end_date = first_ymd(interval.get("endDate"))
+                if begin_date:
+                    min_begin_date = min_begin_date if min_begin_date and min_begin_date < begin_date else begin_date
+                if end_date:
+                    max_end_date = max_end_date if max_end_date and max_end_date > end_date else end_date
+        
+        begin_short = format_date_short(min_begin_date) if min_begin_date else "-"
+        end_short = format_date_short(max_end_date) if max_end_date else "-"
         mark = "✅" if s["seller_id"] in allow_set else "✖️"
         summary_lines.append(
-            f"{s['status_cat']} | {begin_short} - {end_short} | "
+            f"{minutes_ago}{s['status_cat']} | {begin_short} - {end_short} | "
             f"{len(s['campaign_ids'])} | {s['brand']} {mark}"
         )
     summary_text = "\n".join(summary_lines)
@@ -1459,7 +1515,6 @@ def parse_ad_stats_payload(payload: Any) -> List[Dict]:
                             "advertId": advert_id,
                             "date": date_str,
                             "nmId": nm_id,
-                            "name": nm.get("name"),
                             "appType": app_type,
                             "views": nm.get("views"),
                             "clicks": nm.get("clicks"),
@@ -1472,6 +1527,7 @@ def parse_ad_stats_payload(payload: Any) -> List[Dict]:
                             "canceled": nm.get("canceled"),
                             "sum": nm.get("sum"),
                             "sum_price": nm.get("sum_price"),
+                            "ad_expenses": nm.get("sum"),  # расходы на рекламу = sum
                             "avg_position": booster_index.get(key),
                         }
                     )
@@ -1482,7 +1538,7 @@ def parse_ad_stats_payload(payload: Any) -> List[Dict]:
 def build_ad_stats_plan_message(requests: List[Dict], sellers_count: int) -> str:
     lines = [f"Запросов: {len(requests)} | селлеров: {sellers_count}"]
     sorted_requests = sorted(requests, key=lambda r: r.get("ready_at_ts", 0.0))
-    preview = sorted_requests[:10]
+    preview = sorted_requests[:50]
     for idx, entry in enumerate(preview, start=1):
         begin_short = format_date_short(entry["interval"]["beginDate"])
         end_short = format_date_short(entry["interval"]["endDate"])
@@ -2545,6 +2601,60 @@ def load_ad_list_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
         raise RuntimeError(f"LOAD DATA INFILE for ad list failed: {exc}") from exc
 
 
+def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{WB_AD_STATS_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE WB_ad_stats
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_advert_date_key,
+              seller_id,
+              advert_id,
+              @date,
+              nmId,
+              appType,
+              @views,
+              @clicks,
+              @ctr,
+              @cpc,
+              @ad_expenses,
+              @atbs,
+              @orders,
+              @shks,
+              @cr,
+              @canceled,
+              @sum,
+              @sum_price,
+              @avg_position
+            )
+            SET
+              date = NULLIF(@date, ''),
+              views = NULLIF(@views, ''),
+              clicks = NULLIF(@clicks, ''),
+              ctr = NULLIF(@ctr, ''),
+              cpc = NULLIF(@cpc, ''),
+              ad_expenses = NULLIF(@ad_expenses, ''),
+              atbs = NULLIF(@atbs, ''),
+              orders = NULLIF(@orders, ''),
+              shks = NULLIF(@shks, ''),
+              cr = NULLIF(@cr, ''),
+              canceled = NULLIF(@canceled, ''),
+              sum = NULLIF(@sum, ''),
+              sum_price = NULLIF(@sum_price, ''),
+              avg_position = NULLIF(@avg_position, '')
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for ad stats failed: {exc}") from exc
+
+
 def update_products_status(
     cursor: mysql.connector.cursor.MySQLCursor,
     sellers_meta: Iterable[Dict],
@@ -2745,6 +2855,168 @@ def update_ad_list_status(
             """
             UPDATE WB_sellers_updates
             SET ad_list_status = %s
+            WHERE seller_id = %s
+            """,
+            updates,
+        )
+
+    return len(updates), details
+
+
+def update_ad_stats_status(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    sellers_meta: Iterable[Dict],
+    ad_stats_rows: Iterable[Dict],
+    ad_stats_requests_by_seller: Dict[str, List[Dict]],
+    ad_stats_successful_requests_by_seller: Dict[str, List[Dict]],
+    ad_stats_failed_requests_by_seller: Dict[str, List[Dict]],
+) -> Tuple[int, List[Dict]]:
+    threshold180 = ymd_minus_days(AD_STATS_LOOKBACK_DAYS)
+
+    def min_ymd(a: Optional[str], b: Optional[str]) -> Optional[str]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a < b else b
+
+    def max_ymd(a: Optional[str], b: Optional[str]) -> Optional[str]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a > b else b
+
+    per_seller: Dict[str, Dict] = {}
+
+    for meta in sellers_meta:
+        seller_id = str(meta.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        per_seller[seller_id] = {
+            "rows": [],
+            "prev": meta.get("ad_stats_status"),
+            "brand": meta.get("brand") or meta.get("wb_api_brand") or seller_id,
+            "campaign_ids": meta.get("campaign_ids_list", meta.get("campaign_ids", [])),
+        }
+
+    for row in ad_stats_rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        bucket = per_seller.setdefault(
+            seller_id,
+            {
+                "rows": [],
+                "prev": row.get("ad_stats_status"),
+                "brand": row.get("brand") or seller_id,
+            },
+        )
+        bucket["rows"].append(row)
+        if not bucket["prev"] and row.get("ad_stats_status"):
+            bucket["prev"] = row["ad_stats_status"]
+
+    updates: List[Tuple[str, str]] = []
+    details: List[Dict] = []
+    now_time = msk_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for seller_id, bucket in per_seller.items():
+        rows = bucket["rows"]
+        count = len(rows)
+        prev = bucket.get("prev")
+        prev_status = (prev or {}).get("status") if prev else None
+        prev_max_begin_date = first_ymd((prev or {}).get("maxBeginDate"))
+
+        all_requests = ad_stats_requests_by_seller.get(seller_id, [])
+        successful_requests = ad_stats_successful_requests_by_seller.get(seller_id, [])
+        failed_requests = ad_stats_failed_requests_by_seller.get(seller_id, [])
+
+        # Если все запросы провалились - не меняем статус
+        if len(all_requests) > 0 and len(failed_requests) == len(all_requests):
+            if prev:
+                ad_stats_status = prev
+            else:
+                continue
+        elif len(all_requests) == 0:
+            # Нет запросов для селлера - проверяем, есть ли у него кампании
+            campaign_ids = bucket.get("campaign_ids", [])
+            if len(campaign_ids) == 0:
+                # У селлера нет рекламных кампаний - ставим статус right
+                ad_stats_status = {
+                    "status": "right",
+                    "nowTime": now_time,
+                    "lastTotalRow": 0,
+                    "leftBoundary": "",
+                    "maxBeginDate": "",
+                    "lastBeginDate": "",
+                    "rightBoundary": "",
+                }
+            else:
+                # Нет запросов по другой причине (не был в allowed_effective) - пропускаем
+                continue
+        else:
+            # Вычисляем beginDate из успешных запросов
+            current_begin_date = None
+            for req in successful_requests:
+                begin_date = first_ymd(req.get("interval", {}).get("beginDate"))
+                if begin_date:
+                    current_begin_date = min_ymd(current_begin_date, begin_date)
+
+            # Границы по полю date из строк статистики
+            left_boundary = None
+            right_boundary = None
+            for r in rows:
+                date_str = first_ymd(r.get("date"))
+                if date_str:
+                    left_boundary = min_ymd(left_boundary, date_str)
+                    right_boundary = max_ymd(right_boundary, date_str)
+
+            # Если все запросы успешны но пустые (нет строк) - статус right (новичок)
+            if count == 0 and len(successful_requests) > 0:
+                new_max_begin_date = prev_max_begin_date or current_begin_date
+                new_status = "right"
+            elif not prev:
+                # Впервые видим селлера
+                new_max_begin_date = current_begin_date
+                new_status = "left"
+            else:
+                # maxBeginDate = min(старый maxBeginDate, текущий beginDate)
+                candidates = [prev_max_begin_date, current_begin_date]
+                candidates = [c for c in candidates if c]
+                new_max_begin_date = min(candidates) if candidates else (prev_max_begin_date or current_begin_date)
+
+                # 'right' если старый уже 'right' ИЛИ текущий beginDate <= (МСК сегодня - 180 дней)
+                cond_a = prev_status == "right"
+                cond_b = current_begin_date and current_begin_date <= threshold180
+                new_status = (cond_a or cond_b) if (cond_a or cond_b) else "left"
+
+            ad_stats_status = {
+                "status": new_status,
+                "nowTime": now_time,
+                "lastTotalRow": count,
+                "leftBoundary": left_boundary or "",
+                "maxBeginDate": new_max_begin_date or "",
+                "lastBeginDate": current_begin_date or "",
+                "rightBoundary": right_boundary or "",
+            }
+
+        updates.append((json.dumps(ad_stats_status, ensure_ascii=False), seller_id))
+        details.append(
+            {
+                "seller_id": seller_id,
+                "brand": bucket.get("brand") or seller_id,
+                "from": prev_status if prev else "null",
+                "to": ad_stats_status.get("status") if isinstance(ad_stats_status, dict) else (prev_status if prev else "null"),
+                "count": count,
+                "maxBeginDate": ad_stats_status.get("maxBeginDate") if isinstance(ad_stats_status, dict) else "",
+            }
+        )
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE WB_sellers_updates
+            SET ad_stats_status = %s
             WHERE seller_id = %s
             """,
             updates,
@@ -3402,6 +3674,9 @@ def main() -> int:
         ad_stats_empty_campaigns: Dict[str, int] = defaultdict(int)
         ad_stats_errors: List[str] = []
         seller_brand_map: Dict[str, str] = {}
+        ad_stats_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
+        ad_stats_successful_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
+        ad_stats_failed_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
 
         if ad_stats_requests:
             unique_sellers = len({req["seller_id"] for req in ad_stats_requests})
@@ -3414,10 +3689,21 @@ def main() -> int:
 
             sorted_ad_stats_requests = sorted(ad_stats_requests, key=lambda r: r.get("ready_at_ts", 0.0))
             ad_stats_last_request_ts: Dict[str, float] = {}
-            for req in sorted_ad_stats_requests:
+            total_requests = len(sorted_ad_stats_requests)
+            for request_index, req in enumerate(sorted_ad_stats_requests, start=1):
                 seller_id = req["seller_id"]
                 brand = req["brand"]
+                ad_stats_requests_by_seller[seller_id].append(req)
                 seller_brand_map[seller_id] = brand
+
+                begin_short = format_date_short(req["interval"]["beginDate"])
+                end_short = format_date_short(req["interval"]["endDate"])
+                print(
+                    f"[WB-bot] Ad Stats: запрос {request_index}/{total_requests} | "
+                    f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
+                    f"{begin_short}→{end_short}",
+                    flush=True,
+                )
 
                 now_ts = time.time()
                 wait_seconds = max(0.0, req.get("ready_at_ts", 0.0) - now_ts)
@@ -3458,21 +3744,30 @@ def main() -> int:
                                 for row in parsed_rows:
                                     row_out = dict(row)
                                     row_out["seller_id"] = seller_id
-                                    row_out["brand"] = brand
+                                    advert_id = row.get("advertId")
+                                    date_str = row.get("date")
+                                    app_type = row.get("appType")
+                                    if seller_id and advert_id is not None and date_str and app_type is not None:
+                                        row_out["seller_advert_date_key"] = f"{seller_id}_{advert_id}_{row.get('nmId', '')}_{date_str}_{app_type}"
+                                    else:
+                                        row_out["seller_advert_date_key"] = ""
                                     ad_stats_rows.append(row_out)
                             else:
                                 ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
 
+                            ad_stats_successful_requests_by_seller[seller_id].append(req)
                             success = True
                             break
 
                         if status_code == 400 and "no statistics" in response_text.lower():
                             ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
+                            ad_stats_successful_requests_by_seller[seller_id].append(req)
                             success = True
                             break
 
                         if status_code in {429, 500}:
                             if attempt == AD_STATS_MAX_RETRIES:
+                                ad_stats_failed_requests_by_seller[seller_id].append(req)
                                 error_line = (
                                     f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
                                     f"{req['interval']['beginDate']}→{req['interval']['endDate']} | "
@@ -3489,6 +3784,7 @@ def main() -> int:
                             time.sleep(delay)
                             continue
 
+                        ad_stats_failed_requests_by_seller[seller_id].append(req)
                         error_line = (
                             f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
                             f"{req['interval']['beginDate']}→{req['interval']['endDate']} | "
@@ -3504,6 +3800,7 @@ def main() -> int:
                     except Exception as api_err:
                         ad_stats_last_request_ts[seller_id] = time.time()
                         if attempt == AD_STATS_MAX_RETRIES:
+                            ad_stats_failed_requests_by_seller[seller_id].append(req)
                             error_line = (
                                 f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
                                 f"{req['interval']['beginDate']}→{req['interval']['endDate']} | {api_err}"
@@ -3553,6 +3850,52 @@ def main() -> int:
                     f"<code>{errors_text}</code></blockquote>"
                 )
                 send_to_telegram(error_message)
+
+            ad_stats_db_loaded = False
+            if ad_stats_rows:
+                try:
+                    load_ad_stats_into_db(cursor)
+                    ad_stats_db_loaded = True
+                    print("[WB-bot] WB_ad_stats успешно обновлена через LOAD DATA INFILE.", flush=True)
+                    ad_stats_load_message = (
+                        "<b>05 WB API</b> | Ad Stats\n"
+                        "<blockquote>Данные загружены в таблицу WB_ad_stats.</blockquote>"
+                    )
+                    send_to_telegram(ad_stats_load_message)
+                except Exception as db_err:
+                    print(f"[WB-bot] Ошибка LOAD DATA для статистики реклам: {db_err}", file=sys.stderr, flush=True)
+                    error_message = (
+                        "<b>05 WB API</b> | Ad Stats\n"
+                        "<blockquote>"
+                        "Ошибка загрузки данных в WB_ad_stats.\n"
+                        f"<code>{html.escape(str(db_err))}</code>"
+                        "</blockquote>"
+                    )
+                    try:
+                        send_to_telegram(error_message)
+                    except Exception:
+                        traceback.print_exc()
+
+            if ad_stats_db_loaded:
+                ad_stats_status_updates, ad_stats_status_details = update_ad_stats_status(
+                    cursor,
+                    ad_stats_processed,
+                    ad_stats_rows,
+                    ad_stats_requests_by_seller,
+                    ad_stats_successful_requests_by_seller,
+                    ad_stats_failed_requests_by_seller,
+                )
+                if ad_stats_status_updates:
+                    connection.commit()
+                    print(
+                        f"[WB-bot] Обновлены ad_stats_status для {ad_stats_status_updates} селлеров.",
+                        flush=True,
+                    )
+                    if ad_stats_status_details:
+                        ad_stats_status_message = build_ad_stats_status_message(ad_stats_status_details)
+                        send_to_telegram(ad_stats_status_message)
+            else:
+                print("[WB-bot] Статусы ad_stats не обновлялись из-за ошибки загрузки в БД.", flush=True)
         else:
             print("[WB-bot] Нет рекламных кампаний для запроса статистики.", flush=True)
 
