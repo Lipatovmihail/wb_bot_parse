@@ -44,8 +44,12 @@ WB_SALES_CSV_HOST_PATH = "/data/csv/WB_sales_import.csv"
 WB_SALES_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_sales_import.csv"
 RIGHT_COOLDOWN_MINUTES = int(os.environ.get("WB_RIGHT_COOLDOWN_MINUTES", "30"))
 PRODUCTS_COOLDOWN_MINUTES = int(os.environ.get("WB_PRODUCTS_COOLDOWN_MINUTES", "60"))
+ADS_COOLDOWN_MINUTES = int(os.environ.get("WB_ADS_COOLDOWN_MINUTES", "60"))
 WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
 WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
+WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
+WB_AD_LIST_CSV_HOST_PATH = "/data/csv/WB_ad_list_import.csv"
+WB_AD_LIST_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_ad_list_import.csv"
 
 
 MSK_OFFSET = timezone(timedelta(hours=3))
@@ -559,6 +563,42 @@ def build_status_update_message(prefix: str, entity: str, details: List[Dict]) -
     return "\n".join([header, summary_line, *body_lines, closing])
 
 
+def build_products_status_message(details: List[Dict]) -> str:
+    header = "<b>03 WB API</b> | Products\n<blockquote>Статус обновлён ✅"
+    summary_line = f"Всего селлеров: {len(details)}"
+    lines = []
+    for item in details:
+        brand_name = html.escape(item.get("brand") or item.get("seller_id") or "")
+        status = item.get("status") or {}
+
+        line = f"nmID:{status.get('nmID', 0)} | skus:{status.get('skus', 0)} | {brand_name}"
+        lines.append(html.escape(line))
+
+    body = "<code>" + ("\n".join(lines) if lines else "нет данных") + "</code>"
+    closing = "</blockquote>"
+    return "\n".join([header, summary_line, body, closing])
+
+
+def build_ad_list_status_message(details: List[Dict]) -> str:
+    header = "<b>04 WB API</b> | Ad List\n<blockquote>Статус обновлён ✅"
+    summary_line = f"Всего селлеров: {len(details)}"
+    lines = []
+    for item in details:
+        brand_name = html.escape(item.get("brand") or item.get("seller_id") or "")
+        status = item.get("status") or {}
+        line = (
+            f"all:{status.get('ad_all_cnt', 0)} | "
+            f"active:{status.get('ad_active_cnt', 0)} | "
+            f"paused:{status.get('ad_paused_cnt', 0)} | "
+            f"{brand_name}"
+        )
+        lines.append(html.escape(line))
+
+    body = "<code>" + ("\n".join(lines) if lines else "нет данных") + "</code>"
+    closing = "</blockquote>"
+    return "\n".join([header, summary_line, body, closing])
+
+
 def build_completion_message(prefix: str, entity: str, elapsed_seconds: int) -> str:
     safe_elapsed = max(0, int(elapsed_seconds))
     minutes, seconds = divmod(safe_elapsed, 60)
@@ -593,6 +633,15 @@ PRODUCTS_CSV_COLUMNS = [
     "createdAt",
     "updatedAt",
     "needKiz",
+]
+
+AD_LIST_CSV_COLUMNS = [
+    "seller_id",
+    "advert_seller_key",
+    "advertId",
+    "type",
+    "status",
+    "changeTime",
 ]
 
 
@@ -767,6 +816,235 @@ def write_products_csv(rows: List[Dict], path: str) -> None:
 
     with target.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=PRODUCTS_CSV_COLUMNS)
+        writer.writeheader()
+        for chunk_start in range(0, len(rows), 40000):
+            chunk = rows[chunk_start : chunk_start + 40000]
+            writer.writerows(chunk)
+
+
+def format_change_time(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if "." in value:
+        value = value.split(".", 1)[0]
+    value = value.replace("T", " ")
+    return value[:19]
+
+
+def fetch_ad_list_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+            s.seller_id,
+            s.wb_api_key,
+            s.wb_api_brand,
+            su.ad_list_status
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+            ON su.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        status = row.get("ad_list_status")
+        if isinstance(status, str):
+            try:
+                row["ad_list_status"] = json.loads(status)
+            except json.JSONDecodeError:
+                row["ad_list_status"] = None
+        result.append(row)
+    return result
+
+
+def compute_ad_list_priority(
+    sellers: Iterable[Dict],
+) -> Tuple[List[Dict], List[Dict], str]:
+    processed: List[Dict] = []
+    per_seller: Dict[str, Dict] = {}
+
+    for idx, raw in enumerate(sellers):
+        seller_id = str(raw.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+
+        ad_status = raw.get("ad_list_status") or None
+        brand = (raw.get("wb_api_brand") or seller_id).strip()
+
+        status_cat = "new" if not ad_status else "existing"
+        now_time = ad_status.get("nowTime") if ad_status else None
+
+        bucket = per_seller.get(seller_id)
+        if bucket is None:
+            bucket = {
+                "seller_id": seller_id,
+                "brand": brand or seller_id,
+                "status_cat": status_cat,
+                "idx": idx,
+                "ad_list_status": ad_status,
+                "now_time": now_time,
+                "cooldown_blocked": False,
+            }
+            per_seller[seller_id] = bucket
+        else:
+            if bucket["status_cat"] != "new" and status_cat == "new":
+                bucket["status_cat"] = status_cat
+            if not bucket.get("brand"):
+                bucket["brand"] = brand
+            if not bucket.get("now_time") and now_time:
+                bucket["now_time"] = now_time
+
+        processed.append(
+            {
+                "seller_id": seller_id,
+                "brand": brand or seller_id,
+                "status_cat": status_cat,
+                "idx": idx,
+                "wb_api_key": raw.get("wb_api_key"),
+                "ad_list_status": ad_status,
+                "now_time": now_time,
+                "cooldown_blocked": False,
+            }
+        )
+
+    all_sellers = list(per_seller.values())
+
+    new_group = [s for s in all_sellers if s["status_cat"] == "new"]
+    existing_group = [s for s in all_sellers if s["status_cat"] != "new"]
+
+    allow_set = set()
+
+    if new_group:
+        allow_set.update(s["seller_id"] for s in new_group)
+    else:
+        for s in existing_group:
+            status_dict = s.get("ad_list_status") or {}
+            now_dt = parse_msk_datetime(status_dict.get("nowTime") or s.get("now_time"))
+            if now_dt is None:
+                allow_set.add(s["seller_id"])
+            else:
+                age_min = minutes_since_msk(now_dt)
+                if age_min >= ADS_COOLDOWN_MINUTES:
+                    allow_set.add(s["seller_id"])
+                else:
+                    s["cooldown_blocked"] = True
+
+    lines = []
+    for s in sorted(all_sellers, key=lambda item: item["brand"].lower()):
+        allowed = s["seller_id"] in allow_set
+        mark = "✅" if allowed else "✖️"
+        status_dict = s.get("ad_list_status") or {}
+        now_dt = parse_msk_datetime(status_dict.get("nowTime") or s.get("now_time"))
+        if s["status_cat"] == "new":
+            minutes_text = "new"
+        elif now_dt is not None:
+            age_min = max(0, int(minutes_since_msk(now_dt)))
+            minutes_text = f"{age_min}min"
+        else:
+            minutes_text = "--"
+        lines.append(f"{minutes_text} | {s['brand']} {mark}")
+
+    summary_text = "\n".join(lines)
+
+    allowed_items: List[Dict] = []
+    for item in processed:
+        if item["seller_id"] in allow_set:
+            enriched = dict(item)
+            enriched["text"] = summary_text
+            allowed_items.append(enriched)
+
+    return allowed_items, all_sellers, summary_text
+
+
+def build_ad_list_selection_message(summary_text: str) -> str:
+    escaped = html.escape(summary_text)
+    return (
+        "<b>04 WB API</b> | Ad List\n"
+        "<blockquote>Подготовка выгрузки рекламных кампаний.\n"
+        f"<code>{escaped}</code></blockquote>"
+    )
+
+
+def fetch_ad_list_for_seller(item: Dict) -> Dict:
+    headers = {
+        "user-agent": WB_USER_AGENT,
+        "Authorization": f"Bearer {(item.get('wb_api_key') or '').strip()}",
+    }
+    response = requests.get(WB_AD_LIST_URL, headers=headers, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"WB Ad List API error for {item['seller_id']}: {response.status_code} {response.text}"
+        )
+
+    payload = response.json()
+    adverts_payload = payload.get("adverts") or []
+    rows: List[Dict] = []
+    total_all = 0
+    active_cnt = 0
+    paused_cnt = 0
+
+    if adverts_payload:
+        for block in adverts_payload:
+            advert_list = block.get("advert_list") or block.get("advertList") or []
+            ad_type = block.get("type")
+            try:
+                block_status = int(block.get("status"))
+            except (TypeError, ValueError):
+                block_status = None
+            block_count = int(block.get("count") or len(advert_list) or 0)
+            total_all += block_count
+
+            if block_status == 9:
+                active_cnt += block_count
+            elif block_status == 11:
+                paused_cnt += block_count
+
+            if not isinstance(advert_list, list):
+                continue
+            for advert in advert_list:
+                advert_id = advert.get("advertId")
+                change_time = format_change_time(advert.get("changeTime"))
+                if advert_id is None:
+                    continue
+                rows.append(
+                    {
+                        "seller_id": item["seller_id"],
+                        "advertId": advert_id,
+                        "changeTime": change_time,
+                        "type": ad_type,
+                        "status": block_status,
+                        "advert_seller_key": f"{advert_id}_{item['seller_id']}",
+                    }
+                )
+
+    counts = {
+        "all": total_all,
+        "active": active_cnt,
+        "paused": paused_cnt,
+    }
+
+    return {
+        "seller_id": item["seller_id"],
+        "brand": item.get("brand") or item["seller_id"],
+        "counts": counts,
+        "rows": rows,
+        "ad_list_status": item.get("ad_list_status"),
+    }
+
+
+def write_ad_list_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=AD_LIST_CSV_COLUMNS)
         writer.writeheader()
         for chunk_start in range(0, len(rows), 40000):
             chunk = rows[chunk_start : chunk_start + 40000]
@@ -1758,6 +2036,242 @@ def load_products_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
         raise RuntimeError(f"LOAD DATA INFILE for products failed: {exc}") from exc
 
 
+def load_ad_list_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{WB_AD_LIST_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE WB_ad_campaigns
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_id,
+              advert_seller_key,
+              advertId,
+              type,
+              status,
+              @changeTime
+            )
+            SET
+              changeTime = NULLIF(@changeTime, '')
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for ad list failed: {exc}") from exc
+
+
+def update_products_status(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    sellers_meta: Iterable[Dict],
+    products_rows: Iterable[Dict],
+    api_error_sellers: Set[str],
+) -> Tuple[int, List[Dict]]:
+    per_seller: Dict[str, Dict] = {}
+
+    for meta in sellers_meta:
+        seller_id = str(meta.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        per_seller[seller_id] = {
+            "prev": meta.get("products_status"),
+            "brand": meta.get("brand") or meta.get("wb_api_brand") or seller_id,
+            "api_error": seller_id in api_error_sellers,
+            "cards": [],
+        }
+
+    for row in products_rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        bucket = per_seller.setdefault(
+            seller_id,
+            {
+                "prev": row.get("products_status"),
+                "brand": row.get("brand") or seller_id,
+                "api_error": seller_id in api_error_sellers,
+                "cards": [],
+            },
+        )
+        cards = row.get("cards") or []
+        bucket["cards"].extend(cards)
+
+    updates: List[Tuple[str, str]] = []
+    details: List[Dict] = []
+    now_time = msk_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for seller_id, bucket in per_seller.items():
+        prev = bucket.get("prev")
+
+        if bucket.get("api_error"):
+            if prev:
+                products_status = prev
+            else:
+                continue
+        else:
+            cards = bucket.get("cards") or []
+
+            nm_ids: Set[str] = set()
+            imt_ids: Set[str] = set()
+            subject_names: Set[str] = set()
+            brand_names: Set[str] = set()
+            videos: Set[str] = set()
+            skus: Set[str] = set()
+            dimensions_valid_count = 0
+            need_kiz_count = 0
+
+            for card in cards:
+                nm_id = card.get("nmID")
+                if nm_id:
+                    nm_ids.add(str(nm_id))
+
+                imt_id = card.get("imtID")
+                if imt_id:
+                    imt_ids.add(str(imt_id))
+
+                subject_name = (card.get("subjectName") or "").strip()
+                if subject_name:
+                    subject_names.add(subject_name)
+
+                brand_name = (card.get("brand") or "").strip()
+                if brand_name:
+                    brand_names.add(brand_name)
+
+                video_url = (card.get("video") or "").strip()
+                if video_url:
+                    videos.add(video_url)
+
+                dimensions = card.get("dimensions") or {}
+                if dimensions.get("isValid"):
+                    dimensions_valid_count += 1
+
+                if card.get("needKiz"):
+                    need_kiz_count += 1
+
+                for size_variant in card.get("sizes") or []:
+                    for sku in size_variant.get("skus") or []:
+                        sku_val = str(sku).strip()
+                        if sku_val:
+                            skus.add(sku_val)
+
+            products_status = {
+                "nowTime": now_time,
+                "nmID": len(nm_ids),
+                "imtID": len(imt_ids),
+                "subjectName": len(subject_names),
+                "brand": len(brand_names),
+                "video": len(videos),
+                "dimensions_isValid": dimensions_valid_count,
+                "skus": len(skus),
+                "needKiz": need_kiz_count,
+            }
+
+        updates.append((json.dumps(products_status, ensure_ascii=False), seller_id))
+        details.append(
+            {
+                "seller_id": seller_id,
+                "brand": bucket.get("brand") or seller_id,
+                "status": products_status,
+            }
+        )
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE WB_sellers_updates
+            SET products_status = %s
+            WHERE seller_id = %s
+            """,
+            updates,
+        )
+
+    return len(updates), details
+
+
+def update_ad_list_status(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    sellers_meta: Iterable[Dict],
+    ad_results: Iterable[Dict],
+    api_error_sellers: Set[str],
+) -> Tuple[int, List[Dict]]:
+    per_seller: Dict[str, Dict] = {}
+
+    for meta in sellers_meta:
+        seller_id = str(meta.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        per_seller[seller_id] = {
+            "prev": meta.get("ad_list_status"),
+            "brand": meta.get("brand") or meta.get("wb_api_brand") or seller_id,
+            "api_error": seller_id in api_error_sellers,
+            "counts": None,
+        }
+
+    for result in ad_results:
+        seller_id = str(result.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        bucket = per_seller.setdefault(
+            seller_id,
+            {
+                "prev": result.get("ad_list_status"),
+                "brand": result.get("brand") or seller_id,
+                "api_error": seller_id in api_error_sellers,
+                "counts": None,
+            },
+        )
+        bucket["counts"] = result.get("counts")
+
+    updates: List[Tuple[str, str]] = []
+    details: List[Dict] = []
+    now_time = msk_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for seller_id, bucket in per_seller.items():
+        prev = bucket.get("prev")
+
+        if bucket.get("api_error"):
+            if prev:
+                ad_status = prev
+            else:
+                continue
+        else:
+            counts = bucket.get("counts") or {}
+            all_cnt = int(counts.get("all") or 0)
+            active_cnt = int(counts.get("active") or 0)
+            paused_cnt = int(counts.get("paused") or 0)
+
+            ad_status = {
+                "nowTime": now_time,
+                "ad_all_cnt": all_cnt,
+                "ad_active_cnt": active_cnt,
+                "ad_paused_cnt": paused_cnt,
+            }
+
+        updates.append((json.dumps(ad_status, ensure_ascii=False), seller_id))
+        details.append(
+            {
+                "seller_id": seller_id,
+                "brand": bucket.get("brand") or seller_id,
+                "status": ad_status,
+            }
+        )
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE WB_sellers_updates
+            SET ad_list_status = %s
+            WHERE seller_id = %s
+            """,
+            updates,
+        )
+
+    return len(updates), details
+
+
 def update_sales_status(
     cursor: mysql.connector.cursor.MySQLCursor,
     sellers_meta: Iterable[Dict],
@@ -2187,6 +2701,8 @@ def main() -> int:
                     {
                         "seller_id": item["seller_id"],
                         "cards": cards,
+                        "brand": item.get("brand"),
+                        "products_status": item.get("products_status"),
                     }
                 )
             except Exception as api_err:
@@ -2249,9 +2765,144 @@ def main() -> int:
         else:
             print("[WB-bot] Нет данных для формирования CSV карточек.", flush=True)
 
+        updated_products_count, products_details = update_products_status(cursor, products_allowed_items, products_data, products_api_errors)
+        if updated_products_count:
+            connection.commit()
+            print(
+                f"[WB-bot] Обновлены products_status для {updated_products_count} селлеров.",
+                flush=True,
+            )
+            if products_details:
+                status_products_message = build_products_status_message(products_details)
+                send_to_telegram(status_products_message)
+        elif products_api_errors:
+            print("[WB-bot] Статусы продуктов не обновлялись из-за ошибок API.", flush=True)
+
         products_elapsed = time.time() - products_started_at
         products_completion_message = build_completion_message("03", "Products", products_elapsed)
         send_to_telegram(products_completion_message)
+
+        ads_started_at = time.time()
+
+        ad_sellers = fetch_ad_list_sellers(cursor_dict)
+        ad_allowed_items, ad_aggregated, ad_summary = compute_ad_list_priority(ad_sellers)
+        print("[WB-bot] Подготовлена выборка для рекламных кампаний.", flush=True)
+        ad_selection_message = build_ad_list_selection_message(ad_summary)
+        send_to_telegram(ad_selection_message)
+
+        ad_results: List[Dict] = []
+        ad_rows: List[Dict] = []
+        ad_api_errors: Set[str] = set()
+
+        allowed_ad_ids = {item["seller_id"] for item in ad_allowed_items}
+        for s in ad_aggregated:
+            if s["seller_id"] in allowed_ad_ids or s["status_cat"] == "new":
+                continue
+            status_dict = s.get("ad_list_status") or {}
+            now_dt = parse_msk_datetime(status_dict.get("nowTime") or s.get("now_time"))
+            if now_dt is None:
+                continue
+            age_min = minutes_since_msk(now_dt)
+            remaining = ADS_COOLDOWN_MINUTES - age_min
+            if remaining > 0:
+                print(
+                    f"[WB-bot] Отложили рекламные кампании {s['seller_id']} ({s.get('brand')}) — повтор через ~{remaining:.1f} мин.",
+                    flush=True,
+                )
+
+        for item in ad_allowed_items:
+            token = (item.get("wb_api_key") or "").strip()
+            if not token:
+                print(
+                    f"[WB-bot] Пропускаем {item['seller_id']} в рекламе — отсутствует wb_api_key.",
+                    flush=True,
+                )
+                ad_api_errors.add(item["seller_id"])
+                continue
+            try:
+                result = fetch_ad_list_for_seller(item)
+                ad_results.append(result)
+                rows = result.get("rows") or []
+                counts = result.get("counts") or {}
+                print(
+                    "[WB-bot] Рекламные кампании: "
+                    f"all={counts.get('all', 0)} active={counts.get('active', 0)} paused={counts.get('paused', 0)} "
+                    f"для {item['seller_id']} ({item['brand']}).",
+                    flush=True,
+                )
+                ad_rows.extend(rows)
+            except Exception as api_err:
+                print(
+                    f"[WB-bot] Ошибка WB Ad List API для {item['seller_id']}: {api_err}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                ad_api_errors.add(item["seller_id"])
+                error_message = (
+                    "<b>WB_ad_list</b>\n"
+                    "<blockquote>"
+                    f"Ошибка запроса для селлера <code>{html.escape(item['brand'])}</code>.\n"
+                    f"<code>{html.escape(str(api_err))}</code>"
+                    "</blockquote>"
+                )
+                try:
+                    send_to_telegram(error_message)
+                except Exception:
+                    traceback.print_exc()
+
+        if ad_rows:
+            write_ad_list_csv(ad_rows, WB_AD_LIST_CSV_HOST_PATH)
+            print(
+                f"[WB-bot] CSV реклам сформирован: {WB_AD_LIST_CSV_HOST_PATH} ({len(ad_rows)} строк).",
+                flush=True,
+            )
+            ad_csv_message = (
+                "<b>04 WB API</b> | Ad List\n"
+                "<blockquote>Файл WB_ad_list_import.csv сформирован.</blockquote>"
+            )
+            send_to_telegram(ad_csv_message)
+        else:
+            print("[WB-bot] Нет данных по рекламным кампаниям.", flush=True)
+
+        if ad_rows:
+            try:
+                load_ad_list_into_db(cursor)
+                print("[WB-bot] WB_ad_campaigns успешно обновлена через LOAD DATA INFILE.", flush=True)
+                ad_load_message = (
+                    "<b>04 WB API</b> | Ad List\n"
+                    "<blockquote>Данные загружены в таблицу WB_ad_campaigns.</blockquote>"
+                )
+                send_to_telegram(ad_load_message)
+            except Exception as db_err:
+                print(f"[WB-bot] Ошибка LOAD DATA для реклам: {db_err}", file=sys.stderr, flush=True)
+                error_message = (
+                    "<b>04 WB API</b> | Ad List\n"
+                    "<blockquote>"
+                    "Ошибка загрузки данных в WB_ad_campaigns.\n"
+                    f"<code>{html.escape(str(db_err))}</code>"
+                    "</blockquote>"
+                )
+                try:
+                    send_to_telegram(error_message)
+                except Exception:
+                    traceback.print_exc()
+
+        ad_status_updates, ad_status_details = update_ad_list_status(cursor, ad_allowed_items, ad_results, ad_api_errors)
+        if ad_status_updates:
+            connection.commit()
+            print(
+                f"[WB-bot] Обновлены ad_list_status для {ad_status_updates} селлеров.",
+                flush=True,
+            )
+            if ad_status_details:
+                ad_status_message = build_ad_list_status_message(ad_status_details)
+                send_to_telegram(ad_status_message)
+        elif ad_api_errors:
+            print("[WB-bot] Статусы реклам не обновлялись из-за ошибок API.", flush=True)
+
+        ads_elapsed = time.time() - ads_started_at
+        ads_completion_message = build_completion_message("04", "Ad List", ads_elapsed)
+        send_to_telegram(ads_completion_message)
 
         elapsed = int(time.time() - workflow_started_at)
         minutes, seconds = divmod(elapsed, 60)
