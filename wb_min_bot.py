@@ -52,7 +52,7 @@ WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
 WB_AD_LIST_CSV_HOST_PATH = "/data/csv/WB_ad_list_import.csv"
 WB_AD_LIST_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_ad_list_import.csv"
-WB_AD_STATS_URL = "https://advert-api.wildberries.ru/adv/v2/fullstats"  # base endpoint
+WB_AD_STATS_URL = "https://advert-api.wildberries.ru/adv/v3/fullstats"
 WB_AD_STATS_CSV_HOST_PATH = "/data/csv/WB_ad_stats_import.csv"
 WB_AD_STATS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_ad_stats_import.csv"
 AD_STATS_ALLOWED_STATUSES = {7, 9, 11}
@@ -62,6 +62,7 @@ AD_STATS_MAX_INTERVAL_DAYS = 31
 AD_STATS_MAX_CAMPAIGNS_PER_REQUEST = 100
 AD_STATS_RATE_LIMIT_REQUESTS_PER_MINUTE = 3
 AD_STATS_RATE_INTERVAL_SECONDS = 20
+AD_STATS_SKIP_APP_TYPE_ZERO = True
 
 
 MSK_OFFSET = timezone(timedelta(hours=3))
@@ -702,6 +703,28 @@ AD_LIST_CSV_COLUMNS = [
     "changeTime",
 ]
 
+AD_STATS_CSV_COLUMNS = [
+    "seller_id",
+    "brand",
+    "advertId",
+    "date",
+    "nmId",
+    "name",
+    "appType",
+    "views",
+    "clicks",
+    "ctr",
+    "cpc",
+    "atbs",
+    "orders",
+    "shks",
+    "cr",
+    "canceled",
+    "sum",
+    "sum_price",
+    "avg_position",
+]
+
 
 def parse_json_field(value: Any) -> Any:
     if value is None:
@@ -717,6 +740,46 @@ def parse_json_field(value: Any) -> Any:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def to_ymd_from_iso(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    if "T" in candidate:
+        candidate = candidate.split("T", 1)[0]
+    return first_ymd(candidate)
+
+
+def to_int_or_none(value: Any) -> Optional[int]:
+    try:
+        value_int = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value_int
+
+
+def extract_nm_id(entry: Dict[str, Any]) -> Optional[int]:
+    for key in ("nmId", "nm_id", "nm", "nmid"):
+        if key in entry:
+            return to_int_or_none(entry.get(key))
+    return None
+
+
+def build_booster_index(entries: Any) -> Dict[str, Any]:
+    index: Dict[str, Any] = {}
+    if not isinstance(entries, list):
+        return index
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        date_str = to_ymd_from_iso(item.get("date"))
+        nm_id = extract_nm_id(item)
+        if date_str and nm_id is not None:
+            index[f"{date_str}|{nm_id}"] = item.get("avg_position")
+    return index
 
 
 def iso_to_mysql(value: Optional[str]) -> Optional[str]:
@@ -1340,6 +1403,80 @@ def build_ad_stats_selection_message(summary_text: str) -> str:
     )
 
 
+def parse_ad_stats_payload(payload: Any) -> List[Dict]:
+    if isinstance(payload, list):
+        payload_items = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict):
+        payload_items = [payload]
+    else:
+        return []
+
+    parsed_rows: List[Dict] = []
+    for item in payload_items:
+        advert_id = to_int_or_none(item.get("advertId") or item.get("advert_id"))
+        if advert_id is None:
+            continue
+
+        booster_index = build_booster_index(item.get("boosterStats"))
+        days = item.get("days")
+        if not isinstance(days, list) or not days:
+            continue
+
+        for day in days:
+            if not isinstance(day, dict):
+                continue
+            date_str = to_ymd_from_iso(day.get("date"))
+            if not date_str:
+                continue
+
+            apps = day.get("apps")
+            if not isinstance(apps, list):
+                continue
+
+            for app in apps:
+                if not isinstance(app, dict):
+                    continue
+                app_type = to_int_or_none(app.get("appType") or app.get("app_type"))
+                if AD_STATS_SKIP_APP_TYPE_ZERO and app_type == 0:
+                    continue
+
+                nms = app.get("nms")
+                if not isinstance(nms, list):
+                    continue
+
+                for nm in nms:
+                    if not isinstance(nm, dict):
+                        continue
+                    nm_id = extract_nm_id(nm)
+                    if nm_id is None:
+                        continue
+
+                    key = f"{date_str}|{nm_id}"
+                    parsed_rows.append(
+                        {
+                            "advertId": advert_id,
+                            "date": date_str,
+                            "nmId": nm_id,
+                            "name": nm.get("name"),
+                            "appType": app_type,
+                            "views": nm.get("views"),
+                            "clicks": nm.get("clicks"),
+                            "ctr": nm.get("ctr"),
+                            "cpc": nm.get("cpc"),
+                            "atbs": nm.get("atbs"),
+                            "orders": nm.get("orders"),
+                            "shks": nm.get("shks"),
+                            "cr": nm.get("cr"),
+                            "canceled": nm.get("canceled"),
+                            "sum": nm.get("sum"),
+                            "sum_price": nm.get("sum_price"),
+                            "avg_position": booster_index.get(key),
+                        }
+                    )
+
+    return parsed_rows
+
+
 def build_ad_stats_plan_message(requests: List[Dict], sellers_count: int) -> str:
     lines = [f"Запросов: {len(requests)} | селлеров: {sellers_count}"]
     sorted_requests = sorted(requests, key=lambda r: r.get("ready_at_ts", 0.0))
@@ -1348,8 +1485,8 @@ def build_ad_stats_plan_message(requests: List[Dict], sellers_count: int) -> str
         begin_short = format_date_short(entry["interval"]["beginDate"])
         end_short = format_date_short(entry["interval"]["endDate"])
         lines.append(
-            f"{idx}) {entry['brand']} | chunk {entry['chunk_index']}/{entry['chunk_total']} | "
-            f"{begin_short}→{end_short}"
+            f"{idx}) chunk {entry['chunk_index']}/{entry['chunk_total']} | "
+            f"{begin_short}→{end_short} | {entry['brand']}"
         )
     if len(requests) > len(preview):
         lines.append("...")
@@ -1372,6 +1509,21 @@ def write_ad_list_csv(rows: List[Dict], path: str) -> None:
 
     with target.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=AD_LIST_CSV_COLUMNS)
+        writer.writeheader()
+        for chunk_start in range(0, len(rows), 40000):
+            chunk = rows[chunk_start : chunk_start + 40000]
+            writer.writerows(chunk)
+
+
+def write_ad_stats_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=AD_STATS_CSV_COLUMNS)
         writer.writeheader()
         for chunk_start in range(0, len(rows), 40000):
             chunk = rows[chunk_start : chunk_start + 40000]
@@ -3238,6 +3390,13 @@ def main() -> int:
         ad_stats_selection_message = build_ad_stats_selection_message(ad_stats_summary)
         send_to_telegram(ad_stats_selection_message)
 
+        ad_stats_rows: List[Dict] = []
+        ad_stats_rows_by_seller: Dict[str, int] = defaultdict(int)
+        ad_stats_campaigns_with_data: Dict[str, Set[int]] = defaultdict(set)
+        ad_stats_empty_campaigns: Dict[str, int] = defaultdict(int)
+        ad_stats_errors: List[str] = []
+        seller_brand_map: Dict[str, str] = {}
+
         if ad_stats_requests:
             unique_sellers = len({req["seller_id"] for req in ad_stats_requests})
             ad_stats_plan_message = build_ad_stats_plan_message(ad_stats_requests, unique_sellers)
@@ -3246,11 +3405,94 @@ def main() -> int:
                 f"[WB-bot] Запланировано {len(ad_stats_requests)} запросов статистики для {unique_sellers} селлеров.",
                 flush=True,
             )
+
+            sorted_ad_stats_requests = sorted(ad_stats_requests, key=lambda r: r.get("ready_at_ts", 0.0))
+            for req in sorted_ad_stats_requests:
+                seller_id = req["seller_id"]
+                brand = req["brand"]
+                seller_brand_map[seller_id] = brand
+
+                wait_seconds = max(0.0, req.get("ready_at_ts", 0.0) - time.time())
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+
+                params = {
+                    "beginDate": req["interval"]["beginDate"],
+                    "endDate": req["interval"]["endDate"],
+                    "ids": req["campaign_ids_csv"],
+                }
+                headers = {
+                    "user-agent": WB_USER_AGENT,
+                    "Authorization": f"Bearer {req['token']}",
+                }
+                try:
+                    response = requests.get(WB_AD_STATS_URL, params=params, headers=headers, timeout=40)
+                    if response.status_code != 200:
+                        raise RuntimeError(f"{response.status_code} {response.text}")
+
+                    payload = response.json()
+                    parsed_rows = parse_ad_stats_payload(payload)
+
+                    if parsed_rows:
+                        ad_stats_rows_by_seller[seller_id] += len(parsed_rows)
+                        ad_stats_campaigns_with_data[seller_id].update(
+                            {row.get("advertId") for row in parsed_rows if row.get("advertId") is not None}
+                        )
+                        for row in parsed_rows:
+                            row_out = dict(row)
+                            row_out["seller_id"] = seller_id
+                            row_out["brand"] = brand
+                            ad_stats_rows.append(row_out)
+                    else:
+                        ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
+
+                except Exception as api_err:
+                    error_line = (
+                        f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
+                        f"{req['interval']['beginDate']}→{req['interval']['endDate']} | {api_err}"
+                    )
+                    ad_stats_errors.append(error_line)
+                    print(
+                        f"[WB-bot] Ошибка WB Ad Stats API: {error_line}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            if ad_stats_rows:
+                write_ad_stats_csv(ad_stats_rows, WB_AD_STATS_CSV_HOST_PATH)
+                print(
+                    f"[WB-bot] CSV статистики реклам сформирован: {WB_AD_STATS_CSV_HOST_PATH} ({len(ad_stats_rows)} строк).",
+                    flush=True,
+                )
+                summary_lines = []
+                for seller_id, rows_count in sorted(ad_stats_rows_by_seller.items(), key=lambda item: seller_brand_map.get(item[0], item[0])):
+                    brand = seller_brand_map.get(seller_id, seller_id)
+                    campaigns_with_data = len(ad_stats_campaigns_with_data.get(seller_id, set()))
+                    empty_count = ad_stats_empty_campaigns.get(seller_id, 0)
+                    summary_lines.append(
+                        f"{brand} | rows:{rows_count} | кампаний:{campaigns_with_data} | пустых:{empty_count}"
+                    )
+                ad_stats_summary_message = (
+                    "<b>05 WB API</b> | Ad Stats\n"
+                    "<blockquote><b>Статистика собрана ✅</b>\n"
+                    f"<code>{html.escape('\n'.join(summary_lines) or 'нет данных')}</code></blockquote>"
+                )
+                send_to_telegram(ad_stats_summary_message)
+            else:
+                print("[WB-bot] Нет данных статистики по рекламным кампаниям.", flush=True)
+
+            if ad_stats_errors:
+                error_message = (
+                    "<b>05 WB API</b> | Ad Stats\n"
+                    "<blockquote><b>Ошибки при запросе</b>\n"
+                    f"<code>{html.escape('\n'.join(ad_stats_errors))}</code></blockquote>"
+                )
+                send_to_telegram(error_message)
         else:
             print("[WB-bot] Нет рекламных кампаний для запроса статистики.", flush=True)
 
         ad_stats_elapsed = time.time() - ad_stats_started_at
-        ad_stats_completion_message = build_completion_message("05", "Ad Stats (план)", ad_stats_elapsed)
+        ad_stats_completion_message = build_completion_message("05", "Ad Stats", ad_stats_elapsed)
         send_to_telegram(ad_stats_completion_message)
 
         elapsed = int(time.time() - workflow_started_at)
