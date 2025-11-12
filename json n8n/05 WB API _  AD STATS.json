@@ -1,0 +1,880 @@
+{
+  "name": "05 WB API |  AD STATS",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  s.seller_id,\n  s.wb_api_key,\n  s.wb_api_brand,\n  su.ad_stats_status,\n  COALESCE((\n    SELECT JSON_ARRAYAGG(j.cj)\n    FROM (\n      SELECT JSON_OBJECT(\n               'advertId',          c.advertId,\n               'type',              c.`type`,\n               'status',            c.`status`\n             ) AS cj\n      FROM WB_ad_campaigns c\n      WHERE c.seller_id = s.seller_id\n      ORDER BY c.changeTime DESC\n    ) AS j\n  ), JSON_ARRAY()) AS campaigns\nFROM WB_sellers AS s\nJOIN WB_sellers_updates AS su\n  ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -304,
+        448
+      ],
+      "id": "67bdd6ac-c217-4f02-a9cd-57d9fe9bd3e7",
+      "name": "get_all_token2",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start04').first().json.result.message_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2560,
+        400
+      ],
+      "id": "e65be985-346f-49c7-bfcf-af62525cc558",
+      "name": "send_logs_finish",
+      "webhookId": "829d7003-fc0c-4c26-b2d9-e4d56ab6b2b3",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все входящие элементы\nconst items = $input.all();\n\n// Безопасно получаем стартовое время из узла\nconst startNode = $node[\"send_logs_start04\"];\nconst startTime = startNode?.json?.result?.date;\n\n// Заголовок\nlet summaryMessage = `<b>05 WB API | AdStats</b> завершен ✅\\n`;\n\nif (startTime) {\n  const endTime = Math.floor(Date.now() / 1000);\n  const executionTime = endTime - startTime;\n  const minutes = Math.floor(executionTime / 60);\n  const seconds = executionTime % 60;\n  summaryMessage += `<blockquote>Время: ${minutes} мин ${seconds} сек</blockquote>`;\n}\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2560,
+        192
+      ],
+      "id": "81b08ff1-38c2-4794-8e1d-1cbf5adcb149",
+      "name": "collapse",
+      "executeOnce": true
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        208
+      ],
+      "id": "200be051-22dc-4d38-93ca-59d5b8e961c2",
+      "name": "Execute Workflow Trigger"
+    },
+    {
+      "parameters": {
+        "url": "https://advert-api.wildberries.ru/adv/v3/fullstats",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "beginDate",
+              "value": "={{ $('Loop_adstats').item.json.beginDate }}"
+            },
+            {
+              "name": "endDate",
+              "value": "={{ $('Loop_adstats').item.json.endDate }}"
+            },
+            {
+              "name": "ids",
+              "value": "={{ $('Loop_adstats').item.json.ids_csv }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "=Authorization",
+              "value": "=Bearer {{ $('Loop_adstats').item.json.wb_api }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "39d1955b-36f5-4b9e-afe3-8126b7f4079e",
+      "name": "post_ad_stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        544,
+        688
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — WB /adv/v3/fullstats → flat rows per (advertId, date, appType, nmId)\n * Версия: 2025-10-16\n *\n * Вход: массив items, где каждый item.json соответствует ответу /adv/v3/fullstats по одной РК (или её части).\n * Нам нужны ТОЛЬКО строки уровня nms (на день и площадку), агрегаты выше — игнорируем.\n *\n * Выход (на каждую строку nms):\n * {\n *   advertId, date, nmId, name, appType,\n *   views, clicks, ctr, cpc, atbs, orders, shks, cr, canceled, sum, sum_price,\n *   avg_position // из boosterStats по (date, nm) или null\n * }\n */\n\nconst items = $input.all();\nconst output = [];\n\n// Настройка: пропускать ли площадку appType=0 (служебные агрегаты WB)\nconst SKIP_APP_TYPE_ZERO = true;\n\n/** Извлечь YYYY-MM-DD из ISO/даты */\nconst toYMD = (s) => {\n  if (!s) return null;\n  const str = String(s);\n  const t = str.indexOf('T');\n  return t > 0 ? str.slice(0, t) : str.slice(0, 10);\n};\n\n/** Безопасный appType → число или null */\nconst toAppType = (v) => {\n  if (v === null || v === undefined) return null;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : null;\n};\n\n/** Извлечь nmId из разных ключей WB */\nconst getNmId = (nm) =>\n  nm?.nmId ?? nm?.nm ?? nm?.nmid ?? nm?.nm_id ?? null;\n\n/** Построить индекс boosterStats по ключу \"YYYY-MM-DD|nmId\" → avg_position */\nconst indexBooster = (arr) => {\n  const map = new Map();\n  if (!Array.isArray(arr)) return map;\n  for (const b of arr) {\n    const d = toYMD(b?.date);\n    const nmAny = b?.nm ?? b?.nmId ?? b?.nmid ?? b?.nm_id ?? null;\n    if (!d || nmAny == null) continue;\n    const key = `${d}|${String(nmAny)}`;\n    map.set(key, b?.avg_position ?? null);\n  }\n  return map;\n};\n\nfor (const { json } of items) {\n  const advertId = json?.advertId ?? json?.advert_id ?? null;\n  if (advertId == null) continue;\n\n  // Индекс позиций по дате и nm\n  const boosterIdx = indexBooster(json?.boosterStats);\n\n  // На верхних уровнях агрегаты — игнорируем; работаем только с days[].apps[].nms[]\n  const days = Array.isArray(json?.days) ? json.days : [];\n  if (!days.length) continue;\n\n  for (const day of days) {\n    const ymd = toYMD(day?.date);\n    if (!ymd) continue;\n\n    const apps = Array.isArray(day?.apps) ? day.apps : [];\n    if (!apps.length) continue;\n\n    for (const app of apps) {\n      const appType = toAppType(app?.appType ?? app?.app_type ?? null);\n      if (SKIP_APP_TYPE_ZERO && appType === 0) continue;\n\n      const nms = Array.isArray(app?.nms) ? app.nms : [];\n      if (!nms.length) continue; // нет строк на этой площадке в этот день\n\n      for (const nm of nms) {\n        const nmId = getNmId(nm);\n        const name = nm?.name ?? null;\n        if (nmId == null) continue; // без nmId строку не формируем\n\n        // Метрики БЕРЁМ ТОЛЬКО с уровня nms:\n        const row = {\n          advertId,\n          date: ymd,\n          nmId,\n          name,\n          appType,\n\n          views:     nm?.views     ?? null,\n          clicks:    nm?.clicks    ?? null,\n          ctr:       nm?.ctr       ?? null,\n          cpc:       nm?.cpc       ?? null,\n          atbs:      nm?.atbs      ?? null,\n          orders:    nm?.orders    ?? null,\n          shks:      nm?.shks      ?? null,\n          cr:        nm?.cr        ?? null,\n          canceled:  nm?.canceled  ?? null,\n          sum:       nm?.sum       ?? null,\n          sum_price: nm?.sum_price ?? null,\n\n          // Средняя позиция из boosterStats по ключу (date|nmId)\n          avg_position: boosterIdx.get(`${ymd}|${String(nmId)}`) ?? null,\n        };\n\n        output.push({ json: row });\n      }\n    }\n  }\n}\n\nreturn output;"
+      },
+      "id": "aa54b486-553b-434f-8565-215c6cd699d8",
+      "name": "different_stats_for_type",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Статистика кампаний\nВозвращает затраты [Метод](https://dev.wildberries.ru/openapi/promotion#tag/Finansy/paths/~1adv~1v1~1upd/get)\n\nПервый цикл собирает все кампании, которые имеют данные и передает готовый список для загрузки в БД\nУ ВБ есть ограничение в 100 РК, мы берем по 100 самых актуальных у селлера (по дате изменения) и прогоняем по циклу",
+        "height": 904,
+        "width": 1218
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        16,
+        80
+      ],
+      "id": "fb17d1ea-b7fe-41e6-be94-889ecaa04187",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e7ce8b8c-6f89-468b-a403-8331ed5be199",
+              "leftValue": "={{ $json.days }}",
+              "rightValue": "",
+              "operator": {
+                "type": "array",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        736,
+        688
+      ],
+      "id": "df8d1cf4-5428-494f-bdfd-a97dbe55385f",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "amount": 20
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        304,
+        528
+      ],
+      "id": "8b4d0688-3ca0-4173-bd92-e3110dd6a316",
+      "name": "Wait",
+      "webhookId": "bb7cfeba-d15f-49de-9524-7e866d6d29b3"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        80,
+        224
+      ],
+      "id": "c1a4b348-cb4d-4fe0-ab2f-4a46389ddf4e",
+      "name": "Loop_adstats"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1056,
+        704
+      ],
+      "id": "c362297a-f597-4964-b56c-478ff310c5f3",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>05 WB API</b> | ADStats | Запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -512,
+        448
+      ],
+      "id": "354a3477-040d-4bb6-85d6-0a34b0ef5fb9",
+      "name": "send_logs_start04",
+      "webhookId": "45ea7f34-f6e4-4419-b547-29fe6e57ee1e",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO WB_ad_stats (\n    seller_advert_date_key,\n    seller_id,\n    date,\n    views,\n    clicks,\n    ctr,\n    cpc,\n    ad_expenses,\n    atbs,\n    orders,\n    cr,\n    shks,\n    sum_price,\n    app_type,\n    avg_position,\n    nmID,\n    advert_id,\n    subjectName,\n    brand\n)\nSELECT\n    CONCAT(incoming.seller_id, '_', incoming.advertId, '_', incoming.nmId, '_', incoming.date, '_', incoming.appType) AS seller_advert_date_key,\n    incoming.seller_id,\n    incoming.date,\n    incoming.views,\n    incoming.clicks,\n    incoming.ctr,\n    incoming.cpc,\n    incoming.sum AS ad_expenses,\n    incoming.atbs,\n    incoming.orders,\n    incoming.cr,\n    incoming.shks,\n    incoming.sum_price,\n    incoming.appType AS app_type,\n    incoming.avg_position,\n    incoming.nmId AS nmID,\n    incoming.advertId AS advert_id,\n    p.subjectName,\n    p.brand\nFROM (\n  SELECT\n    '{{ $json.seller_id }}' AS seller_id,\n    '{{ $json.date }}' AS date,\n    '{{ $json.views }}' AS views,\n    '{{ $json.clicks }}' AS clicks,\n    '{{ $json.ctr }}' AS ctr,\n    '{{ $json.cpc }}' AS cpc,\n    '{{ $json.sum }}' AS sum,\n    '{{ $json.atbs }}' AS atbs,\n    '{{ $json.orders }}' AS orders,\n    '{{ $json.cr }}' AS cr,\n    '{{ $json.shks }}' AS shks,\n    '{{ $json.sum_price }}' AS sum_price,\n    '{{ $json.appType }}' AS appType,\n    '{{ $json.avg_position }}' AS avg_position,\n    '{{ $json.nmId }}' AS nmId,\n    '{{ $json.advertId }}' AS advertId\n) incoming\nJOIN WB_products p ON p.nmID = incoming.nmId\nON DUPLICATE KEY UPDATE\n    views = VALUES(views),\n    clicks = VALUES(clicks),\n    ctr = VALUES(ctr),\n    cpc = VALUES(cpc),\n    ad_expenses = VALUES(ad_expenses),\n    atbs = VALUES(atbs),\n    orders = VALUES(orders),\n    cr = VALUES(cr),\n    shks = VALUES(shks),\n    sum_price = VALUES(sum_price),\n    app_type = VALUES(app_type),\n    avg_position = VALUES(avg_position),\n    nmID = VALUES(nmID),\n    advert_id = VALUES(advert_id),\n    subjectName = VALUES(subjectName),\n    brand = VALUES(brand);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        1712,
+        464
+      ],
+      "id": "193ca2f0-d899-440b-86a4-5c9365ee2fb5",
+      "name": "ins_upd_ad_stats2",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все входящие итемы\nconst allItems = items;\n\n// Фильтруем, оставляя только \"непустые\" итемы\n// В данном примере признаком \"непустого\" считается наличие поля \"date\"\nconst nonEmptyItems = allItems.filter(item => item.json.date !== undefined && item.json.date !== null);\n\n// Собираем список уникальных seller_id среди непустых итемов\nconst uniqueSellerIds = [...new Set(nonEmptyItems.map(item => item.json.seller_id))];\nconst totalSellers = uniqueSellerIds.length;\n\n// Для удобства группируем непустые итемы по seller_id\nconst itemsBySeller = {};\nfor (const item of nonEmptyItems) {\n  const sid = item.json.seller_id;\n  if (!itemsBySeller[sid]) {\n    itemsBySeller[sid] = [];\n  }\n  itemsBySeller[sid].push(item);\n}\n\n// Общее количество непустых итемов\nconst totalNonEmptyItems = nonEmptyItems.length;\nlet globalItemIndex = 0;\n\n// Идём по каждому seller_id в порядке их появления в uniqueSellerIds\nfor (let sellerIndex = 0; sellerIndex < uniqueSellerIds.length; sellerIndex++) {\n  const sellerId = uniqueSellerIds[sellerIndex];\n  const sellerItems = itemsBySeller[sellerId];\n  const sellerItemCount = sellerItems.length;  \n  const currentSellerOrder = sellerIndex + 1; // порядковый номер селлера\n  \n  // Для каждого итема внутри одного seller_id\n  for (let i = 0; i < sellerItemCount; i++) {\n    globalItemIndex++;\n    const currentItem = sellerItems[i];\n    const brand = currentItem.json.brand || \"\";\n    const campaignCount = currentItem.json.campaign_count || 0;\n    \n    // Формируем текст\n    currentItem.json.text = \n`<b>05 WB API | ADStats</b>\n<blockquote>☑️ 1 этап. Сбор данных\n▫️2 этап. Сохранение статистики\n     Селлер: ${currentSellerOrder} из ${totalSellers}\n     Бренд: ${brand}\n     Кампаний: ${campaignCount}\n     Строк статистики: ${i+1} из ${sellerItemCount}\n     Всего итемов: ${globalItemIndex} из ${totalNonEmptyItems}\n</blockquote>`;\n\n  }\n}\n\n// Возвращаем только непустые итемы\nreturn nonEmptyItems;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        208
+      ],
+      "id": "7335fc3b-b836-42fa-866e-936b42d12925",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "batchSize": 1000,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1648,
+        208
+      ],
+      "id": "f61a482f-857a-460b-8707-ab2f1c7ae3f5",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start04').first().json.result.message_id }}",
+        "text": "={{ $('Loop').first().json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1936,
+        464
+      ],
+      "id": "4533dd50-1a3a-4608-95ff-c399ac951507",
+      "name": "send_logs_finish2",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — build_fullstats_requests_with_ad_status v2.1\n * Изменения:\n *  - delay: первый итем по seller_id → delay=0, остальные → delay=1\n *  - фильтр кампаний по статусам 7,9,11\n *  - texttg: HTML-резюме для Telegram\n *  - passthrough: ad_stats_status из входного итема теперь проходит в каждый выходной\n */\n\nconst src = $input.all();\n\n/* ── Время и даты (MSK) ───────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\n\nconst pad = (n) => String(n).padStart(2, '0');\nconst ymdUTC = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\n\nconst mskNowDate = () => new Date(Date.now() + MSK_OFFSET_MS);\nconst todayMSK = () => {\n  const d = mskNowDate();\n  return ymdUTC(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())));\n};\nconst ymdMskMinusDays = (days) => {\n  const d = mskNowDate();\n  const t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - days * MS_DAY;\n  return ymdUTC(new Date(t));\n};\n\nconst parseYMD = (s) => {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(String(s||'').trim());\n  if (!m) return null;\n  return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));\n};\nconst ymd = (d) => ymdUTC(d);\nconst addDaysYMD = (ymdStr, n) => {\n  const d = parseYMD(ymdStr); if (!d) return null;\n  return ymd(new Date(d.getTime() + n * MS_DAY));\n};\nconst subDaysYMD = (ymdStr, n) => addDaysYMD(ymdStr, -n);\nconst cmpYMD = (a, b) => String(a).localeCompare(String(b));\n\n/** Разбить интервал [startYMD..endYMD] на чанки максимум по 30 дней (включительно) */\nconst chunkBetween = (startYMD, endYMD, maxDays = 30) => {\n  if (!startYMD || !endYMD) return [];\n  if (cmpYMD(startYMD, endYMD) > 0) [startYMD, endYMD] = [endYMD, startYMD];\n\n  const chunks = [];\n  let curStart = startYMD;\n  while (cmpYMD(curStart, endYMD) <= 0) {\n    const curEndCandidate = addDaysYMD(curStart, maxDays - 1); // включительно\n    const curEnd = (cmpYMD(curEndCandidate, endYMD) <= 0) ? curEndCandidate : endYMD; // ← фикс\n    chunks.push({ beginDate: curStart, endDate: curEnd });\n    curStart = addDaysYMD(curEnd, 1);\n  }\n  return chunks;\n};\n\n/* ── Утилиты ──────────────────────────────────── */\nconst ALLOWED_STATUSES = new Set([7, 9, 11]);\nconst escapeHtml = (s) =>\n  String(s ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n// берём объект из ad_stats_status (если передали массив — последний элемент)\nconst pickPrevStatusObj = (val) => {\n  if (!val) return null;\n  if (Array.isArray(val)) return val.length ? val[val.length - 1] : null;\n  if (typeof val === 'object') return val;\n  return null;\n};\n\n/* ── Сбор по селлерам ─────────────────────────── */\nconst perSeller = new Map();\n/**\n * perSeller[seller_id] = {\n *   brand, token, idx, statusCat, nowTime, rightBoundary, maxBeginDate,\n *   ids: Set<number>, excludedCount: number, intervals: Array<{beginDate,endDate}>,\n *   prev: object|null,                 // нормализованный объект статуса (для логики)\n *   ad_stats_status: any|null          // сырой входной для passthrough\n * }\n */\n\nfor (let i = 0; i < src.length; i++) {\n  const j = src[i].json || {};\n  const seller_id = String(j.seller_id ?? '').trim();\n  if (!seller_id) continue;\n\n  const brand = String(j.wb_api_brand ?? seller_id).trim();\n  const token = String(j.wb_api ?? j.wb_api_key ?? '').trim();\n\n  if (!perSeller.has(seller_id)) {\n    perSeller.set(seller_id, {\n      brand, token, idx: i,\n      statusCat: null, nowTime: null,\n      rightBoundary: null, maxBeginDate: null,\n      ids: new Set(),\n      excludedCount: 0,\n      intervals: [],\n      prev: null,\n      ad_stats_status: null,\n    });\n  }\n  const b = perSeller.get(seller_id);\n\n  // кампании: либо j.campaigns[], либо j.advertId в корне\n  if (Array.isArray(j.campaigns)) {\n    for (const c of j.campaigns) {\n      const idNum = Number(c?.advertId);\n      const stNum = Number(c?.status);\n      if (Number.isFinite(idNum) && ALLOWED_STATUSES.has(stNum)) {\n        b.ids.add(idNum);\n      } else if (Number.isFinite(idNum)) {\n        b.excludedCount += 1; // исключаем из-за статуса\n      }\n    }\n  } else if (j.advertId !== undefined) {\n    // одиночный advertId без статуса → исключаем, чтобы не ловить 400 от WB\n    const idNum = Number(j.advertId);\n    if (Number.isFinite(idNum)) b.excludedCount += 1;\n  }\n\n  // статус селлера\n  const stRaw = j.ad_stats_status ?? null;\n  const stObj = pickPrevStatusObj(stRaw);\n  if (!b.ad_stats_status && stRaw != null) b.ad_stats_status = stRaw;  // ⬅ passthrough\n  if (!b.prev && stObj) b.prev = stObj;\n\n  const status = stObj?.status ?? (stObj == null ? null : undefined);\n  const statusCat = (stObj == null) ? 'new' : (status === 'left' ? 'left' : (status === 'right' ? 'right' : 'other'));\n  b.statusCat = b.statusCat ?? statusCat;\n  if (!b.nowTime && stObj?.nowTime) b.nowTime = String(stObj.nowTime);\n\n  // границы\n  const rb = stObj?.rightBoundary ? String(stObj.rightBoundary).slice(0,10) : null;\n  const mb = stObj?.maxBeginDate ? String(stObj.maxBeginDate).slice(0,10) : null;\n  b.rightBoundary  = b.rightBoundary  ?? rb;\n  b.maxBeginDate   = b.maxBeginDate   ?? mb;\n}\n\n/* ── Интервалы по правилам ───────────────────── */\nconst today = todayMSK();\nconst thr180 = ymdMskMinusDays(180);\nconst def15From = ymdMskMinusDays(15);\n\nfor (const [, b] of perSeller) {\n  const { statusCat, rightBoundary, maxBeginDate } = b;\n\n  if (statusCat === 'new') {\n    b.intervals = chunkBetween(def15From, today, 30);\n  } else if (statusCat === 'left') {\n    if (maxBeginDate && cmpYMD(maxBeginDate, thr180) > 0) {\n      b.intervals = chunkBetween(thr180, today, 30);\n    } else if (maxBeginDate && cmpYMD(maxBeginDate, thr180) <= 0) {\n      if (rightBoundary) {\n        const start = subDaysYMD(rightBoundary, 29);\n        b.intervals = chunkBetween(start, rightBoundary, 30);\n      } else {\n        b.intervals = chunkBetween(def15From, today, 30);\n      }\n    } else {\n      b.intervals = chunkBetween(def15From, today, 30);\n    }\n  } else if (statusCat === 'right') {\n    if (rightBoundary) {\n      const start = subDaysYMD(rightBoundary, 7);\n      b.intervals = chunkBetween(start, today, 30);\n    } else {\n      b.intervals = chunkBetween(def15From, today, 30);\n    }\n  } else {\n    b.intervals = chunkBetween(def15From, today, 30);\n  }\n}\n\n/* ── Ограничение потока по приоритетам ───────── */\nconst all = Array.from(perSeller.entries()).map(([seller_id, v]) => ({ seller_id, ...v }));\n\nconst newGroup   = all.filter(s => s.statusCat === 'new');\nconst leftGroup  = all.filter(s => s.statusCat === 'left');\nconst rightGroup = all.filter(s => s.statusCat === 'right');\n\nconst allowSet = new Set();\nif (newGroup.length > 0) {\n  for (const s of newGroup) allowSet.add(s.seller_id);\n} else if (leftGroup.length > 0) {\n  const parseTs = (s) => {\n    const m = String(s.nowTime ?? '').match(/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2}):(\\d{2})$/);\n    if (!m) return Number.POSITIVE_INFINITY;\n    return Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]);\n  };\n  leftGroup.sort((a,b) => {\n    const ta = parseTs(a), tb = parseTs(b);\n    if (ta !== tb) return ta - tb;\n    return a.idx - b.idx;\n  });\n  allowSet.add(leftGroup[0].seller_id);\n} else {\n  if (rightGroup.length > 0 && rightGroup.length === all.length) {\n    for (const s of rightGroup) allowSet.add(s.seller_id);\n  }\n}\n\n/* ── Сводка text по всем селлерам ────────────── */\nconst summaryLines = all\n  .sort((a,b) => a.brand.localeCompare(b.brand, 'ru'))\n  .map(s => {\n    const rep = s.intervals[0] || { beginDate: '-', endDate: '-' };\n    const mark = allowSet.has(s.seller_id) ? '✅' : '✖️';\n    const idsCount = s.ids.size;\n    return `${s.statusCat} | ${rep.beginDate} - ${rep.endDate} | ${idsCount} | ${s.brand} ${mark}`;\n  });\nconst summaryText = summaryLines.join('\\n');\n\n/* ── Формирование выходных чанков ────────────── */\nconst chunkArray = (arr, size) => {\n  const out = [];\n  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));\n  return out;\n};\n\nconst allowedEffective = all.filter(s => allowSet.has(s.seller_id) && s.ids.size > 0);\n\n// Индекс селлера для TG-текста\nconst sellerIndexMap = new Map();\nallowedEffective.forEach((s, idx) => sellerIndexMap.set(s.seller_id, idx + 1));\nconst sellersTotal = allowedEffective.length;\n\nconst out = [];\nconst perSellerEmitCount = new Map(); // seller_id → сколько уже эмитнули (для delay)\nfor (const s of allowedEffective) {\n  const { seller_id, brand, token, ids, intervals, excludedCount, ad_stats_status } = s;\n\n  const idArr = Array.from(ids);\n  if (!idArr.length) continue;\n\n  const idChunks = chunkArray(idArr, 100);\n  const idsChunkCount = idChunks.length;\n\n  const idsIncludedTotal = idArr.length;\n  const idsExcludedTotal = excludedCount;\n\n  perSellerEmitCount.set(seller_id, 0);\n\n  for (let cIdx = 0; cIdx < idChunks.length; cIdx++) {\n    const ids_csv = idChunks[cIdx].join(',');\n    const idsChunkIndex = cIdx + 1;\n\n    for (const { beginDate, endDate } of intervals) {\n      const already = perSellerEmitCount.get(seller_id) || 0;\n      const delayFlag = already > 0 ? 1 : 0;          // 0 для первого, 1 для всех последующих\n      perSellerEmitCount.set(seller_id, already + 1);\n\n      out.push({\n        json: {\n          seller_id,\n          wb_api_brand: brand,\n          wb_api: token,\n          ids_csv,\n          beginDate,\n          endDate,\n          delay: delayFlag,\n          text: summaryText,\n\n          // ⬇ passthrough статуса (как пришёл во входе)\n          ad_stats_status: ad_stats_status ?? null,\n\n          // служебные поля для дальнейшей сборки texttg\n          _tg: {\n            sellerIdx: sellerIndexMap.get(seller_id) || 0,\n            sellersTotal,\n            idsIncludedTotal,\n            idsExcludedTotal,\n            idsChunkIndex,\n            idsChunkCount,\n            brand,\n          }\n        }\n      });\n    }\n  }\n}\n\n// Теперь знаем общее число итемов → добавим texttg\nconst totalOut = out.length;\nfor (let i = 0; i < out.length; i++) {\n  const j = out[i].json;\n  const t = j._tg || {};\n  const brandEsc = escapeHtml(t.brand);\n\n  j.texttg =\n    `<b>05 WB API | ADStats</b>\\n` +\n    `<blockquote>` +\n    `Селлер: ${t.sellerIdx} из ${t.sellersTotal}\\n` +\n    `Бренд: ${brandEsc}\\n` +\n    `Кампаний добавлено: ${t.idsIncludedTotal} [${t.idsChunkIndex} из ${t.idsChunkCount}]\\n` +\n    `Кампаний исключено: ${t.idsExcludedTotal}\\n` +\n    `Всего: ${i + 1} из ${totalOut}\\n` +\n    `</blockquote>`;\n\n  delete j._tg; // cleanup\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        224
+      ],
+      "id": "db868443-de61-419d-91ff-f1a2ebaf7e2b",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<blockquote>{{ $json.text }}</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -144,
+        16
+      ],
+      "id": "4b607d06-3e89-4881-82a5-7f8ec933f1a5",
+      "name": "send_logs_finish3",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": true,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b1e7b308-ffb4-4a24-901b-1ab2f34c0947",
+              "leftValue": "={{ $('Loop_adstats').item.json.delay }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        304,
+        672
+      ],
+      "id": "fc9b1c03-f016-40c4-8ab6-2f7815468b7c",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start04').first().json.result.message_id }}",
+        "text": "={{ $('Loop_adstats').first().json.texttg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        80,
+        672
+      ],
+      "id": "34631676-3d24-49ab-96f0-26452555cfdc",
+      "name": "send_logs_finish4",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Сохраняем данные в БД\n",
+        "height": 536,
+        "width": 562
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        128
+      ],
+      "id": "a5f19e0b-9dfa-487d-83ac-a39074d8f672",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — build_ad_stats_status v1.2\n *\n * Изменения:\n *  - Единый общий text для всех выходных итемов:\n *      \"Всего селлеров: N | всего строк: M\" + построчная сводка по каждому селлеру\n *  - Поля sellersTotal и rowsTotal добавлены в каждый выходной item\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* ── Утилиты времени/дат ─────────────────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3 (постоянно)\nconst pad = (n) => String(n).padStart(2, '0');\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\nconst ymdUTC = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\nconst mskTodayMinusDaysYMD = (days) => ymdUTC(new Date(nowMSK().getTime() - days * MS_DAY));\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMDf = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Парсинг прошлого состояния ──────────────────────────── */\nconst pickPrevStatusObj = (val) => {\n  if (!val) return null;\n  if (Array.isArray(val)) return val.length ? val[val.length - 1] : null;\n  if (typeof val === 'object') return val;\n  return null;\n};\n\n/* ── Группировка по seller_id ────────────────────────────── */\nconst perSeller = new Map();\n\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  const bucket = perSeller.get(sellerId) || {\n    rows: [],\n    brand: null,\n    prev: null, // предыдущий ad_stats_status (object)\n  };\n\n  bucket.rows.push(json);\n  if (!bucket.brand && json.wb_api_brand) bucket.brand = String(json.wb_api_brand);\n  if (!bucket.prev && json.ad_stats_status) bucket.prev = pickPrevStatusObj(json.ad_stats_status);\n\n  perSeller.set(sellerId, bucket);\n}\n\n/* ── Порог 180 дней по МСК ───────────────────────────────── */\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обработка по селлеру ────────────────────────────────── */\nconst out = [];\nconst perSellerLines = []; // строки для общего summary\n\nlet rowsTotal = 0;\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const rows = bucket.rows;\n  const count = rows.length;\n  rowsTotal += count;\n\n  const brand = bucket.brand || '';\n\n  // Текущий beginDate по батчу селлера (если вдруг разные — берём МИНИМАЛЬНЫЙ)\n  let currentBeginDate = null;\n\n  // Границы по полю date (YYYY-MM-DD из статистики)\n  let leftBoundary = null;\n  let rightBoundary = null;\n\n  for (const r of rows) {\n    const b = firstYMD(r.beginDate);\n    if (b) currentBeginDate = minYMD(currentBeginDate, b);\n\n    const ymd = firstYMD(r.date) ?? firstYMD(r.lastChangeDate);\n    if (ymd) {\n      leftBoundary = minYMD(leftBoundary, ymd);\n      rightBoundary = maxYMDf(rightBoundary, ymd);\n    }\n  }\n\n  // Предыдущее состояние\n  const prev = bucket.prev ?? null;\n  const prevStatus = prev?.status ?? null;\n  const prevMaxBegin = firstYMD(prev?.maxBeginDate);\n\n  // Новые поля\n  let newMaxBeginDate;\n  let newStatus;\n\n  if (!prev) {\n    // Впервые видим селлера\n    newMaxBeginDate = currentBeginDate || null;\n    newStatus = 'left';\n  } else {\n    // maxBeginDate = min(старый maxBeginDate, текущий beginDate)\n    newMaxBeginDate = minYMD(prevMaxBegin, currentBeginDate) || prevMaxBegin || currentBeginDate || null;\n\n    // 'right' если старый уже 'right' ИЛИ текущий beginDate <= (МСК сегодня - 180 дней)\n    const condA = prevStatus === 'right';\n    const condB = currentBeginDate && (currentBeginDate <= threshold180);\n    newStatus = (condA || condB) ? 'right' : 'left';\n  }\n\n  const statusObj = {\n    maxBeginDate: newMaxBeginDate || null,\n    status: newStatus,\n    lastTotalRow: count,\n    leftBoundary: leftBoundary || null,\n    rightBoundary: rightBoundary || null,\n    lastBeginDate: currentBeginDate || null,\n    nowTime: ymdHmsUTC(nowMSK()), // текущее время по МСК\n  };\n\n  // Индивидуальная строка для общего summary (сортировать будем позже по бренду)\n  const line =\n    `${statusObj.maxBeginDate || 'null'} | ` +\n    `${prevStatus || 'null'} → ${newStatus} | ` +\n    `${count} | ${brand}`;\n  perSellerLines.push({ brand, line });\n\n  out.push({\n    json: {\n      seller_id: sellerId,\n      wb_api_brand: brand,\n      ad_stats_status: statusObj, // один объект\n      // text временно пустой — заполним общим summary ниже для всех\n      text: '',\n    },\n  });\n}\n\n/* ── Формируем единый общий text и проставляем всем ──────── */\nconst sellersTotal = perSeller.size;\n\nperSellerLines.sort((a, b) => a.brand.localeCompare(b.brand, 'ru'));\nconst body = perSellerLines.map(x => x.line).join('\\n');\n\nconst commonText =\n  `Всего селлеров: ${sellersTotal} | всего строк: ${rowsTotal}\\n` +\n  body;\n\n// Проставляем общий text и агрегаты всем выходам\nfor (const e of out) {\n  e.json.text = commonText;\n  e.json.sellersTotal = sellersTotal;\n  e.json.rowsTotal = rowsTotal;\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        848
+      ],
+      "id": "12596fae-c484-4428-9b7c-10cd14843f9d",
+      "name": "create_status"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": {
+          "__rl": true,
+          "value": "WB_sellers_updates",
+          "mode": "list",
+          "cachedResultName": "WB_sellers_updates"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_id",
+        "valueToMatchOn": "={{ $json.seller_id }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "ad_stats_status",
+              "value": "={{ JSON.stringify($json.ad_stats_status) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        1936,
+        848
+      ],
+      "id": "d2983261-7333-4598-97cb-7f36cead3c98",
+      "name": "ins_upd_orders1",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>05 WB API | ADStats</b>\n<blockquote><b>Статус обновлен ✅</b>\n{{ $('create_status').first().json.text }}\n</blockquote>\n",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1680,
+        1088
+      ],
+      "id": "3fcb070c-9a2c-457c-bf9c-5212db5412e7",
+      "name": "send_create1",
+      "webhookId": "aae4a473-2aa1-4a36-9c27-794f7b994377",
+      "retryOnFail": false,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Формирование статуса\n\n\n",
+        "height": 468,
+        "width": 560
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        784
+      ],
+      "id": "6c0ed13c-bc3c-4c52-ac8d-f4506f7ed362",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "zqdZA3ihBPs5uYA6",
+          "mode": "list",
+          "cachedResultName": "06 WB API | AD EXPENSES"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1952,
+        1088
+      ],
+      "id": "baa11a5e-55b7-41ae-9627-aff3d6d70e31",
+      "name": "Call '06 WB API | AD EXPENSES'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_all_token2": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start04",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "post_ad_stats": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "different_stats_for_type",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "post_ad_stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_adstats": {
+      "main": [
+        [
+          {
+            "node": "create_status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "send_logs_finish4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Loop_adstats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start04": {
+      "main": [
+        [
+          {
+            "node": "get_all_token2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish": {
+      "main": [
+        []
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "collapse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ins_upd_ad_stats2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_ad_stats2": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish2": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish3",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop_adstats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "post_ad_stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "different_stats_for_type": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "send_logs_finish4": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_status": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_orders1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_orders1": {
+      "main": [
+        [
+          {
+            "node": "send_create1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_create1": {
+      "main": [
+        [
+          {
+            "node": "Call '06 WB API | AD EXPENSES'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ce0a66d0-8d08-4129-8430-2d42434c5845",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "58m7Ckdir4braziu",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    },
+    {
+      "createdAt": "2025-10-10T12:03:26.517Z",
+      "updatedAt": "2025-10-10T12:03:26.517Z",
+      "id": "VJZ1GKkGN6Id3ylE",
+      "name": "30 min"
+    }
+  ]
+}

@@ -1,0 +1,912 @@
+{
+  "name": "03 WB API | PRODUCTS",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start06').first().json.result.message_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1536,
+        304
+      ],
+      "id": "50b74a8d-f3ae-44bb-a9fa-84cd8cc9c977",
+      "name": "send_logs_finish",
+      "webhookId": "74ef05ff-4267-4de3-8b2a-d4a4372db6dd",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем массив всех элементов из входных данных\nconst items = $input.all();\n\n// Проверяем, исполнился ли узел \"send_logs_start03\"\nconst startNode = $node[\"send_logs_start06\"];\nconst startTime = startNode && startNode.json && startNode.json.result \n    ? startNode.json.result.date \n    : Math.floor(Date.now() / 1000); // Берем текущее время, если узел не исполнился\n\n// Получаем текущее время (Unix timestamp)\nconst endTime = Math.floor(Date.now() / 1000);\n\n// Вычисляем время выполнения (разница в секундах)\nconst executionTime = endTime - startTime;\n\n// Конвертируем секунды в минуты и секунды\nconst minutes = Math.floor(executionTime / 60);\nconst seconds = executionTime % 60;\n\n// Подсчет уникальных seller_id\nconst uniqueSellers = new Set();\n\n// Перебираем массив и записываем уникальных селлеров\nitems.forEach(item => {\n    if (item.json && item.json.seller_id) {\n        uniqueSellers.add(item.json.seller_id);\n    }\n});\n\n// Количество уникальных селлеров\nconst totalUniqueSellers = uniqueSellers.size;\n\n// Формируем итоговое сообщение с указанием времени выполнения\nconst summaryMessage = `<b>03 WB API | Product List </b> завершен ✅\nВремя: ${minutes} мин ${seconds} сек\nCеллеры: ${totalUniqueSellers}`;\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1536,
+        64
+      ],
+      "id": "93b6597c-6211-4902-bcb3-24c1d15a29ad",
+      "name": "collapse",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Будем обрабатывать все входящие items от узла \"Set\".\n// Каждый item может содержать поля: limit, nmID, updatedAt, withPhoto, wb_api, sellerid...\nconst output = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const row = items[i].json;\n\n  // Извлекаем нужные поля\n  const limit = row.limit || 100;\n  const nmID = row.nmID || 0;\n  const updatedAt = row.updatedAt || \"\";\n  const withPhoto = row.withPhoto ?? -1;  // по умолчанию -1\n  const wb_api = row.wb_api || row.wb_api1 || \"\";  // если храните токен в wb_api1\n  const seller_id = row.sellerid || row.seller_id\n\n  // Собираем cursor (как раньше)\n  const cursor = { limit };\n  if (nmID) cursor.nmID = nmID;\n  if (updatedAt) cursor.updatedAt = updatedAt;\n\n  // Формируем тело для HTTP\n  const requestBody = {\n    settings: {\n      cursor,\n      filter: { withPhoto },\n    }\n  };\n\n  // Складываем в выходной item всё, что нужно\n  output.push({\n    json: {\n      requestBody,\n      seller_id,\n      wb_api,\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        144
+      ],
+      "id": "c7e22787-a8bc-4bb3-9044-776fa818445d",
+      "name": "Build Request Body"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://content-api.wildberries.ru/content/v2/get/cards/list",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "=Authorization",
+              "value": "=Bearer {{$json[\"wb_api\"]}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json[\"requestBody\"]}}",
+        "options": {}
+      },
+      "id": "60a8e776-d977-440c-baba-dc46161ee445",
+      "name": "post_products",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        736,
+        144
+      ],
+      "alwaysOutputData": false,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "00693aa8-9767-4879-8f5b-8879e4856b99",
+              "leftValue": "={{$json[\"total\"] }}",
+              "rightValue": "={{ $('set_selid_api').item.json.limit }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        112,
+        560
+      ],
+      "id": "0a4b9fdd-2987-450a-9580-1f448affb35d",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Будем обрабатывать все входящие items\nconst output = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const current = items[i].json || {};\n\n  // Извлекаем cursor/общее\n  const cursor = current.cursor || {};\n  const total = cursor.total || 0;\n  const nmID = cursor.nmID || 0;\n  const updatedAt = cursor.updatedAt || \"\";\n  \n  // Лимит берем из settings.cursor\n  const limit = current.settings?.cursor?.limit || 100;\n\n  // Протаскиваем seller_id и wb_api (или wb_api1)\n  // (зависит от того, как вы назвали поля в Build Request Body)\n  const seller_id = current.seller_id || \"\";\n  const wb_api = current.wb_api || \"\";\n\n  // Формируем итоговый объект\n  output.push({\n    json: {\n      // Параметры для логики пагинации\n      total,\n      nmID,\n      updatedAt,\n      limit,\n\n      // Протаскиваем seller_id, wb_api дальше\n      seller_id,\n      wb_api,\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        608
+      ],
+      "id": "0c56fdc5-afd5-4fc9-acfb-ec8ba06172ac",
+      "name": "paginator"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node: WB cards -> flat rows for DB\n * - photo_high: первая big (fallback)\n * - photo: первая c246x328 (fallback)\n * - createdAt/updatedAt: 'YYYY-MM-DD HH:MM:SS' (UTC без сдвига)\n * - needKiz: tinyint (0/1)\n */\n\nconst items = $input.all();\nconst output = [];\n\n/** ISO 8601 → 'YYYY-MM-DD HH:MM:SS' (без таймзонных сдвигов) */\nconst isoToMysql = (s) => {\n  if (!s) return null;\n  const m = String(s).match(/^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}:\\d{2}:\\d{2})/);\n  return m ? `${m[1]} ${m[2]}` : null;\n};\n\n/** Берём первую фотку: small=c246x328 (fallback), high=big (fallback) */\nconst pickPhotos = (photosArr = []) => {\n  if (!Array.isArray(photosArr) || !photosArr.length) {\n    return { small: \"\", high: \"\" };\n  }\n  const p = photosArr[0] || {};\n  const high  = p.big || p.hq || p.c516x688 || p.c246x328 || p.square || p.tm || \"\";\n  const small = p.c246x328 || p.big || p.hq || p.c516x688 || p.square || p.tm || \"\";\n  return { small, high };\n};\n\nfor (const item of items) {\n  const data = item.json || {};\n  const seller_id = data.seller_id || \"default_seller_id\";\n  const cards = Array.isArray(data.cards) ? data.cards : [];\n\n  for (const card of cards) {\n    const nmID        = card.nmID;\n    const vendorCode  = card.vendorCode;\n    const subjectName = card.subjectName;\n    const brand       = card.brand || null;\n    const title       = card.title || null;\n\n    const { small: photo, high: photo_high } = pickPhotos(card.photos);\n\n    // Габариты\n    const dimensions        = card.dimensions || {};\n    const lengthVal         = dimensions.length ?? null;\n    const widthVal          = dimensions.width  ?? null;\n    const heightVal         = dimensions.height ?? null;\n    const weightBruttoVal   = dimensions.weightBrutto ?? null;\n    const isValidVal        = dimensions.isValid ? 1 : 0;\n\n    // Характеристики и теги\n    const characteristics = JSON.stringify(card.characteristics || []);\n    const tags            = JSON.stringify(card.tags || []);\n\n    // Новые поля\n    const createdAt = isoToMysql(card.createdAt);\n    const updatedAt = isoToMysql(card.updatedAt);\n    const needKiz   = card.needKiz ? 1 : 0;\n\n    const pushRow = (sku, techSize) => {\n      output.push({\n        json: {\n          nmID,\n          vendorCode,\n          subjectName,\n          brand,\n          title,\n\n          // Фото\n          photo,       // low-res (c246x328 по умолчанию)\n          photo_high,  // high-res (big по умолчанию)\n          video: card.video || \"\",\n\n          // Габариты\n          dimensions_length:  lengthVal,\n          dimensions_width:   widthVal,\n          dimensions_height:  heightVal,\n          weightBrutto:       weightBruttoVal,\n          dimensions_isValid: isValidVal,\n\n          // Прочее\n          characteristics,\n          tags,\n          seller_id,\n\n          // SKU/Размер\n          sku: sku ?? null,\n          techSize: techSize ?? \"\",\n\n          // Новые поля для БД\n          createdAt,   // 'YYYY-MM-DD HH:MM:SS' или null\n          updatedAt,   // 'YYYY-MM-DD HH:MM:SS' или null\n          needKiz      // 0/1\n        },\n      });\n    };\n\n    if (Array.isArray(card.sizes) && card.sizes.length) {\n      for (const sizeVariant of card.sizes) {\n        const techSizeValue = sizeVariant.techSize || \"\";\n        if (Array.isArray(sizeVariant.skus) && sizeVariant.skus.length) {\n          for (const sku of sizeVariant.skus) {\n            pushRow(sku, techSizeValue);\n          }\n        } else {\n          pushRow(null, techSizeValue);\n        }\n      }\n    } else {\n      pushRow(null, \"\");\n    }\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        224
+      ],
+      "id": "2eed89e6-a79e-4a9a-9687-8bcb923b88d0",
+      "name": "prep_DB Items"
+    },
+    {
+      "parameters": {
+        "content": "## Список карточек\n",
+        "height": 1000,
+        "width": 1480
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "e110cc6f-253a-4737-a01a-03b018ef07c5",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "9f45bd76-904e-4505-8142-58f480e029f1",
+              "name": "allCards",
+              "value": "[]",
+              "type": "string"
+            },
+            {
+              "id": "b9eaa765-5205-468e-98d2-4bccab456ac1",
+              "name": "updatedAt",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "d72aaacf-1126-4b7b-bbda-71af2e2f993f",
+              "name": "nmID",
+              "value": 0,
+              "type": "number"
+            },
+            {
+              "id": "13263950-403c-4b72-9dc7-b2eae24592a4",
+              "name": "limit",
+              "value": 100,
+              "type": "number"
+            },
+            {
+              "id": "ebf3115e-0d71-421b-b8ba-8aa7208ce2fd",
+              "name": "withPhoto",
+              "value": -1,
+              "type": "number"
+            },
+            {
+              "id": "9ec91ddf-9802-49fe-ae72-04466f35f021",
+              "name": "sellerid",
+              "value": "={{ $('Loop_cards').item.json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "779eeeb7-2eb0-4b40-b71f-bf1b1f7c4d91",
+              "name": "wb_api1",
+              "value": "={{ $('Loop_cards').item.json.wb_api }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        368,
+        320
+      ],
+      "id": "5400fe96-0e4e-4e90-8617-3f944f72bf1b",
+      "name": "set_selid_api"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        736,
+        368
+      ],
+      "id": "1597dc62-98f7-45f3-8169-64a44f67cffa",
+      "name": "Merge_post_code"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "WB_products",
+          "mode": "list",
+          "cachedResultName": "WB_products"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_skus_key",
+        "valueToMatchOn": "={{ $json.seller_id + \"_\" + $json.sku}}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "nmID",
+              "value": "={{ $json.nmID }}"
+            },
+            {
+              "column": "vendorCode",
+              "value": "={{ $json.vendorCode }}"
+            },
+            {
+              "column": "subjectName",
+              "value": "={{ $json.subjectName }}"
+            },
+            {
+              "column": "brand",
+              "value": "={{ $json.brand }}"
+            },
+            {
+              "column": "title",
+              "value": "={{ $json.title }}"
+            },
+            {
+              "column": "photo",
+              "value": "={{ $json.photo }}"
+            },
+            {
+              "column": "video",
+              "value": "={{ $json.video }}"
+            },
+            {
+              "column": "dimensions_length",
+              "value": "={{ $json.dimensions_length }}"
+            },
+            {
+              "column": "dimensions_width",
+              "value": "={{ $json.dimensions_width }}"
+            },
+            {
+              "column": "dimensions_height",
+              "value": "={{ $json.dimensions_height }}"
+            },
+            {
+              "column": "dimensions_isValid",
+              "value": "={{ $json.dimensions_isValid }}"
+            },
+            {
+              "column": "characteristics",
+              "value": "={{ $json.characteristics }}"
+            },
+            {
+              "column": "size",
+              "value": "={{ $json.techSize }}"
+            },
+            {
+              "column": "tags",
+              "value": "={{ $json.tags }}"
+            },
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "skus",
+              "value": "={{ $json.sku }}"
+            },
+            {
+              "column": "weightBrutto",
+              "value": "={{ $json.weightBrutto }}"
+            },
+            {
+              "column": "photo_high",
+              "value": "={{ $json.photo_high }}"
+            },
+            {
+              "column": "needKiz",
+              "value": "={{ $json.needKiz }}"
+            },
+            {
+              "column": "createdAt",
+              "value": "={{ $json.createdAt }}"
+            },
+            {
+              "column": "updatedAt",
+              "value": "={{ $json.updatedAt }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        1280,
+        464
+      ],
+      "id": "3d01a024-72a1-4fa1-ace3-df791e4cd003",
+      "name": "ins_upd_products",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        96,
+        80
+      ],
+      "id": "d0a48bf1-7145-4c69-b371-6de9b26cd205",
+      "name": "Loop_cards"
+    },
+    {
+      "parameters": {
+        "amount": 3
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        368,
+        544
+      ],
+      "id": "710a08d9-44bd-4ba6-a3f1-a2f9dc9c733a",
+      "name": "Wait1",
+      "webhookId": "ac85c43a-ad76-4562-afc6-8b14f7395dd7"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9cd0d589-7c28-4b2c-9301-254945082b7d",
+              "leftValue": "={{ $json.sku }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1008,
+        464
+      ],
+      "id": "e8775518-0422-47b1-9228-c88a87fbd5cb",
+      "name": "If2"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start06').first().json.result.message_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        112,
+        320
+      ],
+      "id": "c9fac8f9-41b0-4e11-a3d4-c582ce0b8bfa",
+      "name": "send_logs_finish3",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1536,
+        544
+      ],
+      "id": "ecf09131-5923-410c-ac58-96e6f4ba0361",
+      "name": "Wait",
+      "webhookId": "feaeb6e8-ec9f-464d-a81c-fff118b2a5ce"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = items.map(item => item.json);\n\n// Получаем общее количество итемов (для нумерации)\nconst totalCount = data.length;\n\n// Формируем текст для каждого итема\nconst result = data.map((entry, index) => {\n    const pos = index + 1;\n    const text = `<b>03 WB API | Product List</b>\\n` +\n                 `<blockquote><b>Обновление истории продаж</b>\\n` +\n                 `Селлер: ${pos} из ${totalCount}\\n` +\n                 `Бренд: ${entry.brand}</blockquote>`;\n    return { json: { ...entry, text } };\n});\n\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        80
+      ],
+      "id": "90a7340c-94b3-4a8b-8c9e-b4129fad52f9",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>03 WB API</b> | Product List | Запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -480,
+        80
+      ],
+      "id": "8586adcd-f334-45a5-a366-90c7ffe2e076",
+      "name": "send_logs_start06",
+      "webhookId": "dbd0efe6-d854-436d-9cd4-e2dbcfa64f24",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        80
+      ],
+      "id": "f0e738db-9dbb-4ada-afc8-bb2433903baa",
+      "name": "Execute Workflow Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  s.*, \n  COUNT(c.id) AS campaign_count\nFROM WB_sellers s\nJOIN WB_sellers_updates su ON su.seller_id = s.seller_id\nLEFT JOIN WB_ad_campaigns c ON c.seller_id = s.seller_id\nWHERE su.in_workrnp = 1\nGROUP BY s.seller_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -480,
+        352
+      ],
+      "id": "f4a9f1bc-adc3-47c4-82b5-177fa0111030",
+      "name": "get_all_token2",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5e5e1d10-c0f0-4ca8-ac09-a35ba227c5e2",
+              "name": "wb_api",
+              "value": "={{ $json.wb_api_key }}",
+              "type": "string"
+            },
+            {
+              "id": "87d7e327-f7cb-4f86-88d7-bef0f8b6bc99",
+              "name": "depth_orders",
+              "value": "={{ (new Date(Date.now() - ($json.depth_orders * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "0082d45a-5085-4df8-a793-ed4daeb10ce7",
+              "name": "depth_sales",
+              "value": "={{ (new Date(Date.now() - ($json.depth_sales * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "bfda3a9d-b3eb-4604-ac3c-964a258db813",
+              "name": "depth_adstats",
+              "value": "={{ (new Date(Date.now() - ($json.depth_adstats * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "caa24063-5d3c-49f0-9823-195b125a512b",
+              "name": "depth_adexpens_from",
+              "value": "={{ (new Date(Date.now() - ($json.depth_adexpens * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "9687fcfc-c201-49bd-9a0a-c9537b093ae1",
+              "name": "seller_id",
+              "value": "={{ $json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "6b579527-07da-4549-8a73-064c0a8e5b1c",
+              "name": "depth_adexpens_to",
+              "value": "={{    new Date()     .toISOString()     .split('T')[0]  }}",
+              "type": "string"
+            },
+            {
+              "id": "397c45e2-ab43-472b-92ac-ec016e1af0e9",
+              "name": "brand",
+              "value": "={{ $json.wb_api_brand }}",
+              "type": "string"
+            },
+            {
+              "id": "21cb9181-16c9-4f3f-aced-329cde157f67",
+              "name": "depth_reportDetail",
+              "value": "={{ (new Date(Date.now() - ($json.depth_reportDetail * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "ced4d766-96dd-4c73-b111-c46eb40fa4c6",
+              "name": "seller_id",
+              "value": "={{ $json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "de5b7601-e696-4db5-ac64-7cd0b37c6620",
+              "name": "first_name",
+              "value": "={{ $json.first_name }}",
+              "type": "string"
+            },
+            {
+              "id": "fd43de2d-c5c5-4329-bec0-2a1f51335517",
+              "name": "telegram_username",
+              "value": "={{ $json.telegram_username }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -224,
+        352
+      ],
+      "id": "a6e17963-7c93-4c3f-9b56-4df05599f949",
+      "name": "set_depth1"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "0zuIKdacU9Tu4YUY",
+          "mode": "list",
+          "cachedResultName": "04 WB API | AD LIST"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        1536,
+        784
+      ],
+      "id": "2f527482-833d-41f4-910a-408de9616120",
+      "name": "Call '04 WB API | AD LIST'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "collapse": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Request Body": {
+      "main": [
+        [
+          {
+            "node": "Merge_post_code",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "post_products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "post_products": {
+      "main": [
+        [
+          {
+            "node": "Merge_post_code",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop_cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "paginator": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prep_DB Items": {
+      "main": [
+        [
+          {
+            "node": "If2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_selid_api": {
+      "main": [
+        [
+          {
+            "node": "Build Request Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge_post_code": {
+      "main": [
+        [
+          {
+            "node": "prep_DB Items",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "paginator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_cards": {
+      "main": [
+        [
+          {
+            "node": "collapse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send_logs_finish3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Build Request Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If2": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish3": {
+      "main": [
+        [
+          {
+            "node": "set_selid_api",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Call '04 WB API | AD LIST'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Loop_cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start06": {
+      "main": [
+        [
+          {
+            "node": "get_all_token2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start06",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_token2": {
+      "main": [
+        [
+          {
+            "node": "set_depth1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_depth1": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "39b2eb7f-b63d-466d-884f-a97dd30e9acf",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "kZrBYNYETgmdgov1",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    },
+    {
+      "createdAt": "2025-10-10T12:03:26.517Z",
+      "updatedAt": "2025-10-10T12:03:26.517Z",
+      "id": "VJZ1GKkGN6Id3ylE",
+      "name": "30 min"
+    },
+    {
+      "createdAt": "2025-10-15T12:39:15.749Z",
+      "updatedAt": "2025-10-15T12:39:15.749Z",
+      "id": "kKc7aGJkadBwn3P4",
+      "name": "GS RNP"
+    }
+  ]
+}

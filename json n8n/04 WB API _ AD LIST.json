@@ -1,0 +1,731 @@
+{
+  "name": "04 WB API | AD LIST",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "https://advert-api.wildberries.ru/adv/v1/promotion/count",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.wb_api }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e806a6ab-3ea6-44fc-a64c-2feece9f94ce",
+      "name": "get_ad_list",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        288
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = [];\n\nitems.forEach((item, index) => {\n    // Берём seller_id из узла \"get_seller_id\" по тому же индексу\n    const sellerId = $items(\"get_seller_id\")[index]?.json?.seller_id || \"unknown_seller\";\n\n    // adverts может быть null или массивом\n    const adverts = item.json.adverts || [];\n\n    // если adverts пуст или null, ничего не делаем\n    if (!adverts.length) {\n        return;\n    }\n\n    adverts.forEach(ad => {\n        if (!ad.advert_list) {\n            return;\n        }\n\n        ad.advert_list.forEach(advert => {\n            // Удаляем миллисекунды и заменяем 'T' на пробел\n            let formattedChangeTime = advert.changeTime\n                .split('.')[0]\n                .replace('T', ' ');\n\n            output.push({\n                json: {\n                    advertId: advert.advertId,\n                    changeTime: formattedChangeTime,\n                    type: ad.type,\n                    status: ad.status,\n                    seller_id: sellerId,\n                    advert_seller_key: `${advert.advertId}_${sellerId}`,\n                },\n            });\n        });\n    });\n});\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        784,
+        288
+      ],
+      "id": "b923a29d-3c77-4d38-85d6-aba0aef90066",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "WB_ad_campaigns",
+          "mode": "list",
+          "cachedResultName": "WB_ad_campaigns"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "advert_seller_key",
+        "valueToMatchOn": "={{ $json.advert_seller_key }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "advertId",
+              "value": "={{ $json.advertId }}"
+            },
+            {
+              "column": "type",
+              "value": "={{ $json.type }}"
+            },
+            {
+              "column": "status",
+              "value": "={{ $json.status }}"
+            },
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "changeTime",
+              "value": "={{ $json.changeTime }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        784,
+        480
+      ],
+      "id": "a3a48734-af81-4e8c-8f6f-900352f74671",
+      "name": "ins_upd_ad_list",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        64,
+        80
+      ],
+      "id": "31444525-8a35-452c-ae4a-bc7582b61a8a",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dc68e0ea-6c8e-472a-9ca2-343e7c3726f1",
+              "name": "wb_api",
+              "value": "={{ $json.wb_api }}",
+              "type": "string"
+            },
+            {
+              "id": "be2bd1bb-597e-4d80-99d4-8f6307517c99",
+              "name": "depth_adstats",
+              "value": "={{ $json.depth_adstats }}",
+              "type": "string"
+            },
+            {
+              "id": "901633b1-9c26-4a52-910b-1d4a4dd68abb",
+              "name": "seller_id",
+              "value": "={{ $json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "0bbe1249-aa5f-445c-9767-c0ba9324e24c",
+              "name": "brand",
+              "value": "={{ $json.brand }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        320,
+        80
+      ],
+      "id": "cba0807c-6554-4fae-bb7f-3f9bd78629c1",
+      "name": "get_seller_id"
+    },
+    {
+      "parameters": {
+        "content": "## Список кампаний\n**Возвращает списки кампаний.** [Метод](https://dev.wildberries.ru/openapi/promotion#tag/Kampanii)",
+        "height": 680,
+        "width": 960
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "1c712118-9c50-43fa-949d-f53632b36d11",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "94de3e1e-98b4-4c96-810c-b405bd5fae67",
+              "leftValue": "={{ $json.all }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        544,
+        288
+      ],
+      "id": "7fc83daa-4879-4b25-8987-6e677922f8d6",
+      "name": "If_notnull_sales"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.*\nFROM WB_sellers s\nJOIN WB_sellers_updates su ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -480,
+        288
+      ],
+      "id": "6039b340-7e1a-4625-a17d-00c06f631af7",
+      "name": "get_all_token2",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=⚠️<b>04 WB API</b> | ADList | <b>{{ $json.brand }}</b> | Ошибка http @mvlipatov",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        480
+      ],
+      "id": "bf109440-9162-4bdc-85d0-f25ee508ae3c",
+      "name": "send_errors_logs",
+      "webhookId": "fac09162-0ca3-4701-a0ae-e2e8b21d29f2",
+      "retryOnFail": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<blockquote><b>04 WB API</b> | ADList | <b>{{ $('Loop').item.json.brand }}</b> нет рекламы</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        544,
+        480
+      ],
+      "id": "85037fc5-2e5c-4dbf-86d0-4551b2a813a1",
+      "name": "send_logs_finish_null",
+      "webhookId": "2fc94dda-a109-4d06-b9e6-f724b5490d53",
+      "retryOnFail": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        544,
+        80
+      ],
+      "id": "e4bdd798-2f97-475d-be8a-90f43bfd0512",
+      "name": "Wait",
+      "webhookId": "49a3fc0b-a32a-412a-8739-865acb117002"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>04 WB API</b> | ADList | Запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -720,
+        288
+      ],
+      "id": "698388a0-7adb-4c76-a4ae-7b72d046484a",
+      "name": "send_logs_start_adlist",
+      "webhookId": "5aa8f58f-d078-4dd7-98c0-b443841be59d",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем массив всех элементов из входных данных\nconst items = $input.all();\n\n// Получаем время старта из узла send_logs_start_adlist, используя optional chaining\nconst startTime = $node[\"send_logs_start_adlist\"]?.json?.result?.date ?? Math.floor(Date.now() / 1000);\n\n// Получаем текущее время (Unix timestamp)\nconst endTime = Math.floor(Date.now() / 1000);\n\n// Вычисляем время выполнения (разница в секундах)\nconst executionTime = endTime - startTime;\n\n// Конвертируем секунды в минуты и секунды\nconst minutes = Math.floor(executionTime / 60);\nconst seconds = executionTime % 60;\n\n// Инициализируем счетчики\nlet successCount = 0;\nlet noOrdersCount = 0;\nlet errorCount = 0;\n\n// Перебираем массив и анализируем каждый элемент\nitems.forEach(item => {\n    if (item.json.success === true) {\n        successCount++;\n    } else if (item.json.result && item.json.result.text) {\n        const messageText = item.json.result.text;\n        if (messageText.includes(\"нет рекламы\")) {\n            noOrdersCount++;\n        } else if (messageText.includes(\"Ошибка\")) {\n            errorCount++;\n        }\n    }\n});\n\n// Формируем итоговое сообщение с указанием времени выполнения\nconst summaryMessage = `<b>04 WB API | ADList</b> завершен ✅ \nВремя: ${minutes} мин ${seconds} сек \n▫️Обновление БД | ${successCount}\n▫️Без рекламы | ${noOrdersCount}\n▫️Ошибки | ${errorCount}`;\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        64
+      ],
+      "id": "790bb59c-b719-4591-a0bf-42598714c6c5",
+      "name": "collapse_adlist",
+      "executeOnce": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "58m7Ckdir4braziu",
+          "mode": "list",
+          "cachedResultName": "05 WB API |  AD STATS"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        1072,
+        720
+      ],
+      "id": "7dd18f8f-ee88-45a6-bb8b-6754abf2cccb",
+      "name": "Execute_adstats"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        80
+      ],
+      "id": "7cba9735-ef35-4f0d-bb77-ac16c6b749a8",
+      "name": "Execute_trigger_adlist"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_adlist').first().json.result.message_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1072,
+        288
+      ],
+      "id": "a03ebf58-31ff-4a71-aa9c-ceff5e00ea1a",
+      "name": "send_logs_finish_adlist",
+      "webhookId": "99c3dbc2-4e90-4618-ab43-49d95ef87489",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5e5e1d10-c0f0-4ca8-ac09-a35ba227c5e2",
+              "name": "wb_api",
+              "value": "={{ $json.wb_api_key }}",
+              "type": "string"
+            },
+            {
+              "id": "87d7e327-f7cb-4f86-88d7-bef0f8b6bc99",
+              "name": "depth_orders",
+              "value": "={{ (new Date(Date.now() - ($json.depth_orders * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "0082d45a-5085-4df8-a793-ed4daeb10ce7",
+              "name": "depth_sales",
+              "value": "={{ (new Date(Date.now() - ($json.depth_sales * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "bfda3a9d-b3eb-4604-ac3c-964a258db813",
+              "name": "depth_adstats",
+              "value": "={{ (new Date(Date.now() - ($json.depth_adstats * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "caa24063-5d3c-49f0-9823-195b125a512b",
+              "name": "depth_adexpens_from",
+              "value": "={{ (new Date(Date.now() - ($json.depth_adexpens * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "9687fcfc-c201-49bd-9a0a-c9537b093ae1",
+              "name": "seller_id",
+              "value": "={{ $json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "6b579527-07da-4549-8a73-064c0a8e5b1c",
+              "name": "depth_adexpens_to",
+              "value": "={{    new Date()     .toISOString()     .split('T')[0]  }}",
+              "type": "string"
+            },
+            {
+              "id": "397c45e2-ab43-472b-92ac-ec016e1af0e9",
+              "name": "brand",
+              "value": "={{ $json.wb_api_brand }}",
+              "type": "string"
+            },
+            {
+              "id": "21cb9181-16c9-4f3f-aced-329cde157f67",
+              "name": "depth_reportDetail",
+              "value": "={{ (new Date(Date.now() - ($json.depth_reportDetail * 24 * 60 * 60 * 1000))).toISOString().split('T')[0] }}",
+              "type": "string"
+            },
+            {
+              "id": "ced4d766-96dd-4c73-b111-c46eb40fa4c6",
+              "name": "seller_id",
+              "value": "={{ $json.seller_id }}",
+              "type": "string"
+            },
+            {
+              "id": "de5b7601-e696-4db5-ac64-7cd0b37c6620",
+              "name": "first_name",
+              "value": "={{ $json.first_name }}",
+              "type": "string"
+            },
+            {
+              "id": "fd43de2d-c5c5-4329-bec0-2a1f51335517",
+              "name": "telegram_username",
+              "value": "={{ $json.telegram_username }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -480,
+        80
+      ],
+      "id": "b18227ee-6ee5-4839-9b4c-32b70c4ddaf7",
+      "name": "set_depth_adlist"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1072,
+        512
+      ],
+      "id": "69bd6f5f-80e0-4b5a-b2cc-4df11c8d5f19",
+      "name": "Wait1",
+      "webhookId": "86f9c964-a5a6-43c8-a2fc-f4d022030bfb"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_ad_list": {
+      "main": [
+        [
+          {
+            "node": "If_notnull_sales",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send_errors_logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_ad_list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_ad_list": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "collapse_adlist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "get_seller_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_seller_id": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_notnull_sales": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send_logs_finish_null",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_token2": {
+      "main": [
+        [
+          {
+            "node": "set_depth_adlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_errors_logs": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish_null": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "get_ad_list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start_adlist": {
+      "main": [
+        [
+          {
+            "node": "get_all_token2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse_adlist": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish_adlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute_trigger_adlist": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start_adlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish_adlist": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "set_depth_adlist": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Execute_adstats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "361b72cf-0a68-468b-b05c-05f0a3256051",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "0zuIKdacU9Tu4YUY",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    },
+    {
+      "createdAt": "2025-10-10T12:03:26.517Z",
+      "updatedAt": "2025-10-10T12:03:26.517Z",
+      "id": "VJZ1GKkGN6Id3ylE",
+      "name": "30 min"
+    },
+    {
+      "createdAt": "2025-10-15T12:39:15.749Z",
+      "updatedAt": "2025-10-15T12:39:15.749Z",
+      "id": "kKc7aGJkadBwn3P4",
+      "name": "GS RNP"
+    }
+  ]
+}
