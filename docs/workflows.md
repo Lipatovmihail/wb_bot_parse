@@ -133,7 +133,10 @@ docker compose logs --tail=100 wb-min-bot  # просмотр логов
 
 - **Уникальный ключ**: `seller_advert_date_key` = `seller_id` + `advert_id` + `nmId` + `date` + `appType`
   - Пример: `782d8c6632e92_27876425_259774399_2025-11-12_64`
-- **Колонка в БД**: `advert_id` (НЕ `advertId`!) — это критично для LOAD DATA INFILE
+- **Колонки в БД** (snake_case, критично для LOAD DATA INFILE):
+  - `advert_id` (НЕ `advertId`!)
+  - `app_type` (НЕ `appType`!)
+  - `nmID` (с большой D)
 - **Удалены колонки**: `brand` и `name` — их нет в таблице
 - **Поле расходов**: `ad_expenses` (в CSV формируется из `sum` из API)
 
@@ -174,9 +177,12 @@ docker compose logs --tail=100 wb-min-bot  # просмотр логов
 
 ### 4. CSV и загрузка в БД
 - Пишем `WB_ad_stats_import.csv` с колонками (в порядке!):
-  - `seller_advert_date_key`, `seller_id`, `advert_id` (НЕ `advertId`!), `date`, `nmId`, `appType`
+  - `seller_advert_date_key`, `seller_id`, `advertId` (в CSV), `date`, `nmId`, `appType` (в CSV)
   - `views`, `clicks`, `ctr`, `cpc`, `ad_expenses`, `atbs`, `orders`, `shks`, `cr`, `canceled`, `sum`, `sum_price`, `avg_position`
-- **LOAD DATA INFILE** в `WB_ad_stats` с маппингом `advert_id` (не `advertId`!)
+- **LOAD DATA INFILE** в `WB_ad_stats` с маппингом:
+  - CSV `advertId` → БД `advert_id`
+  - CSV `nmId` → БД `nmID` (с большой D)
+  - CSV `appType` → БД `app_type`
 - ⚠️ **КРИТИЧНО**: Статусы обновляются **ТОЛЬКО** после успешной загрузки в БД. Если загрузка не прошла — статусы НЕ обновляются.
 
 ### 5. Обновление статусов
@@ -207,10 +213,11 @@ docker compose logs --tail=100 wb-min-bot  # просмотр логов
 
 ### Исправленные баги и особенности
 
-1. **WB_ad_stats: колонка `advert_id` (не `advertId`)**
-   - В таблице БД колонка называется `advert_id` (snake_case)
-   - В CSV и LOAD DATA INFILE используется `advert_id`
-   - В коде при парсинге API используется `advertId` (camelCase из JSON), но при записи в CSV преобразуется
+1. **WB_ad_stats: имена колонок в БД (snake_case)**
+   - `advert_id` (НЕ `advertId` в LOAD DATA INFILE)
+   - `app_type` (НЕ `appType` в LOAD DATA INFILE)
+   - `nmID` (с большой D, не `nmId`)
+   - В CSV используются camelCase имена (`advertId`, `appType`, `nmId`), но в LOAD DATA INFILE маппятся на snake_case имена БД
 
 2. **Статусы обновляются ТОЛЬКО после успешной загрузки в БД**
    - Если `LOAD DATA INFILE` упал с ошибкой — статусы НЕ обновляются
