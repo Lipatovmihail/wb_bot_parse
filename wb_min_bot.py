@@ -7,6 +7,7 @@
 import html
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -36,11 +37,15 @@ WB_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
+WB_PRODUCTS_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
 WB_CSV_HOST_PATH = "/data/csv/WB_orders_import.csv"
 WB_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_orders_import.csv"
 WB_SALES_CSV_HOST_PATH = "/data/csv/WB_sales_import.csv"
 WB_SALES_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_sales_import.csv"
 RIGHT_COOLDOWN_MINUTES = int(os.environ.get("WB_RIGHT_COOLDOWN_MINUTES", "30"))
+PRODUCTS_COOLDOWN_MINUTES = int(os.environ.get("WB_PRODUCTS_COOLDOWN_MINUTES", "60"))
+WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
+WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 
 
 MSK_OFFSET = timezone(timedelta(hours=3))
@@ -195,13 +200,12 @@ def build_start_message(rows: List[Dict]) -> str:
         brand_lines.append(f"▫️{brand_safe} | {name_safe}")
 
     lines_joined = "\n".join(brand_lines)
-    message = (
+    return (
         "<b>Запускаю обновление  РНП</b>\n"
         f"<blockquote><b>В работу взяты {len(brand_lines)} брендов:</b>\n"
         f"{lines_joined}\n"
         "</blockquote>"
     )
-    return message
 
 
 def fetch_sales_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
@@ -411,6 +415,70 @@ def fetch_sales_for_seller(item: Dict) -> List[Dict]:
     return enriched
 
 
+def build_products_request_body(limit: int, nm_id: int = 0, updated_at: str = "", with_photo: int = -1) -> Dict:
+    cursor = {"limit": limit}
+    if nm_id:
+        cursor["nmID"] = nm_id
+    if updated_at:
+        cursor["updatedAt"] = updated_at
+    return {
+        "settings": {
+            "cursor": cursor,
+            "filter": {"withPhoto": with_photo},
+        }
+    }
+
+
+def fetch_products_for_seller(item: Dict) -> List[Dict]:
+    seller_id = item.get("seller_id") or item.get("sellerId") or ""
+    token = (item.get("wb_api_key") or item.get("wb_api") or "").strip()
+    if not token:
+        raise RuntimeError(f"WB products token missing for seller {seller_id}")
+
+    headers = {
+        "user-agent": WB_USER_AGENT,
+        "Authorization": f"Bearer {token}",
+    }
+
+    limit = 100
+    nm_id = 0
+    updated_at = ""
+    with_photo = -1
+    collected_cards: List[Dict] = []
+    safety_counter = 0
+
+    while True:
+        body = build_products_request_body(limit=limit, nm_id=nm_id, updated_at=updated_at, with_photo=with_photo)
+        response = requests.post(WB_PRODUCTS_URL, headers=headers, json=body, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"WB Products API error for {seller_id}: {response.status_code} {response.text}"
+            )
+        data = response.json()
+        cards_batch = data.get("cards") or []
+        collected_cards.extend(cards_batch)
+
+        cursor_info = data.get("cursor") or {}
+        total = cursor_info.get("total")
+        next_nm_id = cursor_info.get("nmID") or 0
+        next_updated_at = cursor_info.get("updatedAt") or ""
+
+        safety_counter += 1
+        if (
+            not cursor_info
+            or total is None
+            or total < limit
+            or (next_nm_id == 0 and not next_updated_at)
+            or safety_counter > 100
+        ):
+            break
+
+        nm_id = next_nm_id
+        updated_at = next_updated_at
+
+    return collected_cards
+
+
 def build_sales_summary(items: List[Dict]) -> str:
     def first_ymd(value: Optional[str]) -> Optional[str]:
         if not value:
@@ -489,6 +557,358 @@ def build_status_update_message(prefix: str, entity: str, details: List[Dict]) -
         body_lines.append(f"{date_short} | {from_status} → {to_status} | {count} | {brand}")
     closing = "</blockquote>"
     return "\n".join([header, summary_line, *body_lines, closing])
+
+
+def build_completion_message(prefix: str, entity: str, elapsed_seconds: int) -> str:
+    safe_elapsed = max(0, int(elapsed_seconds))
+    minutes, seconds = divmod(safe_elapsed, 60)
+    return (
+        f"<b>{prefix} WB API</b> | {entity} завершен ✅\n"
+        f"<blockquote>Время: {minutes} мин {seconds} сек</blockquote>"
+    )
+
+
+PRODUCTS_CSV_COLUMNS = [
+    "seller_id",
+    "nmID",
+    "imtID",
+    "vendorCode",
+    "subjectID",
+    "subjectName",
+    "brand",
+    "title",
+    "description",
+    "photo",
+    "photo_high",
+    "video",
+    "dimensions_length",
+    "dimensions_width",
+    "dimensions_height",
+    "weightBrutto",
+    "dimensions_isValid",
+    "characteristics",
+    "tags",
+    "skus",
+    "techSize",
+    "createdAt",
+    "updatedAt",
+    "needKiz",
+]
+
+
+def iso_to_mysql(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", str(value))
+    if match:
+        return f"{match.group(1)} {match.group(2)}"
+    return None
+
+
+def pick_photos(photos: Optional[List[Dict]]) -> Tuple[str, str]:
+    if not photos:
+        return "", ""
+    photo_entry = photos[0] or {}
+    high = (
+        photo_entry.get("big")
+        or photo_entry.get("hq")
+        or photo_entry.get("c516x688")
+        or photo_entry.get("c246x328")
+        or photo_entry.get("square")
+        or photo_entry.get("tm")
+        or ""
+    )
+    small = (
+        photo_entry.get("c246x328")
+        or photo_entry.get("big")
+        or photo_entry.get("hq")
+        or photo_entry.get("c516x688")
+        or photo_entry.get("square")
+        or photo_entry.get("tm")
+        or ""
+    )
+    return small, high
+
+
+def convert_products_for_csv(rows: Iterable[Dict]) -> List[Dict]:
+    csv_rows: List[Dict] = []
+    for row in rows:
+        cards = row.get("cards") or []
+        seller_id = row.get("seller_id") or row.get("sellerId") or row.get("seller_id") or "unknown"
+        for card in cards:
+            nmID = card.get("nmID")
+            imtID = card.get("imtID")
+            vendorCode = card.get("vendorCode")
+            subjectID = card.get("subjectID")
+            subjectName = card.get("subjectName")
+            brand = card.get("brand")
+            title = card.get("title")
+            description = card.get("description")
+            photo, photo_high = pick_photos(card.get("photos"))
+
+            dimensions = card.get("dimensions") or {}
+            lengthVal = dimensions.get("length")
+            widthVal = dimensions.get("width")
+            heightVal = dimensions.get("height")
+            weightBruttoVal = dimensions.get("weightBrutto")
+            isValidVal = 1 if dimensions.get("isValid") else 0
+
+            characteristics = json.dumps(card.get("characteristics") or [])
+            tags = json.dumps(card.get("tags") or [])
+
+            created_at = iso_to_mysql(card.get("createdAt"))
+            updated_at = iso_to_mysql(card.get("updatedAt"))
+            needKiz = 1 if card.get("needKiz") else 0
+            video = card.get("video") or ""
+
+            sizes = card.get("sizes") or []
+            if sizes:
+                for sizeVariant in sizes:
+                    techSize = sizeVariant.get("techSize") or ""
+                    skus = sizeVariant.get("skus") or []
+                    if skus:
+                        for sku in skus:
+                            csv_rows.append(
+                                {
+                                    "seller_id": seller_id,
+                                    "nmID": nmID,
+                                    "imtID": imtID,
+                                    "vendorCode": vendorCode,
+                                    "subjectID": subjectID,
+                                    "subjectName": subjectName,
+                                    "brand": brand,
+                                    "title": title,
+                                    "description": description,
+                                    "photo": photo,
+                                    "photo_high": photo_high,
+                                    "video": video,
+                                    "dimensions_length": lengthVal,
+                                    "dimensions_width": widthVal,
+                                    "dimensions_height": heightVal,
+                                    "weightBrutto": weightBruttoVal,
+                                    "dimensions_isValid": isValidVal,
+                                    "characteristics": characteristics,
+                                    "tags": tags,
+                                    "skus": sku,
+                                    "techSize": techSize,
+                                    "createdAt": created_at,
+                                    "updatedAt": updated_at,
+                                    "needKiz": needKiz,
+                                }
+                            )
+                    else:
+                        csv_rows.append(
+                            {
+                                "seller_id": seller_id,
+                                "nmID": nmID,
+                                "imtID": imtID,
+                                "vendorCode": vendorCode,
+                                "subjectID": subjectID,
+                                "subjectName": subjectName,
+                                "brand": brand,
+                                "title": title,
+                                "description": description,
+                                "photo": photo,
+                                "photo_high": photo_high,
+                                "video": video,
+                                "dimensions_length": lengthVal,
+                                "dimensions_width": widthVal,
+                                "dimensions_height": heightVal,
+                                "weightBrutto": weightBruttoVal,
+                                "dimensions_isValid": isValidVal,
+                                "characteristics": characteristics,
+                                "tags": tags,
+                                "skus": None,
+                                "techSize": techSize,
+                                "createdAt": created_at,
+                                "updatedAt": updated_at,
+                                "needKiz": needKiz,
+                            }
+                        )
+            else:
+                csv_rows.append(
+                    {
+                        "seller_id": seller_id,
+                        "nmID": nmID,
+                        "imtID": imtID,
+                        "vendorCode": vendorCode,
+                        "subjectID": subjectID,
+                        "subjectName": subjectName,
+                        "brand": brand,
+                        "title": title,
+                        "description": description,
+                        "photo": photo,
+                        "photo_high": photo_high,
+                        "video": video,
+                        "dimensions_length": lengthVal,
+                        "dimensions_width": widthVal,
+                        "dimensions_height": heightVal,
+                        "weightBrutto": weightBruttoVal,
+                        "dimensions_isValid": isValidVal,
+                        "characteristics": characteristics,
+                        "tags": tags,
+                        "skus": None,
+                        "techSize": "",
+                        "createdAt": created_at,
+                        "updatedAt": updated_at,
+                        "needKiz": needKiz,
+                    }
+                )
+
+    return [row for row in csv_rows if row.get("skus")]
+
+
+def write_products_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=PRODUCTS_CSV_COLUMNS)
+        writer.writeheader()
+        for chunk_start in range(0, len(rows), 40000):
+            chunk = rows[chunk_start : chunk_start + 40000]
+            writer.writerows(chunk)
+
+
+def fetch_products_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+            s.seller_id,
+            s.wb_api_key,
+            s.wb_api_brand,
+            su.products_status
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+            ON su.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        status = row.get("products_status")
+        if isinstance(status, str):
+            try:
+                row["products_status"] = json.loads(status)
+            except json.JSONDecodeError:
+                row["products_status"] = None
+        result.append(row)
+    return result
+
+
+def compute_products_priority(
+    sellers: Iterable[Dict],
+) -> Tuple[List[Dict], List[Dict], str]:
+    processed: List[Dict] = []
+    per_seller: Dict[str, Dict] = {}
+
+    for idx, raw in enumerate(sellers):
+        seller_id = str(raw.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+
+        products_status = raw.get("products_status") or None
+        brand = (raw.get("wb_api_brand") or seller_id).strip()
+
+        status_cat = "new" if not products_status else "existing"
+        now_time = products_status.get("nowTime") if products_status else None
+
+        bucket = per_seller.get(seller_id)
+        if bucket is None:
+            bucket = {
+                "seller_id": seller_id,
+                "brand": brand or seller_id,
+                "status_cat": status_cat,
+                "idx": idx,
+                "products_status": products_status,
+                "now_time": now_time,
+                "cooldown_blocked": False,
+            }
+            per_seller[seller_id] = bucket
+        else:
+            if bucket["status_cat"] != "new" and status_cat == "new":
+                bucket["status_cat"] = status_cat
+            if not bucket.get("brand"):
+                bucket["brand"] = brand
+            if not bucket.get("now_time") and now_time:
+                bucket["now_time"] = now_time
+
+        processed.append(
+            {
+                "seller_id": seller_id,
+                "brand": brand or seller_id,
+                "status_cat": status_cat,
+                "idx": idx,
+                "wb_api_key": raw.get("wb_api_key"),
+                "products_status": products_status,
+                "now_time": now_time,
+                "cooldown_blocked": False,
+            }
+        )
+
+    all_sellers = list(per_seller.values())
+
+    new_group = [s for s in all_sellers if s["status_cat"] == "new"]
+    existing_group = [s for s in all_sellers if s["status_cat"] != "new"]
+
+    allow_set = set()
+
+    if new_group:
+        allow_set.update(s["seller_id"] for s in new_group)
+    else:
+        eligible = []
+        for s in existing_group:
+            status_dict = s.get("products_status") or {}
+            now_dt = parse_msk_datetime(status_dict.get("nowTime"))
+            if now_dt is None:
+                eligible.append(s)
+                continue
+            age_min = minutes_since_msk(now_dt)
+            if age_min >= PRODUCTS_COOLDOWN_MINUTES:
+                eligible.append(s)
+            else:
+                s["cooldown_blocked"] = True
+        if eligible:
+            allow_set.update(s["seller_id"] for s in eligible)
+
+    lines = []
+    for s in sorted(all_sellers, key=lambda item: item["brand"].lower()):
+        allowed = s["seller_id"] in allow_set
+        mark = "✅" if allowed else "✖️"
+        status_dict = s.get("products_status") or {}
+        now_dt = parse_msk_datetime(status_dict.get("nowTime") or s.get("now_time"))
+        if s["status_cat"] == "new":
+            minutes_text = "new"
+        elif now_dt is not None:
+            age_min = max(0, int(minutes_since_msk(now_dt)))
+            minutes_text = f"{age_min}min"
+        else:
+            minutes_text = "--"
+        lines.append(f"{minutes_text} | {s['brand']} {mark}")
+
+    summary_text = "\n".join(lines)
+
+    allowed_items: List[Dict] = []
+    for item in processed:
+        if item["seller_id"] in allow_set:
+            enriched = dict(item)
+            enriched["text"] = summary_text
+            allowed_items.append(enriched)
+
+    return allowed_items, all_sellers, summary_text
+
+
+def build_products_selection_message(summary_text: str) -> str:
+    escaped = html.escape(summary_text)
+    return (
+        "<b>03 WB API</b> | Products\n"
+        "<blockquote>Подготовка выгрузки карточек.\n"
+        f"<code>{escaped}</code></blockquote>"
+    )
 
 
 def _parse_now_time(now_time: Optional[str]) -> Tuple[int, str]:
@@ -1039,14 +1459,31 @@ def update_orders_status(
         rows = bucket["rows"]
         count = len(rows)
         prev = bucket["prev"]
+        current_date_from = first_ymd(bucket.get("date_from"))
+        if not current_date_from:
+            current_date_from = first_ymd((prev or {}).get("lastDateFrom")) or first_ymd((prev or {}).get("maxDateFrom"))
+        prev_max_date_from = first_ymd((prev or {}).get("maxDateFrom"))
 
-        if (bucket.get("api_error") or bucket["has_error"]) and prev:
-            orders_status = prev
-        elif count == 0:
+        if bucket.get("api_error") or bucket["has_error"]:
             if prev:
                 orders_status = prev
             else:
                 continue
+        elif count == 0:
+            max_date_from = prev_max_date_from or current_date_from
+            orders_status = {
+                "maxDateFrom": max_date_from,
+                "status": "right",
+                "lastTotalOrders": 0,
+                "leftBoundary": "",
+                "rightBoundary": "",
+                "lastDateFrom": current_date_from,
+                "nowTime": now_time,
+            }
+            if max_date_from is None:
+                orders_status["maxDateFrom"] = ""
+            if orders_status["lastDateFrom"] is None:
+                orders_status["lastDateFrom"] = ""
         else:
             left_boundary = None
             right_boundary = None
@@ -1056,9 +1493,7 @@ def update_orders_status(
                     left_boundary = min_ymd(left_boundary, ymd_val)
                     right_boundary = max_ymd(right_boundary, ymd_val)
 
-            current_date_from = bucket["date_from"]
             prev_status = (prev or {}).get("status")
-            prev_max_date_from = first_ymd((prev or {}).get("maxDateFrom"))
 
             if not prev:
                 new_max_date_from = current_date_from or None
@@ -1246,6 +1681,83 @@ def load_sales_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
         raise RuntimeError(f"LOAD DATA INFILE for sales failed: {exc}") from exc
 
 
+def load_products_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{WB_PRODUCTS_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE WB_products
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              @seller_id,
+              @nmID,
+              @imtID,
+              @vendorCode,
+              @subjectID,
+              @subjectName,
+              @brand,
+              @title,
+              @description,
+              @photo,
+              @photo_high,
+              @video,
+              @dimensions_length,
+              @dimensions_width,
+              @dimensions_height,
+              @weightBrutto,
+              @dimensions_isValid,
+              @characteristics,
+              @tags,
+              @skus,
+              @techSize,
+              @createdAt,
+              @updatedAt,
+              @needKiz
+            )
+            SET
+              seller_id = NULLIF(@seller_id, ''),
+              seller_skus_key = CASE WHEN @skus = '' THEN NULL ELSE CONCAT(@seller_id, '_', @skus) END,
+              nmID = NULLIF(@nmID, ''),
+              imtID = NULLIF(@imtID, ''),
+              vendorCode = NULLIF(@vendorCode, ''),
+              subjectName = NULLIF(@subjectName, ''),
+              brand = NULLIF(@brand, ''),
+              title = NULLIF(@title, ''),
+              description = NULLIF(@description, ''),
+              photo = NULLIF(@photo, ''),
+              photo_high = NULLIF(@photo_high, ''),
+              video = NULLIF(@video, ''),
+              dimensions_length = NULLIF(@dimensions_length, ''),
+              dimensions_width = NULLIF(@dimensions_width, ''),
+              dimensions_height = NULLIF(@dimensions_height, ''),
+              weightBrutto = NULLIF(@weightBrutto, ''),
+              dimensions_isValid = IF(@dimensions_isValid = '' OR @dimensions_isValid IS NULL, 0, @dimensions_isValid),
+              characteristics = CASE
+                WHEN @characteristics = '' THEN JSON_ARRAY()
+                WHEN JSON_VALID(@characteristics) THEN CAST(@characteristics AS JSON)
+                ELSE JSON_ARRAY()
+              END,
+              size = NULLIF(@techSize, ''),
+              tags = CASE
+                WHEN @tags = '' THEN JSON_ARRAY()
+                WHEN JSON_VALID(@tags) THEN CAST(@tags AS JSON)
+                ELSE JSON_ARRAY()
+              END,
+              skus = NULLIF(@skus, ''),
+              needKiz = IF(@needKiz = '' OR @needKiz IS NULL, 0, @needKiz),
+              createdAt = NULLIF(@createdAt, ''),
+              updatedAt = NULLIF(@updatedAt, '')
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for products failed: {exc}") from exc
+
+
 def update_sales_status(
     cursor: mysql.connector.cursor.MySQLCursor,
     sellers_meta: Iterable[Dict],
@@ -1313,14 +1825,31 @@ def update_sales_status(
         rows = bucket["rows"]
         count = len(rows)
         prev = bucket["prev"]
+        current_date_from = first_ymd(bucket.get("date_from"))
+        if not current_date_from:
+            current_date_from = first_ymd((prev or {}).get("lastDateFrom")) or first_ymd((prev or {}).get("maxDateFrom"))
+        prev_max_date_from = first_ymd((prev or {}).get("maxDateFrom"))
 
-        if bucket.get("api_error") and prev:
-            sales_status = prev
-        elif count == 0:
+        if bucket.get("api_error"):
             if prev:
                 sales_status = prev
             else:
                 continue
+        elif count == 0:
+            max_date_from = prev_max_date_from or current_date_from
+            sales_status = {
+                "maxDateFrom": max_date_from,
+                "status": "right",
+                "lastTotalSales": 0,
+                "leftBoundary": "",
+                "rightBoundary": "",
+                "lastDateFrom": current_date_from,
+                "nowTime": now_time,
+            }
+            if max_date_from is None:
+                sales_status["maxDateFrom"] = ""
+            if sales_status["lastDateFrom"] is None:
+                sales_status["lastDateFrom"] = ""
         else:
             left_boundary = None
             right_boundary = None
@@ -1330,9 +1859,7 @@ def update_sales_status(
                     left_boundary = min_ymd(left_boundary, ymd_val)
                     right_boundary = max_ymd(right_boundary, ymd_val)
 
-            current_date_from = bucket["date_from"]
             prev_status = (prev or {}).get("status")
-            prev_max_date_from = first_ymd((prev or {}).get("maxDateFrom"))
 
             if not prev:
                 new_max_date_from = current_date_from or None
@@ -1410,6 +1937,8 @@ def main() -> int:
             flush=True,
         )
         send_to_telegram(start_message)
+
+        orders_started_at = time.time()
 
         sellers = fetch_active_sellers(cursor_dict)
         allowed_items, aggregated, summary_text = compute_date_from_and_priority(sellers)
@@ -1519,6 +2048,12 @@ def main() -> int:
                 status_message = build_status_update_message("01", "Orders", order_details)
                 send_to_telegram(status_message)
 
+        orders_elapsed = time.time() - orders_started_at
+        orders_completion_message = build_completion_message("01", "Orders", orders_elapsed)
+        send_to_telegram(orders_completion_message)
+
+        sales_started_at = time.time()
+
         sales_sellers = fetch_sales_sellers(cursor_dict)
         sales_allowed_items, sales_aggregated, sales_selection_summary = compute_sales_date_from_and_priority(sales_sellers)
         print("[WB-bot] Подготовлена выборка для продаж.", flush=True)
@@ -1603,27 +2138,126 @@ def main() -> int:
             )
             send_to_telegram(summary_sales_load_message)
 
-            updated_sales_count, sales_details = update_sales_status(cursor, sales_allowed_items, sales_data, sales_api_errors)
-            if updated_sales_count:
-                connection.commit()
-                print(
-                    f"[WB-bot] Обновлены sales_status для {updated_sales_count} селлеров.",
-                    flush=True,
-                )
-                if sales_details:
-                    status_sales_message = build_status_update_message("02", "Sales", sales_details)
-                    send_to_telegram(status_sales_message)
         else:
             print("[WB-bot] Нет данных по продажам или все запросы завершились ошибкой.", flush=True)
 
-        if not sales_data and sales_api_errors:
+        updated_sales_count, sales_details = update_sales_status(cursor, sales_allowed_items, sales_data, sales_api_errors)
+        if updated_sales_count:
+            connection.commit()
+            print(
+                f"[WB-bot] Обновлены sales_status для {updated_sales_count} селлеров.",
+                flush=True,
+            )
+            if sales_details:
+                status_sales_message = build_status_update_message("02", "Sales", sales_details)
+                send_to_telegram(status_sales_message)
+        elif not sales_data and sales_api_errors:
             print("[WB-bot] Статусы продаж не обновлялись из-за ошибок API.", flush=True)
+
+        sales_elapsed = time.time() - sales_started_at
+        sales_completion_message = build_completion_message("02", "Sales", sales_elapsed)
+        send_to_telegram(sales_completion_message)
+
+        products_started_at = time.time()
+
+        products_sellers = fetch_products_sellers(cursor_dict)
+        products_allowed_items, products_aggregated, products_summary = compute_products_priority(products_sellers)
+        print("[WB-bot] Подготовлена выборка для карточек товаров.", flush=True)
+        products_selection_message = build_products_selection_message(products_summary)
+        send_to_telegram(products_selection_message)
+
+        products_data: List[Dict] = []
+        products_api_errors: Set[str] = set()
+        for item in products_allowed_items:
+            token = (item.get("wb_api_key") or "").strip()
+            if not token:
+                print(
+                    f"[WB-bot] Пропускаем {item['seller_id']} в карточках — отсутствует wb_api_key.",
+                    flush=True,
+                )
+                products_api_errors.add(item["seller_id"])
+                continue
+            try:
+                cards = fetch_products_for_seller(item)
+                print(
+                    f"[WB-bot] Карточки: получено {len(cards)} для {item['seller_id']} ({item['brand']}).",
+                    flush=True,
+                )
+                products_data.append(
+                    {
+                        "seller_id": item["seller_id"],
+                        "cards": cards,
+                    }
+                )
+            except Exception as api_err:
+                print(
+                    f"[WB-bot] Ошибка WB Products API для {item['seller_id']}: {api_err}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                products_api_errors.add(item["seller_id"])
+                error_message = (
+                    "<b>WB_products</b>\n"
+                    "<blockquote>"
+                    f"Ошибка запроса для селлера <code>{html.escape(item['brand'])}</code>.\n"
+                    f"<code>{html.escape(str(api_err))}</code>"
+                    "</blockquote>"
+                )
+                try:
+                    send_to_telegram(error_message)
+                except Exception:
+                    traceback.print_exc()
+
+        products_csv_rows = convert_products_for_csv(products_data)
+        if products_csv_rows:
+            write_products_csv(products_csv_rows, WB_PRODUCTS_CSV_HOST_PATH)
+            print(
+                f"[WB-bot] CSV карточек сформирован: {WB_PRODUCTS_CSV_HOST_PATH} ({len(products_csv_rows)} строк).",
+                flush=True,
+            )
+            products_csv_message = (
+                "<b>03 WB API</b> | Products\n"
+                "<blockquote>Файл WB_products_import.csv сформирован.</blockquote>"
+            )
+            send_to_telegram(products_csv_message)
+
+            try:
+                load_products_into_db(cursor)
+                print("[WB-bot] WB_products успешно обновлена через LOAD DATA INFILE.", flush=True)
+                products_load_message = (
+                    "<b>03 WB API</b> | Products\n"
+                    "<blockquote>Данные загружены в таблицу WB_products.</blockquote>"
+                )
+                send_to_telegram(products_load_message)
+            except Exception as db_err:
+                print(
+                    f"[WB-bot] Ошибка LOAD DATA для карточек: {db_err}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                error_message = (
+                    "<b>03 WB API</b> | Products\n"
+                    "<blockquote>"
+                    "Ошибка загрузки данных в WB_products.\n"
+                    f"<code>{html.escape(str(db_err))}</code>"
+                    "</blockquote>"
+                )
+                try:
+                    send_to_telegram(error_message)
+                except Exception:
+                    traceback.print_exc()
+        else:
+            print("[WB-bot] Нет данных для формирования CSV карточек.", flush=True)
+
+        products_elapsed = time.time() - products_started_at
+        products_completion_message = build_completion_message("03", "Products", products_elapsed)
+        send_to_telegram(products_completion_message)
 
         elapsed = int(time.time() - workflow_started_at)
         minutes, seconds = divmod(elapsed, 60)
         final_message = (
-            "<b>01 WB API</b> | Orders & Sales завершены ✅\n"
-            f"<blockquote>Время: {minutes} мин {seconds} сек</blockquote>"
+            "<b>WB API</b> | Цикл завершен ✅\n"
+            f"<blockquote>Общее время: {minutes} мин {seconds} сек</blockquote>"
         )
         send_to_telegram(final_message)
 
