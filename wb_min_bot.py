@@ -3472,20 +3472,22 @@ def main() -> int:
                     summary_lines.append(
                         f"{brand} | rows:{rows_count} | кампаний:{campaigns_with_data} | пустых:{empty_count}"
                     )
+                summary_text = html.escape("\n".join(summary_lines) if summary_lines else "нет данных")
                 ad_stats_summary_message = (
                     "<b>05 WB API</b> | Ad Stats\n"
                     "<blockquote><b>Статистика собрана ✅</b>\n"
-                    f"<code>{html.escape('\n'.join(summary_lines) or 'нет данных')}</code></blockquote>"
+                    f"<code>{summary_text}</code></blockquote>"
                 )
                 send_to_telegram(ad_stats_summary_message)
             else:
                 print("[WB-bot] Нет данных статистики по рекламным кампаниям.", flush=True)
 
             if ad_stats_errors:
+                errors_text = html.escape("\n".join(ad_stats_errors))
                 error_message = (
                     "<b>05 WB API</b> | Ad Stats\n"
                     "<blockquote><b>Ошибки при запросе</b>\n"
-                    f"<code>{html.escape('\n'.join(ad_stats_errors))}</code></blockquote>"
+                    f"<code>{errors_text}</code></blockquote>"
                 )
                 send_to_telegram(error_message)
         else:
