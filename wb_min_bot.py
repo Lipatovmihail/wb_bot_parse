@@ -61,8 +61,10 @@ AD_STATS_DEFAULT_LOOKBACK_DAYS = 15
 AD_STATS_MAX_INTERVAL_DAYS = 31
 AD_STATS_MAX_CAMPAIGNS_PER_REQUEST = 100
 AD_STATS_RATE_LIMIT_REQUESTS_PER_MINUTE = 3
-AD_STATS_RATE_INTERVAL_SECONDS = 20
+AD_STATS_RATE_INTERVAL_SECONDS = 30
 AD_STATS_SKIP_APP_TYPE_ZERO = True
+AD_STATS_MAX_RETRIES = 5
+AD_STATS_RETRY_BASE_DELAY_SECONDS = 30
 
 
 MSK_OFFSET = timezone(timedelta(hours=3))
@@ -3044,6 +3046,7 @@ def main() -> int:
         orders_elapsed = time.time() - orders_started_at
         orders_completion_message = build_completion_message("01", "Orders", orders_elapsed)
         send_to_telegram(orders_completion_message)
+        time.sleep(2)
 
         sales_started_at = time.time()
 
@@ -3150,6 +3153,7 @@ def main() -> int:
         sales_elapsed = time.time() - sales_started_at
         sales_completion_message = build_completion_message("02", "Sales", sales_elapsed)
         send_to_telegram(sales_completion_message)
+        time.sleep(2)
 
         products_started_at = time.time()
 
@@ -3260,6 +3264,7 @@ def main() -> int:
         products_elapsed = time.time() - products_started_at
         products_completion_message = build_completion_message("03", "Products", products_elapsed)
         send_to_telegram(products_completion_message)
+        time.sleep(2)
 
         ads_started_at = time.time()
 
@@ -3382,6 +3387,7 @@ def main() -> int:
         ads_elapsed = time.time() - ads_started_at
         ads_completion_message = build_completion_message("04", "Ad List", ads_elapsed)
         send_to_telegram(ads_completion_message)
+        time.sleep(2)
 
         ad_stats_started_at = time.time()
         ad_stats_sellers = fetch_ad_stats_sellers(cursor_dict)
@@ -3407,12 +3413,17 @@ def main() -> int:
             )
 
             sorted_ad_stats_requests = sorted(ad_stats_requests, key=lambda r: r.get("ready_at_ts", 0.0))
+            ad_stats_last_request_ts: Dict[str, float] = {}
             for req in sorted_ad_stats_requests:
                 seller_id = req["seller_id"]
                 brand = req["brand"]
                 seller_brand_map[seller_id] = brand
 
-                wait_seconds = max(0.0, req.get("ready_at_ts", 0.0) - time.time())
+                now_ts = time.time()
+                wait_seconds = max(0.0, req.get("ready_at_ts", 0.0) - now_ts)
+                last_request_ts = ad_stats_last_request_ts.get(seller_id)
+                if last_request_ts is not None:
+                    wait_seconds = max(wait_seconds, (last_request_ts + AD_STATS_RATE_INTERVAL_SECONDS) - now_ts)
                 if wait_seconds > 0:
                     time.sleep(wait_seconds)
 
@@ -3425,38 +3436,90 @@ def main() -> int:
                     "user-agent": WB_USER_AGENT,
                     "Authorization": f"Bearer {req['token']}",
                 }
-                try:
-                    response = requests.get(WB_AD_STATS_URL, params=params, headers=headers, timeout=40)
-                    if response.status_code != 200:
-                        raise RuntimeError(f"{response.status_code} {response.text}")
 
-                    payload = response.json()
-                    parsed_rows = parse_ad_stats_payload(payload)
+                success = False
 
-                    if parsed_rows:
-                        ad_stats_rows_by_seller[seller_id] += len(parsed_rows)
-                        ad_stats_campaigns_with_data[seller_id].update(
-                            {row.get("advertId") for row in parsed_rows if row.get("advertId") is not None}
+                for attempt in range(1, AD_STATS_MAX_RETRIES + 1):
+                    try:
+                        response = requests.get(WB_AD_STATS_URL, params=params, headers=headers, timeout=40)
+                        ad_stats_last_request_ts[seller_id] = time.time()
+                        status_code = response.status_code
+                        response_text = (response.text or "").strip()
+
+                        if status_code == 200:
+                            payload = response.json()
+                            parsed_rows = parse_ad_stats_payload(payload)
+
+                            if parsed_rows:
+                                ad_stats_rows_by_seller[seller_id] += len(parsed_rows)
+                                ad_stats_campaigns_with_data[seller_id].update(
+                                    {row.get("advertId") for row in parsed_rows if row.get("advertId") is not None}
+                                )
+                                for row in parsed_rows:
+                                    row_out = dict(row)
+                                    row_out["seller_id"] = seller_id
+                                    row_out["brand"] = brand
+                                    ad_stats_rows.append(row_out)
+                            else:
+                                ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
+
+                            success = True
+                            break
+
+                        if status_code == 400 and "no statistics" in response_text.lower():
+                            ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
+                            success = True
+                            break
+
+                        if status_code in {429, 500}:
+                            if attempt == AD_STATS_MAX_RETRIES:
+                                error_line = (
+                                    f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
+                                    f"{req['interval']['beginDate']}→{req['interval']['endDate']} | "
+                                    f"{status_code} {response_text}"
+                                )
+                                ad_stats_errors.append(error_line)
+                                print(
+                                    f"[WB-bot] Ошибка WB Ad Stats API: {error_line}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                break
+                            delay = AD_STATS_RETRY_BASE_DELAY_SECONDS * attempt
+                            time.sleep(delay)
+                            continue
+
+                        error_line = (
+                            f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
+                            f"{req['interval']['beginDate']}→{req['interval']['endDate']} | "
+                            f"{status_code} {response_text}"
                         )
-                        for row in parsed_rows:
-                            row_out = dict(row)
-                            row_out["seller_id"] = seller_id
-                            row_out["brand"] = brand
-                            ad_stats_rows.append(row_out)
-                    else:
-                        ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
+                        ad_stats_errors.append(error_line)
+                        print(
+                            f"[WB-bot] Ошибка WB Ad Stats API: {error_line}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        break
+                    except Exception as api_err:
+                        ad_stats_last_request_ts[seller_id] = time.time()
+                        if attempt == AD_STATS_MAX_RETRIES:
+                            error_line = (
+                                f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
+                                f"{req['interval']['beginDate']}→{req['interval']['endDate']} | {api_err}"
+                            )
+                            ad_stats_errors.append(error_line)
+                            print(
+                                f"[WB-bot] Ошибка WB Ad Stats API: {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        delay = AD_STATS_RETRY_BASE_DELAY_SECONDS * attempt
+                        time.sleep(delay)
 
-                except Exception as api_err:
-                    error_line = (
-                        f"{brand} | chunk {req['chunk_index']}/{req['chunk_total']} | "
-                        f"{req['interval']['beginDate']}→{req['interval']['endDate']} | {api_err}"
-                    )
-                    ad_stats_errors.append(error_line)
-                    print(
-                        f"[WB-bot] Ошибка WB Ad Stats API: {error_line}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                if not success:
+                    continue
 
             if ad_stats_rows:
                 write_ad_stats_csv(ad_stats_rows, WB_AD_STATS_CSV_HOST_PATH)
@@ -3496,6 +3559,7 @@ def main() -> int:
         ad_stats_elapsed = time.time() - ad_stats_started_at
         ad_stats_completion_message = build_completion_message("05", "Ad Stats", ad_stats_elapsed)
         send_to_telegram(ad_stats_completion_message)
+        time.sleep(2)
 
         elapsed = int(time.time() - workflow_started_at)
         minutes, seconds = divmod(elapsed, 60)
