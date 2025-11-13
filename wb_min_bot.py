@@ -2616,10 +2616,10 @@ def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
             (
               seller_advert_date_key,
               seller_id,
-              advert_id,
+              @advertId,
               @date,
-              nmID,
-              app_type,
+              @nmId,
+              @appType,
               @views,
               @clicks,
               @ctr,
@@ -2635,7 +2635,9 @@ def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
               @avg_position
             )
             SET
+              advert_id = NULLIF(@advertId, ''),
               date = NULLIF(@date, ''),
+              nmID = NULLIF(@nmId, ''),
               views = NULLIF(@views, ''),
               clicks = NULLIF(@clicks, ''),
               ctr = NULLIF(@ctr, ''),
@@ -2643,11 +2645,11 @@ def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
               ad_expenses = NULLIF(@ad_expenses, ''),
               atbs = NULLIF(@atbs, ''),
               orders = NULLIF(@orders, ''),
-              shks = NULLIF(@shks, ''),
-              cr = NULLIF(@cr, ''),
               canceled = NULLIF(@canceled, ''),
-              sum = NULLIF(@sum, ''),
+              cr = NULLIF(@cr, ''),
+              shks = NULLIF(@shks, ''),
               sum_price = NULLIF(@sum_price, ''),
+              app_type = NULLIF(@appType, ''),
               avg_position = NULLIF(@avg_position, '')
             """
         )
