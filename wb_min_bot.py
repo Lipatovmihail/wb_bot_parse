@@ -2990,7 +2990,7 @@ def update_ad_stats_status(
                 # 'right' если старый уже 'right' ИЛИ текущий beginDate <= (МСК сегодня - 180 дней)
                 cond_a = prev_status == "right"
                 cond_b = current_begin_date and current_begin_date <= threshold180
-                new_status = (cond_a or cond_b) if (cond_a or cond_b) else "left"
+                new_status = "right" if (cond_a or cond_b) else "left"
 
             ad_stats_status = {
                 "status": new_status,
