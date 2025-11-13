@@ -1574,8 +1574,9 @@ def prepare_ad_expenses_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], L
         begin_short = format_date_short(min_begin_date) if min_begin_date else "-"
         end_short = format_date_short(max_end_date) if max_end_date else "-"
         mark = "✅" if s["seller_id"] in allow_set else "✖️"
+        campaigns_cnt = s.get("campaigns_cnt", 0)
         summary_lines.append(
-            f"{minutes_ago}{s['status_cat']} | {begin_short} - {end_short} | {s['brand']} {mark}"
+            f"{minutes_ago}{s['status_cat']} | {begin_short} - {end_short} | {campaigns_cnt} | {s['brand']} {mark}"
         )
     summary_text = "\n".join(summary_lines)
 
@@ -3469,8 +3470,23 @@ def update_ad_expenses_status(
             else:
                 continue
         elif len(all_requests) == 0:
-            # Нет запросов для селлера - пропускаем
-            continue
+            # Нет запросов для селлера - проверяем, есть ли у него установленный статус "right" из-за 0 РК
+            # (такой статус мог быть создан в prepare_ad_expenses_requests или fetch_ad_expenses_sellers)
+            if prev and prev.get("status") == "right" and prev.get("lastTotalRow") == 0:
+                # Сохраняем существующий статус "right" для селлера с 0 РК
+                # Обновляем только nowTime, чтобы зафиксировать время последней проверки
+                ad_expenses_status = {
+                    "status": "right",
+                    "nowTime": now_time,
+                    "lastTotalRow": 0,
+                    "leftBoundary": "",
+                    "maxBeginDate": "",
+                    "lastBeginDate": "",
+                    "rightBoundary": "",
+                }
+            else:
+                # Нет запросов по другой причине - пропускаем
+                continue
         else:
             # Вычисляем beginDate из успешных запросов
             current_begin_date = None
@@ -3489,13 +3505,11 @@ def update_ad_expenses_status(
                     left_boundary = min_ymd(left_boundary, date_str)
                     right_boundary = max_ymd(right_boundary, date_str)
 
-            # Если все запросы успешны но пустые (нет строк) - статус right
-            if count == 0 and len(successful_requests) > 0:
-                new_max_begin_date = prev_max_begin_date or current_begin_date
-                new_status = "right"
-            elif not prev:
+            if not prev:
                 # Впервые видим селлера
                 new_max_begin_date = current_begin_date
+                # Если запросы вернули пустой ответ - это не значит, что все данные собраны
+                # Продолжаем с left статусом
                 new_status = "left"
             else:
                 # maxBeginDate = min(старый maxBeginDate, текущий beginDate)
@@ -3504,6 +3518,7 @@ def update_ad_expenses_status(
                 new_max_begin_date = min(candidates) if candidates else (prev_max_begin_date or current_begin_date)
 
                 # 'right' если старый уже 'right' ИЛИ текущий beginDate <= (МСК сегодня - 180 дней)
+                # НЕ ставим right только из-за пустого ответа - это может быть просто отсутствие списаний за период
                 threshold180 = ymd_minus_days(AD_EXPENSES_LOOKBACK_DAYS)
                 cond_a = prev_status == "right"
                 cond_b = current_begin_date and current_begin_date <= threshold180
