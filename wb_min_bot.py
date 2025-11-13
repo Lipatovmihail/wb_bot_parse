@@ -67,6 +67,18 @@ AD_STATS_SKIP_APP_TYPE_ZERO = True
 AD_STATS_MAX_RETRIES = 5
 AD_STATS_RETRY_BASE_DELAY_SECONDS = 30
 
+# AD EXPENSES constants
+WB_AD_EXPENSES_URL = "https://advert-api.wildberries.ru/adv/v1/upd"
+WB_AD_EXPENSES_CSV_HOST_PATH = "/data/csv/WB_ad_expenses_import.csv"
+WB_AD_EXPENSES_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_ad_expenses_import.csv"
+AD_EXPENSES_LOOKBACK_DAYS = 180
+AD_EXPENSES_DEFAULT_LOOKBACK_DAYS = 15
+AD_EXPENSES_MAX_INTERVAL_DAYS = 30
+AD_EXPENSES_RATE_INTERVAL_SECONDS = 1  # 1 запрос в секунду
+AD_EXPENSES_CHUNK_DELAY_SECONDS = 2  # задержка между чанками
+AD_EXPENSES_RIGHT_COOLDOWN_MINUTES = 30
+AD_EXPENSES_MAX_RETRIES = 5
+AD_EXPENSES_RETRY_BASE_DELAY_SECONDS = 5  # от 5 секунд с нарастающей
 
 MSK_OFFSET = timezone(timedelta(hours=3))
 MS_DAY = timedelta(days=1)
@@ -748,6 +760,19 @@ AD_STATS_CSV_COLUMNS = [
     "avg_position",
 ]
 
+AD_EXPENSES_CSV_COLUMNS = [
+    "seller_advert_date_key",
+    "seller_id",
+    "advertId",
+    "campName",
+    "advertType",
+    "paymentType",
+    "advertStatus",
+    "updNum",
+    "updTime",
+    "updSum",
+]
+
 
 def parse_json_field(value: Any) -> Any:
     if value is None:
@@ -1404,6 +1429,191 @@ def prepare_ad_stats_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List
     return requests, processed, summary_text
 
 
+def prepare_ad_expenses_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List[Dict], str]:
+    today_str = ymd(msk_now())
+    default_from = ymd_minus_days(AD_EXPENSES_DEFAULT_LOOKBACK_DAYS)
+    threshold_180 = ymd_minus_days(AD_EXPENSES_LOOKBACK_DAYS)
+
+    processed: List[Dict] = []
+
+    for idx, raw in enumerate(sellers):
+        seller_id = str(raw.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        brand = (raw.get("wb_api_brand") or seller_id).strip()
+        token = (raw.get("wb_api_key") or "").strip()
+        campaigns_cnt = int(raw.get("campaigns_cnt", 0) or 0)
+
+        # Читаем статус: приоритет ad_expenses_status, fallback на ad_stats_status
+        status_obj = raw.get("ad_expenses_status")
+        if not status_obj and raw.get("ad_stats_status"):
+            status_obj = raw.get("ad_stats_status")
+        
+        # Если campaigns_cnt = 0 и нет статуса, сразу ставим right
+        if campaigns_cnt == 0 and not status_obj:
+            status_obj = {
+                "status": "right",
+                "nowTime": msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "lastTotalRow": 0,
+                "leftBoundary": "",
+                "maxBeginDate": "",
+                "lastBeginDate": "",
+                "rightBoundary": "",
+            }
+
+        now_time = status_obj.get("nowTime") if isinstance(status_obj, dict) else None
+        status_value = (status_obj or {}).get("status") if isinstance(status_obj, dict) else None
+        
+        if status_obj is None:
+            status_cat = "new"
+        elif status_value == "left":
+            status_cat = "left"
+        elif status_value == "right":
+            status_cat = "right"
+        else:
+            status_cat = "other"
+
+        right_boundary = first_ymd((status_obj or {}).get("rightBoundary")) if isinstance(status_obj, dict) else None
+        max_begin_date = first_ymd((status_obj or {}).get("maxBeginDate")) if isinstance(status_obj, dict) else None
+
+        if status_cat == "new":
+            intervals = chunk_between(default_from, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+        elif status_cat == "left":
+            if max_begin_date and max_begin_date > threshold_180:
+                intervals = chunk_between(threshold_180, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+            elif max_begin_date and max_begin_date <= threshold_180:
+                if right_boundary:
+                    start = sub_days_from_ymd(right_boundary, AD_EXPENSES_MAX_INTERVAL_DAYS - 1) or default_from
+                    intervals = chunk_between(start, right_boundary, AD_EXPENSES_MAX_INTERVAL_DAYS)
+                else:
+                    intervals = chunk_between(default_from, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+            else:
+                intervals = chunk_between(default_from, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+        elif status_cat == "right":
+            if right_boundary:
+                start = sub_days_from_ymd(right_boundary, 7) or default_from
+                intervals = chunk_between(start, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+            else:
+                intervals = chunk_between(default_from, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+        else:
+            intervals = chunk_between(default_from, today_str, AD_EXPENSES_MAX_INTERVAL_DAYS)
+
+        processed.append(
+            {
+                "seller_id": seller_id,
+                "brand": brand,
+                "token": token,
+                "idx": idx,
+                "status_cat": status_cat,
+                "now_time": now_time,
+                "intervals": intervals,
+                "ad_expenses_status": status_obj,
+                "ad_expenses_status_raw": raw.get("ad_expenses_status_raw"),
+                "campaigns_cnt": campaigns_cnt,
+            }
+        )
+
+    def parse_now_time(value: Optional[str]) -> float:
+        dt = parse_msk_datetime(value)
+        if dt is None:
+            return float("inf")
+        return dt.timestamp()
+
+    def ad_expenses_right_cooldown_minutes(status_obj: Optional[Dict]) -> float:
+        if not status_obj:
+            return 0.0
+        now_time_str = status_obj.get("nowTime")
+        dt = parse_msk_datetime(now_time_str)
+        if dt is None:
+            return 0.0
+        age_min = minutes_since_msk(dt)
+        remaining = AD_EXPENSES_RIGHT_COOLDOWN_MINUTES - age_min
+        return max(0.0, remaining)
+
+    new_group = [s for s in processed if s["status_cat"] == "new"]
+    left_group = [s for s in processed if s["status_cat"] == "left"]
+    right_group = [s for s in processed if s["status_cat"] == "right"]
+
+    allow_set: Set[str] = set()
+    if new_group:
+        allow_set.update(s["seller_id"] for s in new_group)
+    if left_group:
+        left_group_sorted = sorted(left_group, key=lambda s: (parse_now_time(s["now_time"]), s["idx"]))
+        if left_group_sorted:
+            allow_set.add(left_group_sorted[0]["seller_id"])
+    if right_group:
+        for s in right_group:
+            cooldown_remaining = ad_expenses_right_cooldown_minutes(s.get("ad_expenses_status"))
+            if cooldown_remaining <= 0:
+                allow_set.add(s["seller_id"])
+
+    summary_lines = []
+    for s in sorted(processed, key=lambda item: item["brand"].lower()):
+        intervals = s["intervals"]
+        
+        # Вычисляем минуты с последнего прогона
+        minutes_ago = ""
+        if s.get("now_time"):
+            dt = parse_msk_datetime(s["now_time"])
+            if dt:
+                minutes_ago_int = int(minutes_since_msk(dt))
+                minutes_ago = f"{minutes_ago_int}min | "
+        
+        # Вычисляем мин/макс границы дат из всех интервалов
+        min_begin_date = None
+        max_end_date = None
+        if intervals:
+            for interval in intervals:
+                begin_date = first_ymd(interval.get("beginDate"))
+                end_date = first_ymd(interval.get("endDate"))
+                if begin_date:
+                    min_begin_date = min_begin_date if min_begin_date and min_begin_date < begin_date else begin_date
+                if end_date:
+                    max_end_date = max_end_date if max_end_date and max_end_date > end_date else end_date
+        
+        begin_short = format_date_short(min_begin_date) if min_begin_date else "-"
+        end_short = format_date_short(max_end_date) if max_end_date else "-"
+        mark = "✅" if s["seller_id"] in allow_set else "✖️"
+        summary_lines.append(
+            f"{minutes_ago}{s['status_cat']} | {begin_short} - {end_short} | {s['brand']} {mark}"
+        )
+    summary_text = "\n".join(summary_lines)
+
+    allowed_effective = [
+        s for s in processed if s["seller_id"] in allow_set
+    ]
+
+    requests: List[Dict] = []
+    per_seller_emit: Dict[str, int] = defaultdict(int)
+    total_sellers = len(allowed_effective)
+
+    for seller_index, s in enumerate(sorted(allowed_effective, key=lambda item: item["brand"].lower()), start=1):
+        intervals = s["intervals"]
+        for interval_index, interval in enumerate(intervals, start=1):
+            emitted = per_seller_emit[s["seller_id"]]
+            delay_flag = 1 if emitted > 0 else 0
+            per_seller_emit[s["seller_id"]] = emitted + 1
+
+            requests.append(
+                {
+                    "seller_id": s["seller_id"],
+                    "brand": s["brand"],
+                    "token": s["token"],
+                    "interval": interval,
+                    "beginDate": interval["beginDate"],
+                    "endDate": interval["endDate"],
+                    "delay": delay_flag,
+                    "interval_index": interval_index,
+                    "interval_total": len(intervals),
+                    "seller_index": seller_index,
+                    "sellers_total": total_sellers,
+                    "ad_expenses_status": s.get("ad_expenses_status"),
+                }
+            )
+
+    return requests, processed, summary_text
+
+
 def fetch_ad_stats_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
     cursor.execute(
         """
@@ -1448,6 +1658,57 @@ def fetch_ad_stats_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> Li
 
         campaigns_raw = parse_json_field(row.get("campaigns"))
         row["campaigns"] = campaigns_raw if isinstance(campaigns_raw, list) else []
+        result.append(row)
+    return result
+
+
+def fetch_ad_expenses_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+          s.seller_id,
+          s.wb_api_key,
+          s.wb_api_brand,
+          su.ad_expenses_status,
+          COALESCE(c.campaigns_cnt, 0) AS campaigns_cnt
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+          ON su.seller_id = s.seller_id
+        LEFT JOIN (
+          SELECT seller_id, COUNT(*) AS campaigns_cnt
+          FROM WB_ad_campaigns
+          GROUP BY seller_id
+        ) AS c
+          ON c.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        raw_status = parse_json_field(row.get("ad_expenses_status"))
+        normalized_status = None
+        if isinstance(raw_status, list):
+            for item in reversed(raw_status):
+                if isinstance(item, dict):
+                    normalized_status = item
+                    break
+        elif isinstance(raw_status, dict):
+            normalized_status = raw_status
+        row["ad_expenses_status_raw"] = raw_status
+        row["ad_expenses_status"] = normalized_status
+        # Если campaigns_cnt = 0, сразу ставим статус right
+        campaigns_cnt = int(row.get("campaigns_cnt", 0) or 0)
+        if campaigns_cnt == 0 and normalized_status is None:
+            row["ad_expenses_status"] = {
+                "status": "right",
+                "nowTime": msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "lastTotalRow": 0,
+                "leftBoundary": "",
+                "maxBeginDate": "",
+                "lastBeginDate": "",
+                "rightBoundary": "",
+            }
         result.append(row)
     return result
 
@@ -1582,6 +1843,74 @@ def write_ad_stats_csv(rows: List[Dict], path: str) -> None:
 
     with target.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=AD_STATS_CSV_COLUMNS)
+        writer.writeheader()
+        for chunk_start in range(0, len(rows), 40000):
+            chunk = rows[chunk_start : chunk_start + 40000]
+            writer.writerows(chunk)
+
+
+def process_ad_expenses_response(response_data: List[Dict], seller_id: str) -> List[Dict]:
+    """Обрабатывает ответ от WB API /adv/v1/upd и группирует по seller_id + advertId + updDate + paymentType"""
+    grouped: Dict[str, Dict] = {}
+    
+    for item in response_data:
+        advert_id = item.get("advertId")
+        if advert_id is None:
+            continue
+        
+        advert_id_str = str(advert_id).strip()
+        payment_type = str(item.get("paymentType", "")).strip()
+        
+        # Извлекаем дату из updTime (может быть null)
+        upd_time_raw = item.get("updTime")
+        if upd_time_raw:
+            upd_time_str = str(upd_time_raw)
+            # Извлекаем дату (первые 10 символов ISO формата)
+            upd_date = upd_time_str[:10] if len(upd_time_str) >= 10 else ""
+        else:
+            # Если updTime null, используем текущую дату
+            upd_date = ymd(msk_now())
+            upd_time_str = ""
+        
+        if not upd_date:
+            continue
+        
+        # Уникальный ключ: seller_id + advertId + date + paymentType
+        key = f"{seller_id}_{advert_id_str}_{upd_date}_{payment_type}"
+        
+        if key not in grouped:
+            grouped[key] = {
+                "seller_id": seller_id,
+                "advertId": advert_id_str,
+                "campName": str(item.get("campName", "")).strip(),
+                "advertType": int(item.get("advertType", 0) or 0),
+                "paymentType": payment_type,
+                "advertStatus": int(item.get("advertStatus", 0) or 0),
+                "updNum": int(item.get("updNum", 0) or 0),
+                "updTime": upd_date if upd_time_str else "",  # Сохраняем только дату или пустую строку
+                "updSum": float(item.get("updSum", 0) or 0),
+            }
+        else:
+            # Суммируем updSum при группировке
+            grouped[key]["updSum"] += float(item.get("updSum", 0) or 0)
+    
+    result = []
+    for key, row in grouped.items():
+        row["seller_advert_date_key"] = key
+        result.append(row)
+    
+    return result
+
+
+def write_ad_expenses_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=AD_EXPENSES_CSV_COLUMNS)
         writer.writeheader()
         for chunk_start in range(0, len(rows), 40000):
             chunk = rows[chunk_start : chunk_start + 40000]
@@ -2657,6 +2986,46 @@ def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
         raise RuntimeError(f"LOAD DATA INFILE for ad stats failed: {exc}") from exc
 
 
+def load_ad_expenses_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{WB_AD_EXPENSES_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE WB_ad_expenses
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_advert_date_key,
+              @sellerId,
+              @advertId,
+              @campName,
+              @advertType,
+              @paymentType,
+              @advertStatus,
+              @updNum,
+              @updTime,
+              @updSum
+            )
+            SET
+              seller_id = NULLIF(@sellerId, ''),
+              advertId = NULLIF(@advertId, ''),
+              campName = NULLIF(@campName, ''),
+              advertType = NULLIF(@advertType, ''),
+              paymentType = NULLIF(@paymentType, ''),
+              advertStatus = NULLIF(@advertStatus, ''),
+              updNum = NULLIF(@updNum, ''),
+              updTime = NULLIF(@updTime, ''),
+              updSum = NULLIF(@updSum, '')
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for ad expenses failed: {exc}") from exc
+
+
 def update_products_status(
     cursor: mysql.connector.cursor.MySQLCursor,
     sellers_meta: Iterable[Dict],
@@ -3019,6 +3388,154 @@ def update_ad_stats_status(
             """
             UPDATE WB_sellers_updates
             SET ad_stats_status = %s
+            WHERE seller_id = %s
+            """,
+            updates,
+        )
+
+    return len(updates), details
+
+
+def update_ad_expenses_status(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    sellers_meta: Iterable[Dict],
+    ad_expenses_rows: Iterable[Dict],
+    ad_expenses_requests_by_seller: Dict[str, List[Dict]],
+    ad_expenses_successful_requests_by_seller: Dict[str, List[Dict]],
+    ad_expenses_failed_requests_by_seller: Dict[str, List[Dict]],
+) -> Tuple[int, List[Dict]]:
+    
+    def min_ymd(a: Optional[str], b: Optional[str]) -> Optional[str]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a < b else b
+
+    def max_ymd(a: Optional[str], b: Optional[str]) -> Optional[str]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a > b else b
+
+    per_seller: Dict[str, Dict] = {}
+
+    for meta in sellers_meta:
+        seller_id = str(meta.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        per_seller[seller_id] = {
+            "rows": [],
+            "prev": meta.get("ad_expenses_status"),
+            "brand": meta.get("brand") or meta.get("wb_api_brand") or seller_id,
+        }
+
+    for row in ad_expenses_rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        bucket = per_seller.setdefault(
+            seller_id,
+            {
+                "rows": [],
+                "prev": row.get("ad_expenses_status"),
+                "brand": row.get("brand") or seller_id,
+            },
+        )
+        bucket["rows"].append(row)
+        if not bucket["prev"] and row.get("ad_expenses_status"):
+            bucket["prev"] = row["ad_expenses_status"]
+
+    updates: List[Tuple[str, str]] = []
+    details: List[Dict] = []
+    now_time = msk_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for seller_id, bucket in per_seller.items():
+        rows = bucket["rows"]
+        count = len(rows)
+        prev = bucket.get("prev")
+        prev_status = (prev or {}).get("status") if prev else None
+        prev_max_begin_date = first_ymd((prev or {}).get("maxBeginDate"))
+
+        all_requests = ad_expenses_requests_by_seller.get(seller_id, [])
+        successful_requests = ad_expenses_successful_requests_by_seller.get(seller_id, [])
+        failed_requests = ad_expenses_failed_requests_by_seller.get(seller_id, [])
+
+        # Если все запросы провалились - не меняем статус
+        if len(all_requests) > 0 and len(failed_requests) == len(all_requests):
+            if prev:
+                ad_expenses_status = prev
+            else:
+                continue
+        elif len(all_requests) == 0:
+            # Нет запросов для селлера - пропускаем
+            continue
+        else:
+            # Вычисляем beginDate из успешных запросов
+            current_begin_date = None
+            for req in successful_requests:
+                begin_date = first_ymd(req.get("beginDate"))
+                if begin_date:
+                    current_begin_date = min_ymd(current_begin_date, begin_date)
+
+            # Границы по полю updTime (дата) из строк списаний
+            left_boundary = None
+            right_boundary = None
+            for r in rows:
+                # updTime может быть датой в формате YYYY-MM-DD или пустой строкой
+                date_str = first_ymd(r.get("updTime"))
+                if date_str:
+                    left_boundary = min_ymd(left_boundary, date_str)
+                    right_boundary = max_ymd(right_boundary, date_str)
+
+            # Если все запросы успешны но пустые (нет строк) - статус right
+            if count == 0 and len(successful_requests) > 0:
+                new_max_begin_date = prev_max_begin_date or current_begin_date
+                new_status = "right"
+            elif not prev:
+                # Впервые видим селлера
+                new_max_begin_date = current_begin_date
+                new_status = "left"
+            else:
+                # maxBeginDate = min(старый maxBeginDate, текущий beginDate)
+                candidates = [prev_max_begin_date, current_begin_date]
+                candidates = [c for c in candidates if c]
+                new_max_begin_date = min(candidates) if candidates else (prev_max_begin_date or current_begin_date)
+
+                # 'right' если старый уже 'right' ИЛИ текущий beginDate <= (МСК сегодня - 180 дней)
+                threshold180 = ymd_minus_days(AD_EXPENSES_LOOKBACK_DAYS)
+                cond_a = prev_status == "right"
+                cond_b = current_begin_date and current_begin_date <= threshold180
+                new_status = "right" if (cond_a or cond_b) else "left"
+
+            ad_expenses_status = {
+                "status": new_status,
+                "nowTime": now_time,
+                "lastTotalRow": count,
+                "leftBoundary": left_boundary or "",
+                "maxBeginDate": new_max_begin_date or "",
+                "lastBeginDate": current_begin_date or "",
+                "rightBoundary": right_boundary or "",
+            }
+
+        updates.append((json.dumps(ad_expenses_status, ensure_ascii=False), seller_id))
+        details.append(
+            {
+                "seller_id": seller_id,
+                "brand": bucket.get("brand") or seller_id,
+                "from": prev_status if prev else "null",
+                "to": ad_expenses_status.get("status") if isinstance(ad_expenses_status, dict) else (prev_status if prev else "null"),
+                "count": count,
+                "maxBeginDate": ad_expenses_status.get("maxBeginDate") if isinstance(ad_expenses_status, dict) else "",
+            }
+        )
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE WB_sellers_updates
+            SET ad_expenses_status = %s
             WHERE seller_id = %s
             """,
             updates,
@@ -3904,6 +4421,219 @@ def main() -> int:
         ad_stats_elapsed = time.time() - ad_stats_started_at
         ad_stats_completion_message = build_completion_message("05", "Ad Stats", ad_stats_elapsed)
         send_to_telegram(ad_stats_completion_message)
+        time.sleep(2)
+
+        ad_expenses_started_at = time.time()
+        ad_expenses_sellers = fetch_ad_expenses_sellers(cursor_dict)
+        ad_expenses_requests, ad_expenses_processed, ad_expenses_summary = prepare_ad_expenses_requests(ad_expenses_sellers)
+        print("[WB-bot] Подготовлена выборка для списаний рекламных кампаний.", flush=True)
+        ad_expenses_selection_message = build_ad_stats_selection_message(ad_expenses_summary)  # Используем ту же функцию для сообщения
+        ad_expenses_selection_message = ad_expenses_selection_message.replace("05 WB API", "06 WB API").replace("Ad Stats", "Ad Expenses")
+        send_to_telegram(ad_expenses_selection_message)
+
+        ad_expenses_rows: List[Dict] = []
+        ad_expenses_rows_by_seller: Dict[str, int] = defaultdict(int)
+        ad_expenses_errors: List[str] = []
+        seller_brand_map_expenses: Dict[str, str] = {}
+        ad_expenses_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
+        ad_expenses_successful_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
+        ad_expenses_failed_requests_by_seller: Dict[str, List[Dict]] = defaultdict(list)
+
+        if ad_expenses_requests:
+            unique_sellers = len({req["seller_id"] for req in ad_expenses_requests})
+            print(
+                f"[WB-bot] Запланировано {len(ad_expenses_requests)} запросов списаний для {unique_sellers} селлеров.",
+                flush=True,
+            )
+
+            total_requests = len(ad_expenses_requests)
+            for request_index, req in enumerate(ad_expenses_requests, start=1):
+                seller_id = req["seller_id"]
+                brand = req["brand"]
+                ad_expenses_requests_by_seller[seller_id].append(req)
+                seller_brand_map_expenses[seller_id] = brand
+
+                # Задержка между чанками
+                if req.get("delay") == 1:
+                    time.sleep(AD_EXPENSES_CHUNK_DELAY_SECONDS)
+
+                print(
+                    f"[WB-bot] Ad Expenses: запрос {request_index}/{total_requests} | "
+                    f"{brand} | интервал {req['interval_index']}/{req['interval_total']} | "
+                    f"{req['beginDate']}→{req['endDate']}",
+                    flush=True,
+                )
+
+                # Задержка между запросами (1 запрос в секунду)
+                if request_index > 1:
+                    time.sleep(AD_EXPENSES_RATE_INTERVAL_SECONDS)
+
+                params = {
+                    "from": req["beginDate"],
+                    "to": req["endDate"],
+                }
+                headers = {
+                    "user-agent": WB_USER_AGENT,
+                    "Authorization": f"Bearer {req['token']}",
+                }
+
+                success = False
+
+                for attempt in range(1, AD_EXPENSES_MAX_RETRIES + 1):
+                    try:
+                        response = requests.get(WB_AD_EXPENSES_URL, params=params, headers=headers, timeout=40)
+                        status_code = response.status_code
+                        response_text = (response.text or "").strip()
+
+                        if status_code == 200:
+                            payload = response.json()
+                            if isinstance(payload, list):
+                                processed_rows = process_ad_expenses_response(payload, seller_id)
+                                if processed_rows:
+                                    ad_expenses_rows_by_seller[seller_id] += len(processed_rows)
+                                    for row in processed_rows:
+                                        row["brand"] = brand
+                                        ad_expenses_rows.append(row)
+
+                            ad_expenses_successful_requests_by_seller[seller_id].append(req)
+                            success = True
+                            break
+
+                        if status_code in {429, 500}:
+                            if attempt == AD_EXPENSES_MAX_RETRIES:
+                                ad_expenses_failed_requests_by_seller[seller_id].append(req)
+                                error_line = (
+                                    f"{brand} | интервал {req['interval_index']}/{req['interval_total']} | "
+                                    f"{req['beginDate']}→{req['endDate']} | "
+                                    f"{status_code} {response_text}"
+                                )
+                                ad_expenses_errors.append(error_line)
+                                print(
+                                    f"[WB-bot] Ошибка WB Ad Expenses API: {error_line}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                break
+                            delay = AD_EXPENSES_RETRY_BASE_DELAY_SECONDS * attempt
+                            time.sleep(delay)
+                            continue
+
+                        ad_expenses_failed_requests_by_seller[seller_id].append(req)
+                        error_line = (
+                            f"{brand} | интервал {req['interval_index']}/{req['interval_total']} | "
+                            f"{req['beginDate']}→{req['endDate']} | "
+                            f"{status_code} {response_text}"
+                        )
+                        ad_expenses_errors.append(error_line)
+                        print(
+                            f"[WB-bot] Ошибка WB Ad Expenses API: {error_line}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        break
+                    except Exception as api_err:
+                        if attempt == AD_EXPENSES_MAX_RETRIES:
+                            ad_expenses_failed_requests_by_seller[seller_id].append(req)
+                            error_line = (
+                                f"{brand} | интервал {req['interval_index']}/{req['interval_total']} | "
+                                f"{req['beginDate']}→{req['endDate']} | {api_err}"
+                            )
+                            ad_expenses_errors.append(error_line)
+                            print(
+                                f"[WB-bot] Ошибка WB Ad Expenses API: {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        delay = AD_EXPENSES_RETRY_BASE_DELAY_SECONDS * attempt
+                        time.sleep(delay)
+
+                if not success:
+                    continue
+
+            if ad_expenses_rows:
+                # Удаляем служебное поле brand перед записью в CSV
+                csv_rows = [{k: v for k, v in row.items() if k in AD_EXPENSES_CSV_COLUMNS} for row in ad_expenses_rows]
+                write_ad_expenses_csv(csv_rows, WB_AD_EXPENSES_CSV_HOST_PATH)
+                print(
+                    f"[WB-bot] CSV списаний реклам сформирован: {WB_AD_EXPENSES_CSV_HOST_PATH} ({len(ad_expenses_rows)} строк).",
+                    flush=True,
+                )
+                summary_lines = []
+                for seller_id, rows_count in sorted(ad_expenses_rows_by_seller.items(), key=lambda item: seller_brand_map_expenses.get(item[0], item[0])):
+                    brand = seller_brand_map_expenses.get(seller_id, seller_id)
+                    summary_lines.append(f"{brand} | rows:{rows_count}")
+                summary_text = html.escape("\n".join(summary_lines) if summary_lines else "нет данных")
+                ad_expenses_summary_message = (
+                    "<b>06 WB API</b> | Ad Expenses\n"
+                    "<blockquote><b>Списания собраны ✅</b>\n"
+                    f"<code>{summary_text}</code></blockquote>"
+                )
+                send_to_telegram(ad_expenses_summary_message)
+            else:
+                print("[WB-bot] Нет данных по списаниям рекламных кампаний.", flush=True)
+
+            if ad_expenses_errors:
+                errors_text = html.escape("\n".join(ad_expenses_errors))
+                error_message = (
+                    "<b>06 WB API</b> | Ad Expenses\n"
+                    "<blockquote><b>Ошибки при запросе</b>\n"
+                    f"<code>{errors_text}</code></blockquote>"
+                )
+                send_to_telegram(error_message)
+
+            ad_expenses_db_loaded = False
+            if ad_expenses_rows:
+                try:
+                    load_ad_expenses_into_db(cursor)
+                    ad_expenses_db_loaded = True
+                    print("[WB-bot] WB_ad_expenses успешно обновлена через LOAD DATA INFILE.", flush=True)
+                    ad_expenses_load_message = (
+                        "<b>06 WB API</b> | Ad Expenses\n"
+                        "<blockquote>Данные загружены в таблицу WB_ad_expenses.</blockquote>"
+                    )
+                    send_to_telegram(ad_expenses_load_message)
+                except Exception as db_err:
+                    print(f"[WB-bot] Ошибка LOAD DATA для списаний реклам: {db_err}", file=sys.stderr, flush=True)
+                    error_message = (
+                        "<b>06 WB API</b> | Ad Expenses\n"
+                        "<blockquote>"
+                        "Ошибка загрузки данных в WB_ad_expenses.\n"
+                        f"<code>{html.escape(str(db_err))}</code>"
+                        "</blockquote>"
+                    )
+                    try:
+                        send_to_telegram(error_message)
+                    except Exception:
+                        traceback.print_exc()
+
+            if ad_expenses_db_loaded:
+                ad_expenses_status_updates, ad_expenses_status_details = update_ad_expenses_status(
+                    cursor,
+                    ad_expenses_processed,
+                    ad_expenses_rows,
+                    ad_expenses_requests_by_seller,
+                    ad_expenses_successful_requests_by_seller,
+                    ad_expenses_failed_requests_by_seller,
+                )
+                if ad_expenses_status_updates:
+                    connection.commit()
+                    print(
+                        f"[WB-bot] Обновлены ad_expenses_status для {ad_expenses_status_updates} селлеров.",
+                        flush=True,
+                    )
+                    if ad_expenses_status_details:
+                        ad_expenses_status_message = build_ad_stats_status_message(ad_expenses_status_details)  # Используем ту же функцию
+                        ad_expenses_status_message = ad_expenses_status_message.replace("05 WB API", "06 WB API").replace("Ad Stats", "Ad Expenses")
+                        send_to_telegram(ad_expenses_status_message)
+            else:
+                print("[WB-bot] Статусы ad_expenses не обновлялись из-за ошибки загрузки в БД.", flush=True)
+        else:
+            print("[WB-bot] Нет селлеров для запроса списаний.", flush=True)
+
+        ad_expenses_elapsed = time.time() - ad_expenses_started_at
+        ad_expenses_completion_message = build_completion_message("06", "Ad Expenses", ad_expenses_elapsed)
+        send_to_telegram(ad_expenses_completion_message)
         time.sleep(2)
 
         elapsed = int(time.time() - workflow_started_at)
