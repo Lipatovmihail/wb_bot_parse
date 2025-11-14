@@ -4,6 +4,8 @@
 и отправляет статус в Telegram.
 """
 
+import base64
+import calendar
 import html
 import json
 import os
@@ -11,7 +13,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -48,6 +50,10 @@ PRODUCTS_COOLDOWN_MINUTES = int(os.environ.get("WB_PRODUCTS_COOLDOWN_MINUTES", "
 ADS_COOLDOWN_MINUTES = int(os.environ.get("WB_ADS_COOLDOWN_MINUTES", "60"))
 AD_STATS_COOLDOWN_MINUTES = int(os.environ.get("WB_AD_STATS_COOLDOWN_MINUTES", "60"))
 AD_STATS_RIGHT_COOLDOWN_MINUTES = 30
+
+TOTAL_NMID_RIGHT_COOLDOWN_MINUTES = 30
+TOTAL_NMID_CSV_HOST_PATH = "/data/csv/GS_RNP_total_metrics_nmid.csv"
+TOTAL_NMID_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_metrics_nmid.csv"
 WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
 WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
@@ -79,6 +85,18 @@ AD_EXPENSES_CHUNK_DELAY_SECONDS = 2  # задержка между чанкам�
 AD_EXPENSES_RIGHT_COOLDOWN_MINUTES = 30
 AD_EXPENSES_MAX_RETRIES = 5
 AD_EXPENSES_RETRY_BASE_DELAY_SECONDS = 5  # от 5 секунд с нарастающей
+
+# STOCKS constants
+WB_STOCKS_CREATE_URL = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
+WB_STOCKS_STATUS_URL = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{task_id}/status"
+WB_STOCKS_DOWNLOAD_URL = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{task_id}/download"
+WB_STOCKS_CSV_HOST_PATH = "/data/csv/WB_stocks_import.csv"
+WB_STOCKS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_stocks_import.csv"
+STOCKS_RIGHT_COOLDOWN_MINUTES = 30
+STOCKS_STATUS_CHECK_INTERVAL_SECONDS = 5  # проверка статуса раз в 5 секунд
+STOCKS_MAX_STATUS_CHECKS = 120  # максимум 10 минут ожидания (120 * 5 сек)
+STOCKS_MAX_RETRIES = 5
+STOCKS_RETRY_BASE_DELAY_SECONDS = 5
 
 MSK_OFFSET = timezone(timedelta(hours=3))
 MS_DAY = timedelta(days=1)
@@ -181,7 +199,47 @@ def test_connection() -> Tuple[bool, str]:
             connection.close()
 
 
-def send_to_telegram(message: str) -> None:
+def _telegram_call(endpoint: str, payload: Dict[str, Any], action: str) -> Optional[Dict[str, Any]]:
+    max_attempts = 5
+    base_delay = 2.0
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                endpoint,
+                json=payload,
+                timeout=10,
+            )
+            response.raise_for_status()
+            try:
+                return response.json()
+            except ValueError:
+                return None
+        except requests.exceptions.HTTPError as http_err:
+            status = http_err.response.status_code if http_err.response else None
+            retryable = status in {429, 500, 502, 503, 504}
+            print(
+                f"[WB-bot] Telegram {action} failed (status={status}) attempt {attempt}/{max_attempts}: {http_err}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if not retryable:
+                break
+        except Exception as exc:
+            print(
+                f"[WB-bot] Telegram {action} unexpected error attempt {attempt}/{max_attempts}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if attempt < max_attempts:
+            delay = base_delay * attempt
+            time.sleep(delay)
+
+    return None
+
+
+def send_to_telegram(message: str) -> Optional[Dict[str, Any]]:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
@@ -191,12 +249,23 @@ def send_to_telegram(message: str) -> None:
     if TELEGRAM_THREAD_ID:
         payload["message_thread_id"] = TELEGRAM_THREAD_ID
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json=payload,
-        timeout=10,
-    )
-    response.raise_for_status()
+    endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    return _telegram_call(endpoint, payload, "sendMessage")
+
+
+def edit_telegram_message(message_id: int, message: str) -> Optional[Dict[str, Any]]:
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_notification": True,
+    }
+    if TELEGRAM_THREAD_ID:
+        payload["message_thread_id"] = TELEGRAM_THREAD_ID
+
+    endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    return _telegram_call(endpoint, payload, "editMessageText")
 
 
 def sync_active_list(cursor: mysql.connector.cursor.MySQLCursor) -> None:
@@ -673,6 +742,33 @@ def build_ad_list_status_message(details: List[Dict]) -> str:
     return "\n".join([header, summary_line, body, closing])
 
 
+def build_stocks_status_message(details: List[Dict]) -> str:
+    header = "<b>07 WB API</b> | STOCKS\n<blockquote>Статус обновлён ✅"
+    summary_line = f"Всего селлеров: {len(details)}"
+    lines = []
+
+    def fmt_int(value: Any) -> str:
+        try:
+            number = int(value)
+        except Exception:
+            number = 0
+        return f"{number:,}".replace(",", " ")
+
+    for item in sorted(details, key=lambda x: (x.get("brand") or x.get("seller_id") or "").lower()):
+        brand_name = html.escape(item.get("brand") or item.get("seller_id") or "")
+        status = item.get("status") or {}
+        line = (
+            f"nmIDs:{status.get('nmid_stock_cnt', 0)} | "
+            f"all_stock:{fmt_int(status.get('all_stock_cnt', 0))} | "
+            f"{brand_name}"
+        )
+        lines.append(html.escape(line))
+
+    body = "<code>" + ("\n".join(lines) if lines else "нет данных") + "</code>"
+    closing = "</blockquote>"
+    return "\n".join([header, summary_line, body, closing])
+
+
 def build_ad_stats_status_message(details: List[Dict]) -> str:
     header = "<b>05 WB API</b> | Ad Stats\n<blockquote>Статус обновлён ✅"
     total_sellers = len(details)
@@ -773,6 +869,22 @@ AD_EXPENSES_CSV_COLUMNS = [
     "updSum",
 ]
 
+STOCKS_CSV_COLUMNS = [
+    "seller_bc_key",
+    "seller_id",
+    "barcode",
+    "subjectName",
+    "vendorCode",
+    "nmId",
+    "techSize",
+    "volume",
+    "quantity",
+    "inWayToClient",
+    "inWayFromClient",
+    "quantityFull",
+    "warehouses",
+]
+
 
 def parse_json_field(value: Any) -> Any:
     if value is None:
@@ -788,6 +900,43 @@ def parse_json_field(value: Any) -> Any:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def parse_ymd_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def first_day_of_month(dt: date) -> date:
+    return date(dt.year, dt.month, 1)
+
+
+def add_months_first_day(dt: date, months: int) -> date:
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, 1)
+
+
+def last_day_of_month(dt: date) -> date:
+    _, last_day = calendar.monthrange(dt.year, dt.month)
+    return date(dt.year, dt.month, last_day)
+
+
+def month_span(start: date, end: date) -> Iterable[date]:
+    if start > end:
+        return []
+    current = date(start.year, start.month, 1)
+    final = date(end.year, end.month, 1)
+    span: List[date] = []
+    while current <= final:
+        span.append(current)
+        current = add_months_first_day(current, 1)
+    return span
 
 
 def to_ymd_from_iso(value: Optional[str]) -> Optional[str]:
@@ -1429,6 +1578,110 @@ def prepare_ad_stats_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List
     return requests, processed, summary_text
 
 
+def fetch_total_nmid_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+            s.seller_id,
+            s.wb_api_brand,
+            su.total_nmid_status
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+            ON su.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        status = parse_json_field(row.get("total_nmid_status"))
+        result.append(
+            {
+                "seller_id": seller_id,
+                "brand": str(row.get("wb_api_brand") or seller_id).strip(),
+                "total_nmid_status": status if isinstance(status, dict) else None,
+            }
+        )
+    return result
+
+
+def _total_nmid_cooldown_minutes(status_obj: Optional[Dict]) -> float:
+    if not status_obj:
+        return 0.0
+    now_time_str = status_obj.get("nowTime")
+    dt = parse_msk_datetime(now_time_str)
+    if dt is None:
+        return 0.0
+    age_min = minutes_since_msk(dt)
+    remaining = TOTAL_NMID_RIGHT_COOLDOWN_MINUTES - age_min
+    return max(0.0, remaining)
+
+
+def prepare_total_nmid_requests(
+    sellers: Iterable[Dict],
+) -> Tuple[List[Dict], List[Dict], str]:
+    processed: List[Dict] = []
+
+    for idx, raw in enumerate(sellers):
+        seller_id = str(raw.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        status_obj = raw.get("total_nmid_status")
+        status_cat = "new"
+        now_time = None
+        if isinstance(status_obj, dict):
+            status_cat_value = (status_obj.get("status") or "").strip().lower()
+            now_time = status_obj.get("nowTime")
+            if status_cat_value == "right":
+                status_cat = "right"
+            else:
+                status_cat = "new"
+        processed.append(
+            {
+                "seller_id": seller_id,
+                "brand": raw.get("brand") or seller_id,
+                "idx": idx,
+                "total_nmid_status": status_obj,
+                "status_cat": status_cat,
+                "now_time": now_time,
+            }
+        )
+
+    new_group = [s for s in processed if s["status_cat"] == "new"]
+    right_group = [s for s in processed if s["status_cat"] == "right"]
+
+    allow_set: Set[str] = set()
+    if new_group:
+        allow_set.update(s["seller_id"] for s in new_group)
+    else:
+        for s in right_group:
+            cooldown_remaining = _total_nmid_cooldown_minutes(s.get("total_nmid_status"))
+            if cooldown_remaining <= 0:
+                allow_set.add(s["seller_id"])
+
+    summary_lines = []
+    for s in sorted(processed, key=lambda item: item["brand"].lower()):
+        allowed = s["seller_id"] in allow_set
+        mark = "✅" if allowed else "✖️"
+        status_obj = s.get("total_nmid_status") or {}
+        now_dt = parse_msk_datetime(status_obj.get("nowTime"))
+        if s["status_cat"] == "new":
+            minutes_text = "new"
+        elif now_dt is not None:
+            age_min = max(0, int(minutes_since_msk(now_dt)))
+            minutes_text = f"{age_min}min"
+        else:
+            minutes_text = "--"
+        summary_lines.append(f"{minutes_text} | {s['brand']} {mark}")
+    summary_text = "\n".join(summary_lines)
+
+    allowed = [s for s in processed if s["seller_id"] in allow_set]
+    return allowed, processed, summary_text
+
+
 def prepare_ad_expenses_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List[Dict], str]:
     today_str = ymd(msk_now())
     default_from = ymd_minus_days(AD_EXPENSES_DEFAULT_LOOKBACK_DAYS)
@@ -1612,6 +1865,858 @@ def prepare_ad_expenses_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], L
                 }
             )
 
+    return requests, processed, summary_text
+
+
+def fetch_stocks_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+            s.seller_id,
+            s.wb_api_key,
+            s.wb_api_brand,
+            su.stock_status
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+            ON su.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        # Парсим JSON поле stock_status
+        status = row.get("stock_status")
+        stock_status = None
+        if status:
+            try:
+                if isinstance(status, str):
+                    stock_status = json.loads(status)
+                elif isinstance(status, dict):
+                    stock_status = status
+            except (json.JSONDecodeError, TypeError):
+                stock_status = None
+        result.append(
+            {
+                "seller_id": seller_id,
+                "wb_api_key": str(row.get("wb_api_key") or "").strip(),
+                "wb_api_brand": str(row.get("wb_api_brand") or seller_id).strip(),
+                "stock_status": stock_status,
+            }
+        )
+    return result
+
+
+def fetch_report_detail_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
+    cursor.execute(
+        """
+        SELECT
+            s.seller_id,
+            COALESCE(s.wb_api_brand, s.seller_id) AS brand
+        FROM WB_sellers AS s
+        JOIN WB_sellers_updates AS su
+            ON su.seller_id = s.seller_id
+        WHERE su.in_workrnp = 1
+        """
+    )
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        result.append(
+            {
+                "seller_id": seller_id,
+                "brand": str(row.get("brand") or seller_id).strip(),
+            }
+        )
+    return result
+
+
+REPORT_DETAIL_INSERT_ORDERS_SQL = """
+INSERT INTO GS_RNP_ReportDetail (
+    srid_seller_sale_key,
+    seller_id,
+    Date_order,
+    Date_cancel,
+    Warehouse,
+    Warehouse_type,
+    Country,
+    Okrug,
+    Region,
+    nmId,
+    supplierArticle,
+    Size,
+    BC,
+    Brand,
+    Category,
+    Subject,
+    SPP,
+    TotalPrice,
+    Discount,
+    priceWithDisc,
+    finishedPrice,
+    gNumber,
+    srid,
+    orderType,
+    status
+)
+SELECT
+    CONCAT(srid, '_', seller_id) AS srid_seller_sale_key,
+    seller_id,
+    `date` AS Date_order,
+    CASE WHEN isCancel = 1 THEN cancelDate ELSE NULL END AS Date_cancel,
+    warehouseName       AS Warehouse,
+    warehouseType       AS Warehouse_type,
+    countryName         AS Country,
+    oblastOkrugName     AS Okrug,
+    regionName          AS Region,
+    nmId,
+    supplierArticle,
+    techSize            AS Size,
+    barcode             AS BC,
+    brand               AS Brand,
+    category            AS Category,
+    subject             AS Subject,
+    spp                 AS SPP,
+    totalPrice          AS TotalPrice,
+    discountPercent     AS Discount,
+    priceWithDisc       AS priceWithDisc,
+    finishedPrice       AS finishedPrice,
+    gNumber,
+    srid,
+    orderType,
+    CASE WHEN isCancel = 1 THEN 'Отмена' ELSE 'Доставка' END AS status
+FROM WB_orders
+WHERE seller_id = %s
+ON DUPLICATE KEY UPDATE
+  seller_id       = VALUES(seller_id),
+  Date_order      = VALUES(Date_order),
+  Date_cancel     = VALUES(Date_cancel),
+  Warehouse       = VALUES(Warehouse),
+  Warehouse_type  = VALUES(Warehouse_type),
+  Country         = VALUES(Country),
+  Okrug           = VALUES(Okrug),
+  Region          = VALUES(Region),
+  nmId            = VALUES(nmId),
+  supplierArticle = VALUES(supplierArticle),
+  Size            = VALUES(Size),
+  BC              = VALUES(BC),
+  Brand           = VALUES(Brand),
+  Category        = VALUES(Category),
+  Subject         = VALUES(Subject),
+  SPP             = VALUES(SPP),
+  TotalPrice      = VALUES(TotalPrice),
+  Discount        = VALUES(Discount),
+  priceWithDisc   = VALUES(priceWithDisc),
+  finishedPrice   = VALUES(finishedPrice),
+  gNumber         = VALUES(gNumber),
+  srid            = VALUES(srid),
+  orderType       = VALUES(orderType),
+  status          = VALUES(status)
+"""
+
+
+REPORT_DETAIL_INSERT_SALES_SQL = """
+INSERT INTO GS_RNP_ReportDetail (
+    srid_seller_sale_key,
+    seller_id,
+    date_sales,
+    date_return,
+    finishedPriceFact,
+    paymentSaleAmount,
+    forPay,
+    ComWBRub,
+    ComWBPercent,
+    Warehouse,
+    Warehouse_type,
+    Country,
+    Okrug,
+    Region,
+    nmId,
+    supplierArticle,
+    Size,
+    BC,
+    Brand,
+    Category,
+    Subject,
+    SPP,
+    TotalPrice,
+    Discount,
+    gNumber,
+    srid,
+    orderType,
+    status,
+    priceWithDisc,
+    finishedPrice
+)
+SELECT
+  CONCAT(w.srid, '_', w.seller_id) AS srid_seller_sale_key,
+  w.seller_id,
+  ls.lastSaleDate AS date_sales,
+  lr.lastReturnDate AS date_return,
+  ABS(w.finishedPrice)     AS finishedPriceFact,
+  ABS(w.paymentSaleAmount) AS paymentSaleAmount,
+  ABS(w.forPay)            AS forPay,
+  ROUND(ABS(w.priceWithDisc) - ABS(w.forPay), 2) AS ComWBRub,
+  CASE
+    WHEN ABS(w.priceWithDisc) != 0
+    THEN ROUND(((ABS(w.priceWithDisc) - ABS(w.forPay)) * 100 / ABS(w.priceWithDisc)), 2)
+    ELSE 0
+  END AS ComWBPercent,
+  w.warehouseName   AS Warehouse,
+  w.warehouseType   AS Warehouse_type,
+  w.countryName     AS Country,
+  w.oblastOkrugName AS Okrug,
+  w.regionName      AS Region,
+  w.nmId,
+  w.supplierArticle,
+  w.techSize        AS Size,
+  w.barcode         AS BC,
+  w.brand           AS Brand,
+  w.category        AS Category,
+  w.subject         AS Subject,
+  w.spp             AS SPP,
+  ABS(w.totalPrice)     AS TotalPrice,
+  w.discountPercent     AS Discount,
+  w.gNumber,
+  w.srid,
+  w.orderType,
+  CASE
+    WHEN lr.lastReturnDate IS NOT NULL THEN 'Возврат'
+    WHEN ls.lastSaleDate   IS NOT NULL THEN 'Выкуп'
+    ELSE NULL
+  END AS status,
+  ABS(w.priceWithDisc)   AS priceWithDisc,
+  ABS(w.finishedPrice)    AS finishedPrice
+FROM
+  (
+    SELECT
+      srid,
+      seller_id,
+      MAX(`date`) AS lastEventDate
+    FROM WB_sales
+    GROUP BY srid, seller_id
+  ) le
+  JOIN WB_sales w
+    ON  w.srid      = le.srid
+    AND w.seller_id = le.seller_id
+    AND w.`date`    = le.lastEventDate
+  LEFT JOIN (
+    SELECT
+      srid,
+      seller_id,
+      MAX(`date`) AS lastReturnDate
+    FROM WB_sales
+    WHERE saleID LIKE 'R%'
+    GROUP BY srid, seller_id
+  ) lr
+    ON lr.srid      = le.srid
+    AND lr.seller_id = le.seller_id
+  LEFT JOIN (
+    SELECT
+      srid,
+      seller_id,
+      MAX(`date`) AS lastSaleDate
+    FROM WB_sales
+    WHERE saleID LIKE 'S%'
+    GROUP BY srid, seller_id
+  ) ls
+    ON ls.srid      = le.srid
+    AND ls.seller_id = le.seller_id
+WHERE w.seller_id = %s
+ON DUPLICATE KEY UPDATE
+  seller_id         = VALUES(seller_id),
+  date_sales        = VALUES(date_sales),
+  date_return       = VALUES(date_return),
+  finishedPriceFact = VALUES(finishedPriceFact),
+  paymentSaleAmount = VALUES(paymentSaleAmount),
+  forPay            = VALUES(forPay),
+  ComWBRub          = VALUES(ComWBRub),
+  ComWBPercent      = VALUES(ComWBPercent),
+  Warehouse         = VALUES(Warehouse),
+  Warehouse_type    = VALUES(Warehouse_type),
+  Country           = VALUES(Country),
+  Okrug             = VALUES(Okrug),
+  Region            = VALUES(Region),
+  nmId              = VALUES(nmId),
+  supplierArticle   = VALUES(supplierArticle),
+  Size              = VALUES(Size),
+  BC                = VALUES(BC),
+  Brand             = VALUES(Brand),
+  Category          = VALUES(Category),
+  Subject           = VALUES(Subject),
+  SPP               = VALUES(SPP),
+  TotalPrice        = VALUES(TotalPrice),
+  Discount          = VALUES(Discount),
+  gNumber           = VALUES(gNumber),
+  srid              = VALUES(srid),
+  orderType         = VALUES(orderType),
+  status            = VALUES(status),
+  priceWithDisc     = VALUES(priceWithDisc),
+  finishedPrice     = VALUES(finishedPrice)
+"""
+
+
+REPORT_DETAIL_UPDATE_PURPRICE_SQL = """
+UPDATE GS_RNP_ReportDetail r
+JOIN GS_RNP_PurPrice p
+   ON p.Barcode = r.BC
+  AND p.seller_id = r.seller_id
+  AND p.Date = (
+       SELECT MAX(p2.Date)
+       FROM GS_RNP_PurPrice p2
+       WHERE p2.Barcode = r.BC
+         AND p2.seller_id = r.seller_id
+         AND p2.Date <= COALESCE(r.Date_order, r.date_sales, r.date_return)
+  )
+SET
+  r.Pur_price              = p.Pur_price,
+  r.Logistics_toclient_cost= p.Logistics_cost,
+  r.Pur_date               = p.Date
+WHERE (
+       r.Pur_price IS NULL
+       OR r.Pur_date IS NULL
+       OR r.Pur_date < p.Date
+       OR r.Pur_price <> p.Pur_price
+      )
+"""
+
+
+REPORT_DETAIL_UPDATE_LOGISTICS_SQL = """
+UPDATE GS_RNP_ReportDetail
+SET Logistics_return_cost = CASE
+  WHEN status IN ('Отмена', 'Возврат') THEN 50
+  ELSE 0
+END
+"""
+
+
+TOTAL_NMID_PRODUCTS_SQL = """
+SELECT
+  p.seller_id,
+  p.nmid,
+  ANY_VALUE(p.vendorCode)        AS vendorCode,
+  ANY_VALUE(p.subjectName)       AS subjectName,
+  ANY_VALUE(p.title)             AS title,
+  ANY_VALUE(p.photo)             AS photo,
+  ANY_VALUE(s.wb_api_brand)      AS wb_api_brand,
+  MAX(su.orders_status)          AS orders_status,
+  MAX(su.sales_status)           AS sales_status,
+  MAX(su.total_nmid_status)      AS total_nmid_status
+FROM WB_products p
+LEFT JOIN WB_sellers         s  ON s.seller_id  = p.seller_id
+LEFT JOIN WB_sellers_updates su ON su.seller_id = p.seller_id
+WHERE p.seller_id = %s
+GROUP BY p.seller_id, p.nmid
+ORDER BY p.nmid
+"""
+
+
+TOTAL_NMID_FETCH_SQL = """
+SELECT
+    p.seller_id,
+    p.nmID,
+    p.vendorCode,
+    p.subjectName,
+    p.title,
+    p.photo,
+    COALESCE(s.wb_api_brand, '') AS wb_api_brand,
+    d.BC,
+    d.Size,
+    d.supplierArticle,
+    d.Subject,
+    d.id,
+    d.status,
+    d.srid_seller_sale_key,
+    d.Date_order,
+    d.Date_cancel,
+    d.date_sales,
+    d.date_return,
+    d.Warehouse,
+    d.Warehouse_type,
+    d.Country,
+    d.Okrug,
+    d.Region,
+    d.nmId                AS nmId_sale,
+    d.SPP,
+    d.TotalPrice,
+    d.Discount,
+    d.priceWithDisc,
+    d.finishedPrice,
+    d.gNumber,
+    d.srid,
+    d.orderType,
+    d.finishedPriceFact,
+    d.paymentSaleAmount,
+    d.forPay,
+    d.ComWBRub,
+    d.ComWBPercent,
+    d.Pur_price,
+    d.Logistics_toclient_cost,
+    d.Logistics_return_cost,
+    d.Pur_date
+FROM (
+    SELECT
+        seller_id,
+        nmID,
+        MIN(vendorCode)   AS vendorCode,
+        MIN(subjectName)  AS subjectName,
+        MIN(title)        AS title,
+        MIN(photo)        AS photo
+    FROM WB_products
+    WHERE seller_id = %s
+      AND nmID      = %s
+    GROUP BY seller_id, nmID
+) AS p
+LEFT JOIN WB_sellers AS s
+       ON s.seller_id = p.seller_id
+LEFT JOIN GS_RNP_ReportDetail AS d
+       ON  d.seller_id = p.seller_id
+       AND d.nmId      = p.nmID
+       AND d.Date_order >= %s
+       AND d.Date_order < %s
+"""
+
+
+def fetch_total_nmid_cards(
+    cursor: mysql.connector.cursor.MySQLCursorDict,
+    seller_id: str,
+) -> List[Dict]:
+    cursor.execute(TOTAL_NMID_PRODUCTS_SQL, (seller_id,))
+    rows = cursor.fetchall()
+    result: List[Dict] = []
+    for row in rows:
+        card = dict(row)
+        card["seller_id"] = seller_id
+        card["orders_status"] = parse_json_field(card.get("orders_status"))
+        card["sales_status"] = parse_json_field(card.get("sales_status"))
+        card["total_nmid_status"] = parse_json_field(card.get("total_nmid_status"))
+        result.append(card)
+    return result
+
+
+def fetch_total_nmid_rows(
+    cursor: mysql.connector.cursor.MySQLCursorDict,
+    seller_id: str,
+    nmid: Any,
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    cursor.execute(
+        TOTAL_NMID_FETCH_SQL,
+        (
+            seller_id,
+            nmid,
+            date_from,
+            date_to,
+        ),
+    )
+    return cursor.fetchall()
+
+
+def build_total_nmid_chunks_for_card(card: Dict, today: date) -> List[Dict]:
+    tomorrow = today + timedelta(days=1)
+    total_status = card.get("total_nmid_status")
+    orders_status = card.get("orders_status")
+    sales_status = card.get("sales_status")
+
+    def build_chunks_from_start(start_date: date, months_per_chunk: int) -> List[Dict]:
+        chunks: List[Dict] = []
+        current_start = first_day_of_month(start_date)
+        if current_start > today:
+            current_start = first_day_of_month(today)
+        while current_start <= today:
+            next_start = add_months_first_day(current_start, months_per_chunk)
+            date_to = next_start if next_start <= today else tomorrow
+            chunks.append(
+                {
+                    "date_from": current_start.isoformat(),
+                    "date_to": date_to.isoformat(),
+                }
+            )
+            if next_start > today:
+                break
+            current_start = next_start
+        if not chunks:
+            chunks.append(
+                {
+                    "date_from": first_day_of_month(today).isoformat(),
+                    "date_to": tomorrow.isoformat(),
+                }
+            )
+        return chunks
+
+    def build_recent_chunks(window_days: int) -> List[Dict]:
+        start_candidate = today - timedelta(days=window_days)
+        start_date = first_day_of_month(start_candidate)
+        return build_chunks_from_start(start_date, 1)
+
+    if isinstance(total_status, dict) and (total_status.get("status") or "").lower() == "right":
+        return build_recent_chunks(15)
+
+    earliest_dates: List[date] = []
+    for status_obj in (orders_status, sales_status):
+        if isinstance(status_obj, dict):
+            dt = parse_ymd_date(status_obj.get("maxDateFrom"))
+            if dt:
+                earliest_dates.append(dt)
+
+    if earliest_dates:
+        earliest = max(min(earliest_dates), date(2025, 1, 1))
+        return build_chunks_from_start(earliest, 3)
+
+    return build_recent_chunks(15)
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_total_nmid_rows(
+    card: Dict,
+    rows: List[Dict],
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    seller_id = str(card.get("seller_id") or "")
+    nmid = card.get("nmid") or card.get("nmID")
+    card_brand = card.get("wb_api_brand") or ""
+    card_subject = card.get("subjectName") or card.get("Subject") or ""
+    card_title = card.get("title") or ""
+    card_photo = card.get("photo") or ""
+    card_supplier = card.get("supplierArticle") or card.get("vendorCode") or ""
+
+    range_start = parse_ymd_date(date_from) or date.today()
+    range_end_exclusive = parse_ymd_date(date_to) or (range_start + timedelta(days=1))
+    range_end = range_end_exclusive - timedelta(days=1)
+    if range_end < range_start:
+        range_end = range_start
+
+    groups: Dict[Tuple[str, Any, int, int], Dict[str, Any]] = {}
+
+    def normalize_date_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        return str(value)
+
+    for row in rows:
+        row_seller = row.get("seller_id") or seller_id
+        row_nmid = row.get("nmID") or row.get("nmid") or nmid
+        row_brand = row.get("wb_api_brand") or card_brand
+        row_subject = row.get("Subject") or card_subject
+        row_title = row.get("title") or card_title
+        row_photo = row.get("photo") or card_photo
+        row_supplier = row.get("supplierArticle") or row.get("vendorCode") or card_supplier
+
+        date_fields = ["Date_order", "date_sales", "Date_cancel", "date_return"]
+        months_set: Set[Tuple[int, int]] = set()
+        for field in date_fields:
+            dt = parse_ymd_date(row.get(field))
+            if dt:
+                months_set.add((dt.year, dt.month))
+
+        if not months_set:
+            for month_start in month_span(range_start, range_end):
+                months_set.add((month_start.year, month_start.month))
+
+        for year, month in months_set:
+            key = (row_seller, row_nmid, year, month)
+            entry = groups.setdefault(
+                key,
+                {
+                    "meta": {
+                        "seller_nmid_month_year_key": f"{row_seller}_{row_nmid}_{str(month).zfill(2)}_{year}",
+                        "month": month,
+                        "year": year,
+                        "seller_id": row_seller,
+                        "wb_api_brand": row_brand or card_brand,
+                        "Subject": row_subject or card_subject,
+                        "nmid": row_nmid,
+                        "title": row_title or card_title,
+                        "photo": row_photo or card_photo,
+                        "supplierArticle": str(row_supplier or card_supplier or ""),
+                    },
+                    "orders": [],
+                },
+            )
+            entry["orders"].append(row)
+
+    # гарантируем, что каждый месяц в диапазоне добавлен (даже без данных)
+    for month_start in month_span(range_start, range_end):
+        key = (seller_id, nmid, month_start.year, month_start.month)
+        if key not in groups:
+            groups[key] = {
+                "meta": {
+                    "seller_nmid_month_year_key": f"{seller_id}_{nmid}_{str(month_start.month).zfill(2)}_{month_start.year}",
+                    "month": month_start.month,
+                    "year": month_start.year,
+                    "seller_id": seller_id,
+                    "wb_api_brand": card_brand,
+                    "Subject": card_subject,
+                    "nmid": nmid,
+                    "title": card_title,
+                    "photo": card_photo,
+                    "supplierArticle": str(card_supplier or ""),
+                },
+                "orders": [],
+            }
+
+    outputs: List[Dict] = []
+
+    for entry in groups.values():
+        meta = entry["meta"]
+        orders_list = entry["orders"]
+        month = meta["month"]
+        year = meta["year"]
+        first = date(year, month, 1)
+        last = last_day_of_month(first)
+
+        def days_in_month() -> List[date]:
+            current = first
+            result: List[date] = []
+            while current <= last:
+                result.append(current)
+                current += timedelta(days=1)
+            return result
+
+        def filter_by(field: str, day_str: str) -> List[Dict]:
+            return [
+                o
+                for o in orders_list
+                if normalize_date_value(o.get(field)).startswith(day_str)
+            ]
+
+        def sum_field(iterable: Iterable[Dict], field: str) -> float:
+            return sum(_float_or_zero(item.get(field)) for item in iterable)
+
+        def avg_field(iterable: Iterable[Dict], field: str) -> Optional[float]:
+            values = [_float_or_none(item.get(field)) for item in iterable]
+            values = [v for v in values if v is not None]
+            if not values:
+                return None
+            return sum(values) / len(values)
+
+        def calc_spp(iterable: Iterable[Dict]) -> Optional[float]:
+            values = list(iterable)
+            if not values:
+                return None
+            acc = 0.0
+            count = 0
+            for item in values:
+                pre = _float_or_zero(item.get("priceWithDisc"))
+                post = _float_or_zero(item.get("finishedPrice"))
+                if pre:
+                    acc += (pre - post) / pre
+                    count += 1
+            if not count:
+                return None
+            return round((acc / count) * 100, 2)
+
+        day_metrics: List[Dict] = []
+        for day in days_in_month():
+            day_str = day.isoformat()
+            ord_rows = filter_by("Date_order", day_str)
+            ord_buy = [o for o in ord_rows if o.get("status") == "Выкуп"]
+            ord_canc = [o for o in ord_rows if o.get("status") == "Отмена"]
+            ord_ret = [o for o in ord_rows if o.get("status") == "Возврат"]
+            in_way = len([o for o in ord_rows if o.get("status") == "Доставка"])
+
+            fact_sales = [
+                o
+                for o in orders_list
+                if o.get("status") == "Выкуп"
+                and normalize_date_value(o.get("date_sales")).startswith(day_str)
+            ]
+            fact_canc = [
+                o
+                for o in orders_list
+                if o.get("status") == "Отмена"
+                and normalize_date_value(o.get("Date_cancel")).startswith(day_str)
+            ]
+            fact_ret = [
+                o
+                for o in orders_list
+                if o.get("status") == "Возврат"
+                and normalize_date_value(o.get("date_return")).startswith(day_str)
+            ]
+
+            buy_cnt = len(ord_buy)
+            canc_cnt = len(ord_canc)
+            ret_cnt = len(ord_ret)
+            denom = buy_cnt + canc_cnt + ret_cnt
+
+            def pct(num: int) -> float:
+                return round((num / denom) * 100, 2) if denom else 0.0
+
+            day_metrics.append(
+                {
+                    "date": day_str,
+                    "orders_sum_pre": sum_field(ord_rows, "priceWithDisc"),
+                    "orders_sum_post": sum_field(ord_rows, "finishedPrice"),
+                    "orders_cnt": len(ord_rows),
+                    "log_to": sum_field(ord_rows, "Logistics_toclient_cost"),
+                    "cancel_perc": pct(canc_cnt),
+                    "sales_buyout": pct(buy_cnt),
+                    "returns_perc": pct(ret_cnt),
+                    "fact_sales_cnt": len(fact_sales),
+                    "fact_sales_prep_rev": sum_field(fact_sales, "priceWithDisc"),
+                    "fact_sales_post_rev": sum_field(fact_sales, "finishedPrice"),
+                    "fact_commission_sum": sum_field(fact_sales, "ComWBRub"),
+                    "fact_commission_perc": avg_field(fact_sales, "ComWBPercent"),
+                    "fact_cancels_cnt": len(fact_canc),
+                    "fact_cancels_sum": sum_field(fact_canc, "finishedPrice"),
+                    "fact_returns_cnt": len(fact_ret),
+                    "fact_returns_sum": sum_field(fact_ret, "finishedPrice"),
+                    "fact_log_from": sum_field(fact_canc, "Logistics_return_cost") + sum_field(fact_ret, "Logistics_return_cost"),
+                    "fact_cogs": sum_field(fact_sales, "Pur_price"),
+                    "fact_forpay": sum_field(fact_sales, "forPay"),
+                    "fact_spp": calc_spp(fact_sales),
+                    "ord_sales_cnt": len(ord_buy),
+                    "ord_sales_prep_rev": sum_field(ord_buy, "priceWithDisc"),
+                    "ord_sales_post_rev": sum_field(ord_buy, "finishedPrice"),
+                    "ord_commission_sum": sum_field(ord_buy, "ComWBRub"),
+                    "ord_commission_perc": avg_field(ord_buy, "ComWBPercent"),
+                    "ord_cancels_cnt": len(ord_canc),
+                    "ord_cancels_sum": sum_field(ord_canc, "finishedPrice"),
+                    "ord_returns_cnt": len(ord_ret),
+                    "ord_returns_sum": sum_field(ord_ret, "finishedPrice"),
+                    "ord_log_from": sum_field(ord_canc, "Logistics_return_cost") + sum_field(ord_ret, "Logistics_return_cost"),
+                    "ord_cogs": sum_field(ord_buy, "Pur_price"),
+                    "ord_forpay": sum_field(ord_buy, "forPay"),
+                    "ord_spp": calc_spp(ord_rows),
+                    "in_way": in_way,
+                }
+            )
+
+        outputs.append({**meta, "day_metrics": day_metrics})
+
+    return outputs
+
+def prepare_stocks_requests(sellers: Iterable[Dict]) -> Tuple[List[Dict], List[Dict], str]:
+    processed: List[Dict] = []
+    
+    for idx, raw in enumerate(sellers):
+        seller_id = str(raw.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        brand = (raw.get("wb_api_brand") or seller_id).strip()
+        token = (raw.get("wb_api_key") or "").strip()
+        
+        # Читаем статус (парсим JSON если нужно)
+        raw_status = parse_json_field(raw.get("stock_status"))
+        status_obj = raw_status if isinstance(raw_status, dict) else None
+        now_time = status_obj.get("nowTime") if isinstance(status_obj, dict) else None
+        
+        # Определяем статус по наличию nowTime: если есть - был прогнан (right), если нет - новичок (new)
+        if status_obj is None or not now_time:
+            status_cat = "new"
+        else:
+            # Если есть nowTime - значит был прогнан, используем right для кулдауна
+            status_cat = "right"
+        
+        processed.append(
+            {
+                "seller_id": seller_id,
+                "brand": brand,
+                "token": token,
+                "idx": idx,
+                "status_cat": status_cat,
+                "now_time": now_time,
+                "stock_status": status_obj,
+                "stock_status_raw": raw.get("stock_status"),
+            }
+        )
+    
+    def parse_now_time(value: Optional[str]) -> float:
+        dt = parse_msk_datetime(value)
+        if dt is None:
+            return float("inf")
+        return dt.timestamp()
+    
+    def stocks_right_cooldown_minutes(status_obj: Optional[Dict]) -> float:
+        if not status_obj:
+            return 0.0
+        now_time_str = status_obj.get("nowTime")
+        dt = parse_msk_datetime(now_time_str)
+        if dt is None:
+            return 0.0
+        age_min = minutes_since_msk(dt)
+        remaining = STOCKS_RIGHT_COOLDOWN_MINUTES - age_min
+        return max(0.0, remaining)
+    
+    new_group = [s for s in processed if s["status_cat"] == "new"]
+    right_group = [s for s in processed if s["status_cat"] == "right"]
+    
+    allow_set: Set[str] = set()
+    if new_group:
+        # Если есть новички - обрабатываем только их
+        allow_set.update(s["seller_id"] for s in new_group)
+    else:
+        # Если новичков нет - обрабатываем right с истекшим кулдауном
+        for s in right_group:
+            cooldown_remaining = stocks_right_cooldown_minutes(s.get("stock_status"))
+            if cooldown_remaining <= 0:
+                allow_set.add(s["seller_id"])
+    
+    summary_lines = []
+    for s in sorted(processed, key=lambda item: item["brand"].lower()):
+        allowed = s["seller_id"] in allow_set
+        mark = "✅" if allowed else "✖️"
+        status_dict = s.get("stock_status") or {}
+        now_dt = parse_msk_datetime(status_dict.get("nowTime") or s.get("now_time"))
+        if s["status_cat"] == "new":
+            minutes_text = "new"
+        elif now_dt is not None:
+            age_min = max(0, int(minutes_since_msk(now_dt)))
+            minutes_text = f"{age_min}min"
+        else:
+            minutes_text = "--"
+        summary_lines.append(f"{minutes_text} | {s['brand']} {mark}")
+    summary_text = "\n".join(summary_lines)
+    
+    allowed_effective = [
+        s for s in processed if s["seller_id"] in allow_set
+    ]
+    
+    requests: List[Dict] = []
+    total_sellers = len(allowed_effective)
+    
+    for seller_index, s in enumerate(sorted(allowed_effective, key=lambda item: item["brand"].lower()), start=1):
+        requests.append(
+            {
+                "seller_id": s["seller_id"],
+                "brand": s["brand"],
+                "token": s["token"],
+                "seller_index": seller_index,
+                "sellers_total": total_sellers,
+                "stock_status": s.get("stock_status"),
+            }
+        )
+    
     return requests, processed, summary_text
 
 
@@ -1916,6 +3021,272 @@ def write_ad_expenses_csv(rows: List[Dict], path: str) -> None:
         for chunk_start in range(0, len(rows), 40000):
             chunk = rows[chunk_start : chunk_start + 40000]
             writer.writerows(chunk)
+
+
+def create_stocks_report(token: str) -> Optional[str]:
+    """Создает отчет по остаткам и возвращает task_id"""
+    params = {
+        "groupByBrand": "true",
+        "groupBySubject": "true",
+        "groupBySa": "true",
+        "groupByNm": "true",
+        "groupByBarcode": "true",
+        "groupBySize": "true",
+    }
+    headers = {
+        "user-agent": WB_USER_AGENT,
+        "Authorization": f"Bearer {token}",
+    }
+    
+    try:
+        response = requests.get(WB_STOCKS_CREATE_URL, params=params, headers=headers, timeout=40)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                task_id = data["data"].get("taskId")
+                if task_id:
+                    return str(task_id).strip()
+        return None
+    except Exception:
+        return None
+
+
+def write_total_nmid_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "seller_nmid_month_year_key",
+        "seller_id",
+        "wb_api_brand",
+        "nmid",
+        "month",
+        "year",
+        "title",
+        "photo",
+        "Subject",
+        "supplierArticle",
+        "day_metrics",
+    ]
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            # Кодируем day_metrics в Base64, как для warehouses в STOCKS
+            day_metrics = row.get("day_metrics") or []
+            day_metrics_base64 = None
+            if day_metrics:
+                try:
+                    day_metrics_json = json.dumps(day_metrics, ensure_ascii=False, separators=(',', ':'))
+                    json.loads(day_metrics_json)  # Проверка валидности
+                    day_metrics_base64 = base64.b64encode(day_metrics_json.encode("utf-8")).decode("ascii")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    day_metrics_base64 = None
+            
+            writer.writerow(
+                {
+                    "seller_nmid_month_year_key": row.get("seller_nmid_month_year_key"),
+                    "seller_id": row.get("seller_id"),
+                    "wb_api_brand": row.get("wb_api_brand"),
+                    "nmid": row.get("nmid"),
+                    "month": row.get("month"),
+                    "year": row.get("year"),
+                    "title": row.get("title"),
+                    "photo": row.get("photo"),
+                    "Subject": row.get("Subject"),
+                    "supplierArticle": row.get("supplierArticle"),
+                    "day_metrics": day_metrics_base64,
+                }
+            )
+
+
+def load_total_nmid_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{TOTAL_NMID_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE GS_RNP_ReportDetail_daily_nmid
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_nmid_month_year_key,
+              @seller_id,
+              @wb_api_brand,
+              @nmid,
+              @month,
+              @year,
+              @title,
+              @photo,
+              @Subject,
+              @supplierArticle,
+              @day_metrics
+            )
+            SET
+              seller_id = NULLIF(@seller_id, ''),
+              wb_api_brand = NULLIF(@wb_api_brand, ''),
+              nmid = NULLIF(@nmid, ''),
+              month = NULLIF(@month, ''),
+              year = NULLIF(@year, ''),
+              title = NULLIF(@title, ''),
+              photo = NULLIF(@photo, ''),
+              Subject = NULLIF(@Subject, ''),
+              supplierArticle = NULLIF(@supplierArticle, ''),
+              day_metrics = CASE
+                WHEN @day_metrics IS NULL OR @day_metrics = '' THEN JSON_ARRAY()
+                -- Новая схема: day_metrics сохраняем в CSV в base64, чтобы избежать проблем с кавычками и разделителями
+                WHEN JSON_VALID(CONVERT(FROM_BASE64(@day_metrics) USING utf8mb4)) THEN CAST(CONVERT(FROM_BASE64(@day_metrics) USING utf8mb4) AS JSON)
+                -- Прямая проверка валидности JSON (если уже правильно сериализован через json.dumps)
+                WHEN JSON_VALID(@day_metrics) THEN CAST(@day_metrics AS JSON)
+                -- Обработка экранированных кавычек из CSV: CSV writer удваивает кавычки внутри полей
+                WHEN JSON_VALID(REPLACE(@day_metrics, '""', '"')) THEN CAST(REPLACE(@day_metrics, '""', '"') AS JSON)
+                ELSE JSON_ARRAY()
+              END
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for total nmid failed: {exc}") from exc
+
+def check_stocks_status(task_id: str, token: str) -> Optional[str]:
+    """Проверяет статус отчета. Возвращает 'done', 'processing', 'error' или None"""
+    url = WB_STOCKS_STATUS_URL.format(task_id=task_id)
+    headers = {
+        "user-agent": WB_USER_AGENT,
+        "Authorization": f"Bearer {token}",
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=40)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                status = data["data"].get("status")
+                if status:
+                    return str(status).strip().lower()
+        return None
+    except Exception:
+        return None
+
+
+def download_stocks_data(task_id: str, token: str) -> Optional[List[Dict]]:
+    """Скачивает данные отчета по остаткам"""
+    url = WB_STOCKS_DOWNLOAD_URL.format(task_id=task_id)
+    headers = {
+        "user-agent": WB_USER_AGENT,
+        "Authorization": f"Bearer {token}",
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=40)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list):
+                return data
+        return None
+    except Exception:
+        return None
+
+
+def process_stocks_response(response_data: List[Dict], seller_id: str) -> List[Dict]:
+    """Обрабатывает ответ от WB API warehouse_remains и извлекает данные по складам"""
+    result = []
+    
+    for item in response_data:
+        # Фильтруем записи без barcode
+        barcode = str(item.get("barcode", "")).strip()
+        if not barcode:
+            continue
+        
+        # Извлекаем данные из warehouses
+        warehouses = item.get("warehouses", [])
+        if not isinstance(warehouses, list):
+            warehouses = []
+        
+        def find_quantity(warehouse_name: str) -> int:
+            for wh in warehouses:
+                if isinstance(wh, dict):
+                    wh_name = str(wh.get("warehouseName", "")).strip()
+                    if wh_name == warehouse_name:
+                        qty = wh.get("quantity", 0)
+                        return int(qty) if qty is not None else 0
+            return 0
+        
+        quantity = find_quantity("Всего находится на складах")
+        in_way_to_client = find_quantity("В пути до получателей")
+        in_way_from_client = find_quantity("В пути возвраты на склад WB")
+        quantity_full = quantity + in_way_to_client + in_way_from_client
+        
+        # Формируем seller_bc_key
+        seller_bc_key = f"{seller_id}_{barcode}"
+        
+        # Формируем JSON для warehouses (компактный, без переносов строк)
+        # Используем JSON.stringify аналогично n8n для правильной сериализации
+        warehouses_json = None
+        warehouses_base64 = None
+        if warehouses:
+            try:
+                # Компактный JSON без пробелов и переносов строк для избежания проблем в CSV
+                # ensure_ascii=False сохраняет кириллицу, separators убирает пробелы
+                warehouses_json = json.dumps(warehouses, ensure_ascii=False, separators=(',', ':'))
+                # Убеждаемся, что это валидная JSON строка (аналогично JSON.stringify в n8n)
+                # Проверяем валидность через повторный парсинг
+                json.loads(warehouses_json)
+                warehouses_base64 = base64.b64encode(warehouses_json.encode("utf-8")).decode("ascii")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                warehouses_json = None
+                warehouses_base64 = None
+        
+        # Формируем строку для записи (порядок соответствует STOCKS_CSV_COLUMNS)
+        row = {
+            "seller_bc_key": seller_bc_key,
+            "seller_id": seller_id,
+            "barcode": barcode,
+            "subjectName": str(item.get("subjectName", "")).strip() or None,
+            "vendorCode": str(item.get("vendorCode", "")).strip() or None,
+            "nmId": int(item.get("nmId", 0) or 0) if item.get("nmId") else None,
+            "techSize": str(item.get("techSize", "")).strip() or None,
+            "volume": float(item.get("volume", 0) or 0) if item.get("volume") is not None else None,
+            "quantity": quantity,
+            "inWayToClient": in_way_to_client,
+            "inWayFromClient": in_way_from_client,
+            "quantityFull": quantity_full,
+            "warehouses": warehouses_base64,
+        }
+        
+        result.append(row)
+    
+    return result
+
+
+def write_stocks_csv(rows: List[Dict], path: str) -> None:
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=STOCKS_CSV_COLUMNS)
+        writer.writeheader()
+        for chunk_start in range(0, len(rows), 40000):
+            chunk = rows[chunk_start : chunk_start + 40000]
+            writer.writerows(chunk)
+
+
+def build_stocks_selection_message(summary_text: str) -> str:
+    escaped = html.escape(summary_text)
+    return (
+        "<b>07 WB API</b> | STOCKS\n"
+        "<blockquote>Подготовка выгрузки остатков.\n"
+        f"<code>{escaped}</code></blockquote>"
+    )
 
 
 def fetch_products_sellers(cursor: mysql.connector.cursor.MySQLCursorDict) -> List[Dict]:
@@ -3027,6 +4398,66 @@ def load_ad_expenses_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None
         raise RuntimeError(f"LOAD DATA INFILE for ad expenses failed: {exc}") from exc
 
 
+def load_stocks_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    try:
+        cursor.execute(
+            f"""
+            LOAD DATA INFILE '{WB_STOCKS_CSV_MYSQL_PATH}'
+            REPLACE
+            INTO TABLE WB_stocks
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_bc_key,
+              @sellerId,
+              @barcode,
+              @subjectName,
+              @vendorCode,
+              @nmId,
+              @techSize,
+              @volume,
+              @quantity,
+              @inWayToClient,
+              @inWayFromClient,
+              @quantityFull,
+              @warehouses
+            )
+            SET
+              seller_id = NULLIF(@sellerId, ''),
+              barcode = NULLIF(@barcode, ''),
+              subjectName = NULLIF(@subjectName, ''),
+              vendorCode = NULLIF(@vendorCode, ''),
+              nmId = NULLIF(@nmId, ''),
+              techSize = NULLIF(@techSize, ''),
+              volume = NULLIF(@volume, ''),
+              quantity = NULLIF(@quantity, ''),
+              inWayToClient = NULLIF(@inWayToClient, ''),
+              inWayFromClient = NULLIF(@inWayFromClient, ''),
+              quantityFull = NULLIF(@quantityFull, ''),
+              warehouses = CASE
+                WHEN @warehouses = '' OR @warehouses IS NULL THEN JSON_ARRAY()
+                -- Прямая проверка валидности JSON (если уже правильно сериализован через json.dumps)
+                WHEN JSON_VALID(@warehouses) THEN CAST(@warehouses AS JSON)
+                -- Обработка экранированных кавычек из CSV: CSV writer удваивает кавычки внутри полей
+                -- CSV writer экранирует кавычки, удваивая их, поэтому нужно заменить "" на "
+                -- Это аналогично тому, как JSON.stringify работает в n8n
+                WHEN JSON_VALID(REPLACE(@warehouses, '""', '"')) THEN CAST(REPLACE(@warehouses, '""', '"') AS JSON)
+                -- Множественная замена двойных кавычек (на случай двойного/тройного экранирования)
+                WHEN JSON_VALID(REPLACE(REPLACE(REPLACE(@warehouses, '""', '"'), '""', '"'), '""', '"')) 
+                     THEN CAST(REPLACE(REPLACE(REPLACE(@warehouses, '""', '"'), '""', '"'), '""', '"') AS JSON)
+                -- Новая схема: warehouses сохраняем в CSV в base64, чтобы избежать проблем с кавычками и разделителями
+                WHEN JSON_VALID(CONVERT(FROM_BASE64(@warehouses) USING utf8mb4)) THEN CAST(CONVERT(FROM_BASE64(@warehouses) USING utf8mb4) AS JSON)
+                ELSE JSON_ARRAY()
+              END
+            """
+        )
+    except Error as exc:
+        raise RuntimeError(f"LOAD DATA INFILE for stocks failed: {exc}") from exc
+
+
 def update_products_status(
     cursor: mysql.connector.cursor.MySQLCursor,
     sellers_meta: Iterable[Dict],
@@ -3227,6 +4658,138 @@ def update_ad_list_status(
             """
             UPDATE WB_sellers_updates
             SET ad_list_status = %s
+            WHERE seller_id = %s
+            """,
+            updates,
+        )
+
+    return len(updates), details
+
+
+def update_stocks_status(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    sellers_meta: Iterable[Dict],
+    stocks_rows: Iterable[Dict],
+    api_error_sellers: Set[str],
+    successful_sellers: Set[str],
+) -> Tuple[int, List[Dict]]:
+    per_seller: Dict[str, Dict] = {}
+
+    def safe_int(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (int, float)):
+            return int(value)
+        try:
+            value_str = str(value).strip()
+            if not value_str:
+                return 0
+            return int(float(value_str))
+        except Exception:
+            return 0
+
+    for meta in sellers_meta:
+        seller_id = str(meta.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        per_seller[seller_id] = {
+            "prev": meta.get("stock_status"),
+            "brand": meta.get("brand") or meta.get("wb_api_brand") or seller_id,
+            "api_error": seller_id in api_error_sellers,
+            "aggregates": None,
+        }
+
+    for row in stocks_rows:
+        seller_id = str(row.get("seller_id") or "").strip()
+        if not seller_id:
+            continue
+        bucket = per_seller.setdefault(
+            seller_id,
+            {
+                "prev": row.get("stock_status"),
+                "brand": row.get("brand") or seller_id,
+                "api_error": seller_id in api_error_sellers,
+                "aggregates": None,
+            },
+        )
+
+        aggregates = bucket.get("aggregates")
+        if aggregates is None:
+            aggregates = {
+                "all_stock_cnt": 0,
+                "to_client_cnt": 0,
+                "from_client_cnt": 0,
+                "in_whsWB_cnt": 0,
+                "nm_ids_positive": set(),
+            }
+            bucket["aggregates"] = aggregates
+
+        all_stock_cnt = safe_int(row.get("quantityFull"))
+        to_client_cnt = safe_int(row.get("inWayToClient"))
+        from_client_cnt = safe_int(row.get("inWayFromClient"))
+        in_whs_cnt = safe_int(row.get("quantity"))
+
+        aggregates["all_stock_cnt"] += all_stock_cnt
+        aggregates["to_client_cnt"] += to_client_cnt
+        aggregates["from_client_cnt"] += from_client_cnt
+        aggregates["in_whsWB_cnt"] += in_whs_cnt
+
+        if in_whs_cnt > 0:
+            nm_id = row.get("nmId")
+            if nm_id is not None:
+                aggregates["nm_ids_positive"].add(str(nm_id))
+
+    updates: List[Tuple[str, str]] = []
+    details: List[Dict] = []
+    now_time = msk_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for seller_id, bucket in per_seller.items():
+        prev = bucket.get("prev")
+        aggregates = bucket.get("aggregates")
+        processed_successfully = aggregates is not None or seller_id in successful_sellers
+
+        if not processed_successfully and not bucket.get("api_error"):
+            continue
+
+        if bucket.get("api_error"):
+            if prev:
+                stock_status = prev
+            else:
+                continue
+        else:
+            if not aggregates:
+                stock_status = {
+                    "nowTime": now_time,
+                    "all_stock_cnt": 0,
+                    "to_client_cnt": 0,
+                    "from_client_cnt": 0,
+                    "in_whsWB_cnt": 0,
+                    "nmid_stock_cnt": 0,
+                }
+            else:
+                stock_status = {
+                    "nowTime": now_time,
+                    "all_stock_cnt": int(aggregates.get("all_stock_cnt") or 0),
+                    "to_client_cnt": int(aggregates.get("to_client_cnt") or 0),
+                    "from_client_cnt": int(aggregates.get("from_client_cnt") or 0),
+                    "in_whsWB_cnt": int(aggregates.get("in_whsWB_cnt") or 0),
+                    "nmid_stock_cnt": len(aggregates.get("nm_ids_positive") or []),
+                }
+
+        updates.append((json.dumps(stock_status, ensure_ascii=False), seller_id))
+        details.append(
+            {
+                "seller_id": seller_id,
+                "brand": bucket.get("brand") or seller_id,
+                "status": stock_status,
+            }
+        )
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE WB_sellers_updates
+            SET stock_status = %s
             WHERE seller_id = %s
             """,
             updates,
@@ -4649,6 +6212,577 @@ def main() -> int:
         ad_expenses_elapsed = time.time() - ad_expenses_started_at
         ad_expenses_completion_message = build_completion_message("06", "Ad Expenses", ad_expenses_elapsed)
         send_to_telegram(ad_expenses_completion_message)
+        time.sleep(2)
+
+        # 07 WB API | STOCKS
+        stocks_started_at = time.time()
+        stocks_sellers = fetch_stocks_sellers(cursor_dict)
+        stocks_requests, stocks_processed, stocks_summary = prepare_stocks_requests(stocks_sellers)
+        print("[WB-bot] Подготовлена выборка для остатков.", flush=True)
+        stocks_selection_message = build_stocks_selection_message(stocks_summary)
+        send_to_telegram(stocks_selection_message)
+
+        stocks_rows: List[Dict] = []
+        stocks_rows_by_seller: Dict[str, int] = defaultdict(int)
+        stocks_errors: List[str] = []
+        seller_brand_map_stocks: Dict[str, str] = {}
+        stocks_api_error_sellers: Set[str] = set()
+        stocks_successful_sellers: Set[str] = set()
+
+        if stocks_requests:
+            unique_sellers = len({req["seller_id"] for req in stocks_requests})
+            print(
+                f"[WB-bot] Запланировано {len(stocks_requests)} запросов остатков для {unique_sellers} селлеров.",
+                flush=True,
+            )
+
+            total_requests = len(stocks_requests)
+            for request_index, req in enumerate(stocks_requests, start=1):
+                seller_id = req["seller_id"]
+                brand = req["brand"]
+                token = req["token"]
+                seller_brand_map_stocks[seller_id] = brand
+
+                print(
+                    f"[WB-bot] Stocks: запрос {request_index}/{total_requests} | {brand}",
+                    flush=True,
+                )
+
+                # Этап 1: Создание отчета
+                task_id = None
+                for attempt in range(1, STOCKS_MAX_RETRIES + 1):
+                    try:
+                        task_id = create_stocks_report(token)
+                        if task_id:
+                            break
+                        if attempt < STOCKS_MAX_RETRIES:
+                            delay = STOCKS_RETRY_BASE_DELAY_SECONDS * attempt
+                            time.sleep(delay)
+                    except Exception as api_err:
+                        if attempt == STOCKS_MAX_RETRIES:
+                            error_line = f"{brand} | создание отчета | {api_err}"
+                            stocks_errors.append(error_line)
+                            stocks_api_error_sellers.add(seller_id)
+                            print(
+                                f"[WB-bot] Ошибка WB Stocks API (создание отчета): {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        delay = STOCKS_RETRY_BASE_DELAY_SECONDS * attempt
+                        time.sleep(delay)
+
+                if not task_id:
+                    stocks_api_error_sellers.add(seller_id)
+                    continue
+
+                # Этап 2: Ожидание готовности отчета
+                status = None
+                for check_index in range(1, STOCKS_MAX_STATUS_CHECKS + 1):
+                    try:
+                        status = check_stocks_status(task_id, token)
+                        if status == "done":
+                            break
+                        if status == "error":
+                            error_line = f"{brand} | статус отчета | error"
+                            stocks_errors.append(error_line)
+                            stocks_api_error_sellers.add(seller_id)
+                            print(
+                                f"[WB-bot] Ошибка WB Stocks API (статус отчета): {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        # Ждем перед следующей проверкой
+                        time.sleep(STOCKS_STATUS_CHECK_INTERVAL_SECONDS)
+                    except Exception as api_err:
+                        if check_index == STOCKS_MAX_STATUS_CHECKS:
+                            error_line = f"{brand} | проверка статуса | {api_err}"
+                            stocks_errors.append(error_line)
+                            stocks_api_error_sellers.add(seller_id)
+                            print(
+                                f"[WB-bot] Ошибка WB Stocks API (проверка статуса): {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        time.sleep(STOCKS_STATUS_CHECK_INTERVAL_SECONDS)
+
+                if status != "done":
+                    stocks_api_error_sellers.add(seller_id)
+                    continue
+
+                # Этап 3: Скачивание данных
+                response_data = None
+                for attempt in range(1, STOCKS_MAX_RETRIES + 1):
+                    try:
+                        response_data = download_stocks_data(task_id, token)
+                        if response_data is not None:
+                            break
+                        if attempt < STOCKS_MAX_RETRIES:
+                            delay = STOCKS_RETRY_BASE_DELAY_SECONDS * attempt
+                            time.sleep(delay)
+                    except Exception as api_err:
+                        if attempt == STOCKS_MAX_RETRIES:
+                            error_line = f"{brand} | скачивание данных | {api_err}"
+                            stocks_errors.append(error_line)
+                            stocks_api_error_sellers.add(seller_id)
+                            print(
+                                f"[WB-bot] Ошибка WB Stocks API (скачивание данных): {error_line}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
+                        delay = STOCKS_RETRY_BASE_DELAY_SECONDS * attempt
+                        time.sleep(delay)
+
+                if response_data is None:
+                    stocks_api_error_sellers.add(seller_id)
+                    continue
+
+                stocks_successful_sellers.add(seller_id)
+
+                # Обработка данных
+                processed_rows = process_stocks_response(response_data, seller_id)
+                if processed_rows:
+                    stocks_rows_by_seller[seller_id] += len(processed_rows)
+                    for row in processed_rows:
+                        row["brand"] = brand
+                        stocks_rows.append(row)
+
+            stocks_db_loaded = False
+            if stocks_rows:
+                # Удаляем поле 'brand' перед записью в CSV
+                csv_rows = [{k: v for k, v in row.items() if k in STOCKS_CSV_COLUMNS} for row in stocks_rows]
+                write_stocks_csv(csv_rows, WB_STOCKS_CSV_HOST_PATH)
+                print(
+                    f"[WB-bot] CSV остатков сформирован: {WB_STOCKS_CSV_HOST_PATH} ({len(stocks_rows)} строк).",
+                    flush=True,
+                )
+                summary_lines = []
+                for seller_id, rows_count in sorted(stocks_rows_by_seller.items(), key=lambda item: seller_brand_map_stocks.get(item[0], item[0])):
+                    brand = seller_brand_map_stocks.get(seller_id, seller_id)
+                    summary_lines.append(f"{brand} | rows:{rows_count}")
+                summary_text = html.escape("\n".join(summary_lines) if summary_lines else "нет данных")
+                stocks_summary_message = (
+                    "<b>07 WB API</b> | STOCKS\n"
+                    "<blockquote><b>Остатки собраны ✅</b>\n"
+                    f"<code>{summary_text}</code></blockquote>"
+                )
+                send_to_telegram(stocks_summary_message)
+                
+                # Загрузка в БД
+                try:
+                    load_stocks_into_db(cursor)
+                    stocks_db_loaded = True
+                    print("[WB-bot] WB_stocks успешно обновлена через LOAD DATA INFILE.", flush=True)
+                    stocks_load_message = (
+                        "<b>07 WB API</b> | STOCKS\n"
+                        "<blockquote>Данные загружены в таблицу WB_stocks.</blockquote>"
+                    )
+                    send_to_telegram(stocks_load_message)
+                except Exception as db_err:
+                    print(f"[WB-bot] Ошибка LOAD DATA для остатков: {db_err}", file=sys.stderr, flush=True)
+                    error_message = (
+                        "<b>07 WB API</b> | STOCKS\n"
+                        "<blockquote>"
+                        "Ошибка загрузки данных в WB_stocks.\n"
+                        f"<code>{html.escape(str(db_err))}</code>"
+                        "</blockquote>"
+                    )
+                    try:
+                        send_to_telegram(error_message)
+                    except Exception:
+                        traceback.print_exc()
+                if stocks_db_loaded:
+                    stocks_status_updates, stocks_status_details = update_stocks_status(
+                        cursor,
+                        stocks_processed,
+                        stocks_rows,
+                        stocks_api_error_sellers,
+                        stocks_successful_sellers,
+                    )
+                    if stocks_status_updates:
+                        connection.commit()
+                        print(
+                            f"[WB-bot] Обновлены stock_status для {stocks_status_updates} селлеров.",
+                            flush=True,
+                        )
+                        if stocks_status_details:
+                            stocks_status_message = build_stocks_status_message(stocks_status_details)
+                            send_to_telegram(stocks_status_message)
+                else:
+                    print("[WB-bot] Статусы stock_status не обновлялись из-за ошибки загрузки в БД.", flush=True)
+            else:
+                print("[WB-bot] Нет данных по остаткам.", flush=True)
+
+            if stocks_errors:
+                errors_text = html.escape("\n".join(stocks_errors))
+                error_message = (
+                    "<b>07 WB API</b> | STOCKS\n"
+                    "<blockquote><b>Ошибки при запросе</b>\n"
+                    f"<code>{errors_text}</code></blockquote>"
+                )
+                send_to_telegram(error_message)
+        else:
+            print("[WB-bot] Нет селлеров для запроса остатков.", flush=True)
+
+        stocks_elapsed = time.time() - stocks_started_at
+        stocks_completion_message = build_completion_message("07", "STOCKS", stocks_elapsed)
+        send_to_telegram(stocks_completion_message)
+        time.sleep(2)
+
+        # 01 DB RNP | ReportDetail
+        report_detail_started_at = time.time()
+        reportdetail_start_msg_id: Optional[int] = None
+        try:
+            start_reply = send_to_telegram("<b>01 DB RNP | ReportDetail</b> | Запуск...")
+            if isinstance(start_reply, dict):
+                result = start_reply.get("result") or {}
+                message_id = result.get("message_id")
+                if isinstance(message_id, int):
+                    reportdetail_start_msg_id = message_id
+        except Exception:
+            traceback.print_exc()
+
+        report_orders_counts: Dict[str, int] = defaultdict(int)
+        report_sales_counts: Dict[str, int] = defaultdict(int)
+        report_errors: List[str] = []
+        report_brand_map: Dict[str, str] = {}
+        report_any_changes = False
+
+        report_detail_orders_sellers = fetch_report_detail_sellers(cursor_dict)
+
+        if report_detail_orders_sellers:
+            print(
+                f"[WB-bot] ReportDetail: подготовлено {len(report_detail_orders_sellers)} селлеров для этапа заказов.",
+                flush=True,
+            )
+            for item in report_detail_orders_sellers:
+                seller_id = str(item.get("seller_id") or "").strip()
+                if not seller_id:
+                    continue
+                brand = item.get("brand") or seller_id
+                report_brand_map.setdefault(seller_id, brand)
+                try:
+                    cursor.execute(REPORT_DETAIL_INSERT_ORDERS_SQL, (seller_id,))
+                    affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                    if affected:
+                        report_any_changes = True
+                        report_orders_counts[seller_id] += affected
+                    print(
+                        f"[WB-bot] ReportDetail: orders | {brand} | affected: {affected}",
+                        flush=True,
+                    )
+                except Error as exc:
+                    error_line = f"{brand} | orders | {exc}"
+                    report_errors.append(error_line)
+                    print(f"[WB-bot] Ошибка ReportDetail (orders): {error_line}", file=sys.stderr, flush=True)
+        else:
+            print("[WB-bot] ReportDetail: нет селлеров для этапа заказов.", flush=True)
+
+        report_detail_sales_sellers = fetch_report_detail_sellers(cursor_dict)
+
+        if report_detail_sales_sellers:
+            print(
+                f"[WB-bot] ReportDetail: подготовлено {len(report_detail_sales_sellers)} селлеров для этапа продаж.",
+                flush=True,
+            )
+            for item in report_detail_sales_sellers:
+                seller_id = str(item.get("seller_id") or "").strip()
+                if not seller_id:
+                    continue
+                brand = item.get("brand") or seller_id
+                report_brand_map.setdefault(seller_id, brand)
+                try:
+                    cursor.execute(REPORT_DETAIL_INSERT_SALES_SQL, (seller_id,))
+                    affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                    if affected:
+                        report_any_changes = True
+                        report_sales_counts[seller_id] += affected
+                    print(
+                        f"[WB-bot] ReportDetail: sales | {brand} | affected: {affected}",
+                        flush=True,
+                    )
+                except Error as exc:
+                    error_line = f"{brand} | sales | {exc}"
+                    report_errors.append(error_line)
+                    print(f"[WB-bot] Ошибка ReportDetail (sales): {error_line}", file=sys.stderr, flush=True)
+        else:
+            print("[WB-bot] ReportDetail: нет селлеров для этапа продаж.", flush=True)
+
+        if report_any_changes:
+            connection.commit()
+        report_any_changes = False
+
+        try:
+            cursor.execute(REPORT_DETAIL_UPDATE_PURPRICE_SQL)
+            purprice_affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            if purprice_affected:
+                connection.commit()
+                report_any_changes = True
+            print(
+                f"[WB-bot] ReportDetail: обновлены себестоимость и логистика для {purprice_affected} записей.",
+                flush=True,
+            )
+        except Error as exc:
+            error_line = f"purprice update | {exc}"
+            report_errors.append(error_line)
+            print(f"[WB-bot] Ошибка ReportDetail (purprice): {error_line}", file=sys.stderr, flush=True)
+
+        try:
+            cursor.execute(REPORT_DETAIL_UPDATE_LOGISTICS_SQL)
+            logistics_affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            if logistics_affected:
+                connection.commit()
+                report_any_changes = True
+            print(
+                f"[WB-bot] ReportDetail: обновлены Logistics_return_cost для {logistics_affected} записей.",
+                flush=True,
+            )
+        except Error as exc:
+            error_line = f"logistics update | {exc}"
+            report_errors.append(error_line)
+            print(f"[WB-bot] Ошибка ReportDetail (logistics): {error_line}", file=sys.stderr, flush=True)
+
+        def fmt_int(value: Any) -> str:
+            try:
+                number = int(value)
+            except Exception:
+                number = 0
+            return f"{number:,}".replace(",", " ")
+
+        summary_entries = []
+        for seller_id in report_brand_map.keys():
+            brand = report_brand_map.get(seller_id, seller_id)
+            orders_cnt = report_orders_counts.get(seller_id, 0)
+            sales_cnt = report_sales_counts.get(seller_id, 0)
+            summary_entries.append(
+                {
+                    "brand": brand,
+                    "orders": orders_cnt,
+                    "sales": sales_cnt,
+                }
+            )
+
+        summary_entries.sort(key=lambda item: (-item["orders"], (item["brand"] or "").lower()))
+
+        summary_lines = [
+            f"orders:{fmt_int(item['orders'])} | sales:{fmt_int(item['sales'])} | {item['brand']}"
+            for item in summary_entries
+        ]
+
+        summary_body = "\n".join(html.escape(line) for line in summary_lines) if summary_lines else "нет данных"
+        summary_message = (
+            "<b>01 DB RNP | ReportDetail</b>\n\n"
+            "Таблица обновлена ✅\n"
+            f"<blockquote>{summary_body}</blockquote>"
+        )
+
+        edited_ok = False
+        if reportdetail_start_msg_id is not None:
+            try:
+                edit_telegram_message(reportdetail_start_msg_id, summary_message)
+                edited_ok = True
+            except Exception:
+                traceback.print_exc()
+
+        if not edited_ok:
+            send_to_telegram(summary_message)
+
+        if report_errors:
+            errors_text = html.escape("\n".join(report_errors))
+            report_error_message = (
+                "<b>01 DB RNP | ReportDetail</b>\n"
+                "<blockquote><b>Ошибки при обновлении</b>\n"
+                f"<code>{errors_text}</code></blockquote>"
+            )
+            send_to_telegram(report_error_message)
+
+        report_detail_elapsed = time.time() - report_detail_started_at
+        report_detail_completion_message = build_completion_message("01 DB RNP", "ReportDetail", report_detail_elapsed)
+        send_to_telegram(report_detail_completion_message)
+        time.sleep(2)
+
+        # ⚡️ Сводная (TOTAL)
+        total_started_at = time.time()
+        total_start_msg_id: Optional[int] = None
+        try:
+            start_reply = send_to_telegram("<b>⚡️ Сводная</b> | Запуск...")
+            if isinstance(start_reply, dict):
+                result = start_reply.get("result") or {}
+                message_id = result.get("message_id")
+                if isinstance(message_id, int):
+                    total_start_msg_id = message_id
+        except Exception:
+            traceback.print_exc()
+
+        total_sellers = fetch_total_nmid_sellers(cursor_dict)
+        total_allowed, total_processed, total_summary_text = prepare_total_nmid_requests(total_sellers)
+
+        if total_processed:
+            selection_body = html.escape(total_summary_text) if total_summary_text else "нет данных"
+            selection_message = (
+                "<b>⚡️ Сводная</b> | Отбор\n"
+                f"<blockquote>{selection_body}</blockquote>"
+            )
+            send_to_telegram(selection_message)
+        else:
+            print("[WB-bot] Сводная: нет селлеров для обработки.", flush=True)
+
+        total_outputs: List[Dict] = []
+        total_errors: List[str] = []
+        total_summary: Dict[str, Dict[str, Any]] = {}
+        total_chunks = 0
+        today_date = date.today()
+
+        for seller in total_allowed:
+            seller_id = seller["seller_id"]
+            brand = seller.get("brand") or seller_id
+            total_summary.setdefault(seller_id, {"brand": brand, "cards": 0, "months": 0})
+
+            try:
+                cards = fetch_total_nmid_cards(cursor_dict, seller_id)
+            except Exception as exc:
+                error_line = f"{brand} | fetch_cards | {exc}"
+                total_errors.append(error_line)
+                print(f"[WB-bot] Ошибка TOTAL (fetch cards): {error_line}", file=sys.stderr, flush=True)
+                continue
+
+            if not cards:
+                print(f"[WB-bot] Сводная: у {brand} нет карточек.", flush=True)
+                continue
+
+            for card in cards:
+                card_nmid = card.get("nmid") or card.get("nmID")
+                if card_nmid is None:
+                    continue
+                card["seller_id"] = seller_id
+                card["nmid"] = card_nmid
+                card_meta = {
+                    "seller_id": seller_id,
+                    "nmid": card_nmid,
+                    "wb_api_brand": card.get("wb_api_brand") or brand,
+                    "subjectName": card.get("subjectName") or "",
+                    "title": card.get("title") or "",
+                    "photo": card.get("photo") or "",
+                    "vendorCode": card.get("vendorCode") or "",
+                    "supplierArticle": card.get("supplierArticle") or card.get("vendorCode") or "",
+                }
+
+                chunks = build_total_nmid_chunks_for_card(card, today_date)
+                if not chunks:
+                    continue
+                total_summary[seller_id]["cards"] += 1
+
+                # Собираем все строки для одного nmid по всем чанкам (как в n8n)
+                all_rows_for_card: List[Dict] = []
+                min_date_from: Optional[str] = None
+                max_date_to: Optional[str] = None
+                
+                for chunk in chunks:
+                    date_from = chunk["date_from"]
+                    date_to = chunk["date_to"]
+                    if min_date_from is None or date_from < min_date_from:
+                        min_date_from = date_from
+                    if max_date_to is None or date_to > max_date_to:
+                        max_date_to = date_to
+                    
+                    try:
+                        rows = fetch_total_nmid_rows(cursor_dict, seller_id, card_nmid, date_from, date_to)
+                        all_rows_for_card.extend(rows)
+                    except Exception as exc:
+                        error_line = (
+                            f"{brand} | nmID:{card_nmid} | fetch_rows {date_from}→{date_to} | {exc}"
+                        )
+                        total_errors.append(error_line)
+                        print(f"[WB-bot] Ошибка TOTAL (fetch rows): {error_line}", file=sys.stderr, flush=True)
+                        continue
+                    total_chunks += 1
+
+                # Агрегируем все строки разом (как в n8n)
+                if all_rows_for_card and min_date_from and max_date_to:
+                    try:
+                        aggregated = aggregate_total_nmid_rows(card_meta, all_rows_for_card, min_date_from, max_date_to)
+                    except Exception as exc:
+                        error_line = (
+                            f"{brand} | nmID:{card_nmid} | aggregate | {exc}"
+                        )
+                        total_errors.append(error_line)
+                        print(f"[WB-bot] Ошибка TOTAL (aggregate): {error_line}", file=sys.stderr, flush=True)
+                        continue
+
+                    if aggregated:
+                        total_outputs.extend(aggregated)
+                        total_summary[seller_id]["months"] += len(aggregated)
+
+        total_db_loaded = False
+        if total_outputs:
+            write_total_nmid_csv(total_outputs, TOTAL_NMID_CSV_HOST_PATH)
+            print(
+                f"[WB-bot] TOTAL: сформирован CSV {TOTAL_NMID_CSV_HOST_PATH} ({len(total_outputs)} записей).",
+                flush=True,
+            )
+            
+            # Загрузка в БД
+            try:
+                load_total_nmid_into_db(cursor)
+                connection.commit()
+                total_db_loaded = True
+                print("[WB-bot] GS_RNP_ReportDetail_daily_nmid успешно обновлена через LOAD DATA INFILE.", flush=True)
+            except Exception as db_err:
+                print(f"[WB-bot] Ошибка LOAD DATA для TOTAL: {db_err}", file=sys.stderr, flush=True)
+                error_line = f"Ошибка загрузки данных в GS_RNP_ReportDetail_daily_nmid: {db_err}"
+                total_errors.append(error_line)
+
+        def fmt_total_int(value: Any) -> str:
+            try:
+                number = int(value)
+            except Exception:
+                number = 0
+            return f"{number:,}".replace(",", " ")
+
+        summary_lines_total = []
+        for seller_id, info in sorted(
+            total_summary.items(),
+            key=lambda item: (-item[1].get("cards", 0), item[1].get("brand", item[0]).lower()),
+        ):
+            summary_lines_total.append(
+                f"cards:{fmt_total_int(info.get('cards', 0))} | months:{fmt_total_int(info.get('months', 0))} | {info.get('brand', seller_id)}"
+            )
+
+        summary_body_total = (
+            "\n".join(html.escape(line) for line in summary_lines_total) if summary_lines_total else "нет данных"
+        )
+        total_summary_message = (
+            "<b>⚡️ Сводная</b>\n\n"
+            "Таблица обновлена ✅\n"
+            f"<blockquote>{summary_body_total}</blockquote>"
+        )
+
+        edited_total = False
+        if total_start_msg_id is not None:
+            try:
+                edit_telegram_message(total_start_msg_id, total_summary_message)
+                edited_total = True
+            except Exception:
+                traceback.print_exc()
+
+        if not edited_total:
+            send_to_telegram(total_summary_message)
+
+        if total_errors:
+            errors_text = html.escape("\n".join(total_errors))
+            total_error_message = (
+                "<b>⚡️ Сводная</b>\n"
+                "<blockquote><b>Ошибки при обработке</b>\n"
+                f"<code>{errors_text}</code></blockquote>"
+            )
+            send_to_telegram(total_error_message)
+
+        total_elapsed = time.time() - total_started_at
+        total_completion_message = build_completion_message("TOTAL", "RNP | Сводная", total_elapsed)
+        send_to_telegram(total_completion_message)
         time.sleep(2)
 
         elapsed = int(time.time() - workflow_started_at)
