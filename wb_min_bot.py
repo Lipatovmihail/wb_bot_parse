@@ -2282,6 +2282,91 @@ LEFT JOIN GS_RNP_ReportDetail AS d
        AND d.Date_order < %s
 """
 
+TOTAL_NMID_STOCK_HISTORY_SQL = """
+UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+JOIN (
+  SELECT
+    %s AS seller_id,
+    %s AS nmid,
+    m.year,
+    m.month,
+    COALESCE((
+      SELECT JSON_ARRAYAGG(j)
+      FROM (
+        SELECT JSON_OBJECT(
+                 'date',        DATE(sf.`date`),
+                 'stocks_cnt',  SUM(sf.barcodesCount),
+                 'storage_fee', SUM(sf.warehousePrice)
+               ) AS j
+        FROM WB_storage_fee sf
+        WHERE sf.seller_id = %s
+          AND sf.nmId      = %s
+          AND YEAR(sf.`date`)  = m.year
+          AND MONTH(sf.`date`) = m.month
+        GROUP BY sf.`date`
+        ORDER BY sf.`date`
+      ) AS ordered_rows
+    ), JSON_ARRAY()) AS stock_json
+  FROM (
+    SELECT r.year, r.month
+    FROM GS_RNP_ReportDetail_daily_nmid r
+    WHERE r.seller_id = %s
+      AND r.nmid      = %s
+    GROUP BY r.year, r.month
+  ) AS m
+  INNER JOIN (
+    SELECT DISTINCT YEAR(sf.`date`) AS year, MONTH(sf.`date`) AS month
+    FROM WB_storage_fee sf
+    WHERE sf.seller_id = %s
+      AND sf.nmId      = %s
+  ) AS s
+    ON s.year  = m.year
+   AND s.month = m.month
+) AS src
+  ON  r.seller_id = src.seller_id
+  AND r.nmid      = src.nmid
+  AND r.year      = src.year
+  AND r.month     = src.month
+SET r.stock_history = src.stock_json
+WHERE r.seller_id = %s
+  AND r.nmid      = %s
+"""
+
+TOTAL_NMID_STOCK_TODAY_SQL = """
+UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+JOIN (
+  SELECT
+    COALESCE(
+      (
+        SELECT JSON_ARRAYAGG(size_row)
+        FROM (
+          SELECT
+            JSON_OBJECT(
+              'techSize',       st.techSize,
+              'quantity',       st.quantity,
+              'inWayToClient',  st.inWayToClient,
+              'inWayFromClient', st.inWayFromClient,
+              'quantityFull',   st.quantityFull
+            ) AS size_row
+          FROM WB_stocks st
+          WHERE st.seller_id = %s
+            AND st.nmId      = %s
+            AND COALESCE(
+                  st.quantityFull,
+                  st.quantity + st.inWayToClient + st.inWayFromClient,
+                  0
+                ) > 0
+          ORDER BY st.techSize
+        ) AS ordered_rows
+      ),
+      JSON_ARRAY()
+    ) AS stock_json
+) AS src
+SET r.stock_today = src.stock_json
+WHERE r.seller_id = %s
+  AND r.nmid      = %s
+"""
+
 
 def fetch_total_nmid_cards(
     cursor: mysql.connector.cursor.MySQLCursorDict,
@@ -3153,6 +3238,48 @@ def load_total_nmid_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
         )
     except Error as exc:
         raise RuntimeError(f"LOAD DATA INFILE for total nmid failed: {exc}") from exc
+
+
+def update_stock_history_for_card(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    seller_id: str,
+    nmid: Any,
+) -> int:
+    """Обновляет stock_history для одного артикула (seller_id + nmid)"""
+    try:
+        cursor.execute(
+            TOTAL_NMID_STOCK_HISTORY_SQL,
+            (
+                seller_id, nmid,  # для SELECT в JOIN
+                seller_id, nmid,  # для WHERE в подзапросе WB_storage_fee
+                seller_id, nmid,  # для WHERE в подзапросе месяцев из GS_RNP_ReportDetail_daily_nmid
+                seller_id, nmid,  # для WHERE в подзапросе DISTINCT месяцев из WB_storage_fee
+                seller_id, nmid,  # для WHERE в UPDATE
+            ),
+        )
+        return cursor.rowcount
+    except Error as exc:
+        raise RuntimeError(f"UPDATE stock_history failed for seller_id={seller_id}, nmid={nmid}: {exc}") from exc
+
+
+def update_stock_today_for_card(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    seller_id: str,
+    nmid: Any,
+) -> int:
+    """Обновляет stock_today для одного артикула (seller_id + nmid)"""
+    try:
+        cursor.execute(
+            TOTAL_NMID_STOCK_TODAY_SQL,
+            (
+                seller_id, nmid,  # для WHERE в подзапросе WB_stocks
+                seller_id, nmid,  # для WHERE в UPDATE
+            ),
+        )
+        return cursor.rowcount
+    except Error as exc:
+        raise RuntimeError(f"UPDATE stock_today failed for seller_id={seller_id}, nmid={nmid}: {exc}") from exc
+
 
 def check_stocks_status(task_id: str, token: str) -> Optional[str]:
     """Проверяет статус отчета. Возвращает 'done', 'processing', 'error' или None"""
@@ -6635,6 +6762,8 @@ def main() -> int:
         total_summary: Dict[str, Dict[str, Any]] = {}
         total_chunks = 0
         today_date = date.today()
+        # Сохраняем пул артикулов для использования во втором цикле (stock_history)
+        total_cards_by_seller: Dict[str, List[Dict]] = {}
 
         for seller in total_allowed:
             seller_id = seller["seller_id"]
@@ -6652,6 +6781,9 @@ def main() -> int:
             if not cards:
                 print(f"[WB-bot] Сводная: у {brand} нет карточек.", flush=True)
                 continue
+
+            # Сохраняем cards для использования во втором цикле (stock_history)
+            total_cards_by_seller[seller_id] = cards
 
             for card in cards:
                 card_nmid = card.get("nmid") or card.get("nmID")
@@ -6730,10 +6862,123 @@ def main() -> int:
                 connection.commit()
                 total_db_loaded = True
                 print("[WB-bot] GS_RNP_ReportDetail_daily_nmid успешно обновлена через LOAD DATA INFILE.", flush=True)
+                
+                # Сообщение о завершении первого этапа (сохраняем message_id для редактирования)
+                stage1_message = (
+                    "<b>⚡️ Сводная</b>\n"
+                    "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
+                    "▫️ 2. Подсчёт истории остатков\n"
+                    "▫️ 3. Подсчёт текущих остатков</blockquote>"
+                )
+                stage_msg_reply = send_to_telegram(stage1_message)
+                stage_msg_id: Optional[int] = None
+                if isinstance(stage_msg_reply, dict):
+                    result = stage_msg_reply.get("result") or {}
+                    stage_msg_id = result.get("message_id")
+                
+                # Второй цикл: подсчёт истории остатков (stock_history)
+                if total_cards_by_seller:
+                    stock_history_updated = 0
+                    stock_history_errors: List[str] = []
+                    
+                    for seller_id, cards in total_cards_by_seller.items():
+                        brand = total_summary.get(seller_id, {}).get("brand", seller_id)
+                        
+                        for card in cards:
+                            card_nmid = card.get("nmid") or card.get("nmID")
+                            if card_nmid is None:
+                                continue
+                            
+                            try:
+                                affected = update_stock_history_for_card(cursor, seller_id, card_nmid)
+                                if affected > 0:
+                                    stock_history_updated += affected
+                            except Exception as exc:
+                                error_line = f"{brand} | nmID:{card_nmid} | stock_history | {exc}"
+                                stock_history_errors.append(error_line)
+                                print(f"[WB-bot] Ошибка TOTAL (stock_history): {error_line}", file=sys.stderr, flush=True)
+                    
+                    if stock_history_updated > 0:
+                        connection.commit()
+                        print(f"[WB-bot] TOTAL: обновлено stock_history для {stock_history_updated} записей.", flush=True)
+                    
+                    if stock_history_errors:
+                        errors_text = html.escape("\n".join(stock_history_errors))
+                        stock_error_message = (
+                            "<b>⚡️ Сводная</b>\n"
+                            "<blockquote><b>Ошибки при обновлении stock_history</b>\n"
+                            f"<code>{errors_text}</code></blockquote>"
+                        )
+                        send_to_telegram(stock_error_message)
+                    
+                    # Редактируем сообщение о завершении второго этапа
+                    stage2_message = (
+                        "<b>⚡️ Сводная</b>\n"
+                        "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
+                        "☑️ 2. Подсчёт истории остатков\n"
+                        "▫️ 3. Подсчёт текущих остатков</blockquote>"
+                    )
+                    if stage_msg_id is not None:
+                        try:
+                            edit_telegram_message(stage_msg_id, stage2_message)
+                        except Exception:
+                            pass
+                    else:
+                        send_to_telegram(stage2_message)
+                    
+                    # Третий цикл: подсчёт текущих остатков (stock_today)
+                    stock_today_updated = 0
+                    stock_today_errors: List[str] = []
+                    
+                    for seller_id, cards in total_cards_by_seller.items():
+                        brand = total_summary.get(seller_id, {}).get("brand", seller_id)
+                        
+                        for card in cards:
+                            card_nmid = card.get("nmid") or card.get("nmID")
+                            if card_nmid is None:
+                                continue
+                            
+                            try:
+                                affected = update_stock_today_for_card(cursor, seller_id, card_nmid)
+                                if affected > 0:
+                                    stock_today_updated += affected
+                            except Exception as exc:
+                                error_line = f"{brand} | nmID:{card_nmid} | stock_today | {exc}"
+                                stock_today_errors.append(error_line)
+                                print(f"[WB-bot] Ошибка TOTAL (stock_today): {error_line}", file=sys.stderr, flush=True)
+                    
+                    if stock_today_updated > 0:
+                        connection.commit()
+                        print(f"[WB-bot] TOTAL: обновлено stock_today для {stock_today_updated} записей.", flush=True)
+                    
+                    if stock_today_errors:
+                        errors_text = html.escape("\n".join(stock_today_errors))
+                        stock_today_error_message = (
+                            "<b>⚡️ Сводная</b>\n"
+                            "<blockquote><b>Ошибки при обновлении stock_today</b>\n"
+                            f"<code>{errors_text}</code></blockquote>"
+                        )
+                        send_to_telegram(stock_today_error_message)
+                    
+                    # Редактируем сообщение о завершении третьего этапа
+                    stage3_message = (
+                        "<b>⚡️ Сводная</b>\n"
+                        "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
+                        "☑️ 2. Подсчёт истории остатков\n"
+                        "☑️ 3. Подсчёт текущих остатков</blockquote>"
+                    )
+                    if stage_msg_id is not None:
+                        try:
+                            edit_telegram_message(stage_msg_id, stage3_message)
+                        except Exception:
+                            pass
+                    else:
+                        send_to_telegram(stage3_message)
             except Exception as db_err:
                 print(f"[WB-bot] Ошибка LOAD DATA для TOTAL: {db_err}", file=sys.stderr, flush=True)
                 error_line = f"Ошибка загрузки данных в GS_RNP_ReportDetail_daily_nmid: {db_err}"
                 total_errors.append(error_line)
+                total_db_loaded = False
 
         def fmt_total_int(value: Any) -> str:
             try:

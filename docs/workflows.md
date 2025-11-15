@@ -297,6 +297,114 @@ docker compose logs --tail=100 wb-min-bot  # просмотр логов
   - Для новичков (`prev == None`): всегда `left`, даже при пустом ответе
 - Telegram-сводка по итогам: сколько строк списаний по каждому бренду, переходы статусов.
 
+## ⚡️ Сводная (TOTAL)
+
+- **Цель**: подготовить данные для веб-приложения, агрегируя помесячные метрики по артикулам (nmid) и заполняя историю остатков и текущие остатки.
+
+### 1. Подготовка селлеров
+
+- SQL-запрос берёт селлеров с `in_workrnp = 1` и анализирует `total_nmid_status`.
+- **Логика фильтрации**:
+  - Старые селлеры (с `total_nmid_status`) — каждые 30 минут (`TOTAL_NMID_RIGHT_COOLDOWN_MINUTES = 30`)
+  - Новые селлеры (без `total_nmid_status` или `status = null`) — обрабатываются первыми
+- Telegram получает сводку с отметками допуска (✅/✖️).
+
+### 2. Получение пула артикулов
+
+- Для каждого разрешённого селлера выполняется запрос `TOTAL_NMID_PRODUCTS_SQL`:
+  ```sql
+  SELECT p.seller_id, p.nmid, ANY_VALUE(p.vendorCode), ...
+  FROM WB_products p
+  LEFT JOIN WB_sellers s ON s.seller_id = p.seller_id
+  LEFT JOIN WB_sellers_updates su ON su.seller_id = p.seller_id
+  WHERE p.seller_id = ?
+  GROUP BY p.seller_id, p.nmid
+  ```
+- **Важно**: пул артикулов сохраняется в `total_cards_by_seller` для использования во всех трёх циклах.
+
+### 3. Этап 1: Подсчёт day_metrics для nmid
+
+- **Генерация чанков дат**:
+  - Если `total_nmid_status = null` (новый селлер):
+    - Берётся минимальная дата из `orders_status.maxDateFrom` и `sales_status.maxDateFrom`
+    - Если дат нет — последние 15 дней (с захватом полного месяца)
+    - Если `maxDateFrom` есть — формируются чанки по 3 месяца от `maxDateFrom` до сегодня
+  - Если `total_nmid_status.status = "right"`:
+    - Последние 15 дней (с захватом полного месяца)
+    - `date_to = today + 1 день` (БД не выдаёт заказы текущего дня)
+- **Сбор данных**: для каждого чанка выполняется `TOTAL_NMID_FETCH_SQL` для получения детализации из `GS_RNP_ReportDetail`.
+- **Агрегация**: все строки для одного nmid собираются вместе (как в n8n), затем группируются по месяцам и агрегируются в `day_metrics` — массив дневных метрик для каждого дня месяца.
+- **Формирование CSV**: `GS_RNP_total_metrics_nmid.csv` с полями:
+  - `seller_nmid_month_year_key` (уникальный ключ: `seller_id_nmid_month_year`)
+  - `seller_id`, `wb_api_brand`, `nmid`, `month`, `year`
+  - `title`, `photo`, `Subject`, `supplierArticle`
+  - `day_metrics` (JSON-массив, кодируется в Base64 для CSV)
+- **Загрузка в БД**: `LOAD DATA INFILE` в таблицу `GS_RNP_ReportDetail_daily_nmid` с `REPLACE` (обновление при дубликатах).
+- **Base64 для day_metrics**: аналогично `warehouses` в STOCKS — JSON кодируется в Base64 при записи в CSV и декодируется в MySQL через `CONVERT(FROM_BASE64(@day_metrics) USING utf8mb4)`.
+
+### 4. Этап 2: Подсчёт истории остатков (stock_history)
+
+- **После успешной загрузки day_metrics** отправляется сообщение в Telegram о завершении первого этапа.
+- **Цикл по сохранённому пулу артикулов**: для каждого артикула выполняется `TOTAL_NMID_STOCK_HISTORY_SQL`:
+  ```sql
+  UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+  JOIN (
+    SELECT ... JSON_ARRAYAGG(JSON_OBJECT(
+      'date', DATE(sf.date),
+      'stocks_cnt', SUM(sf.barcodesCount),
+      'storage_fee', SUM(sf.warehousePrice)
+    )) AS stock_json
+    FROM WB_storage_fee sf
+    WHERE sf.seller_id = ? AND sf.nmId = ?
+    GROUP BY sf.date
+  ) AS src
+  SET r.stock_history = src.stock_json
+  WHERE r.seller_id = ? AND r.nmid = ?
+  ```
+- Обновляются только те месяцы, которые уже есть в `GS_RNP_ReportDetail_daily_nmid` (есть продажи).
+- **Важно**: используется `DATE(sf.date)` вместо `DATE_FORMAT` для корректного форматирования даты в JSON.
+- После завершения сообщение в Telegram редактируется (второй этап отмечен как завершённый).
+
+### 5. Этап 3: Подсчёт текущих остатков (stock_today)
+
+- **Цикл по тому же пулу артикулов**: для каждого артикула выполняется `TOTAL_NMID_STOCK_TODAY_SQL`:
+  ```sql
+  UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+  JOIN (
+    SELECT JSON_ARRAYAGG(JSON_OBJECT(
+      'techSize', st.techSize,
+      'quantity', st.quantity,
+      'inWayToClient', st.inWayToClient,
+      'inWayFromClient', st.inWayFromClient,
+      'quantityFull', st.quantityFull
+    )) AS stock_json
+    FROM WB_stocks st
+    WHERE st.seller_id = ? AND st.nmId = ?
+      AND COALESCE(st.quantityFull, st.quantity + st.inWayToClient + st.inWayFromClient, 0) > 0
+    ORDER BY st.techSize
+  ) AS src
+  SET r.stock_today = src.stock_json
+  WHERE r.seller_id = ? AND r.nmid = ?
+  ```
+- Обновляется поле `stock_today` для всех записей артикула в таблице (независимо от месяца).
+- После завершения сообщение в Telegram редактируется (все три этапа отмечены как завершённые).
+
+### 6. Telegram-уведомления
+
+- **Прогресс этапов**: одно сообщение редактируется после каждого этапа:
+  - После этапа 1: `☑️ 1. Подсчёт day_metrics для nmid` | `▫️ 2. Подсчёт истории остатков` | `▫️ 3. Подсчёт текущих остатков`
+  - После этапа 2: `☑️ 1.` | `☑️ 2.` | `▫️ 3.`
+  - После этапа 3: `☑️ 1.` | `☑️ 2.` | `☑️ 3.`
+- Ошибки отправляются отдельными сообщениями.
+- Финальная сводка с количеством обработанных карточек и месяцев.
+
+### ⚠️ Важные особенности
+
+- **Пул артикулов**: один и тот же пул используется во всех трёх циклах — артикулы сохраняются после первого запроса.
+- **Агрегация day_metrics**: все строки для одного nmid собираются по всем чанкам перед агрегацией (как в n8n), чтобы корректно группировать по месяцам.
+- **Base64 для JSON**: `day_metrics` кодируется в Base64 при записи в CSV (как `warehouses` в STOCKS) для избежания проблем с кавычками.
+- **Форматирование дат**: в `stock_history` используется `DATE(sf.date)` вместо `DATE_FORMAT` для корректного вывода дат в JSON.
+
 ---
 
 ## ⚠️ КРИТИЧЕСКИ ВАЖНЫЕ МОМЕНТЫ
@@ -348,19 +456,50 @@ docker compose logs --tail=100 wb-min-bot  # просмотр логов
     - Если для одного ключа (`seller_id + advertId + date + paymentType`) приходит несколько записей — суммируем `updSum`
     - Это важно, так как WB может возвращать несколько записей за один день для одной кампании
 
+11. **WB_stocks: колонка `warehouses`**
+    - При формировании CSV массив складов сериализуется в JSON и дополнительно кодируется в Base64 (`warehouses_base64`)
+    - В MySQL при `LOAD DATA INFILE` выполняется `FROM_BASE64(@warehouses)` и `CAST(... AS JSON)`, чтобы получить корректный JSON-массив
+    - Base64 критичен: без него CSV ломает кавычки и MySQL получает `[]`. Ищи реализацию в `wb_min_bot.py` (`warehouses_base64`, `FROM_BASE64(@warehouses)`), если нужно повторить логику
+
+12. **GS_RNP_ReportDetail_daily_nmid: колонка `day_metrics`**
+    - Аналогично `warehouses` в STOCKS: массив `day_metrics` кодируется в Base64 при записи в CSV
+    - В MySQL при `LOAD DATA INFILE` выполняется `CONVERT(FROM_BASE64(@day_metrics) USING utf8mb4)` и `CAST(... AS JSON)`
+    - Base64 критичен для корректной передачи JSON-массивов через CSV
+    - Реализация: `write_total_nmid_csv` кодирует в Base64, `load_total_nmid_into_db` декодирует
+
+13. **TOTAL воркфлоу: пул артикулов**
+    - Пул артикулов (`cards`) сохраняется в `total_cards_by_seller` после первого запроса
+    - Один и тот же пул используется во всех трёх циклах (day_metrics, stock_history, stock_today)
+    - Это гарантирует, что все три этапа обрабатывают одинаковый набор артикулов
+
+14. **TOTAL воркфлоу: агрегация day_metrics**
+    - Все строки для одного nmid собираются по всем чанкам дат перед агрегацией (как в n8n)
+    - Это критично для корректной группировки по месяцам — если агрегировать каждый чанк отдельно, данные будут разбиты неправильно
+
+15. **TOTAL воркфлоу: форматирование дат в stock_history**
+    - Используется `DATE(sf.date)` вместо `DATE_FORMAT(sf.date, '%Y-%m-%d')`
+    - `DATE()` возвращает дату в формате 'YYYY-MM-DD' по умолчанию
+    - `DATE_FORMAT` с экранированием `%%` в Python f-строках может работать некорректно
+
 ### Структура данных
 
 - **Уникальный ключ WB_ad_stats**: `seller_advert_date_key` = `seller_id_advert_id_nmId_date_appType`
 - **Уникальный ключ WB_ad_expenses**: `seller_advert_date_key` = `seller_id_advertId_date_paymentType`
+- **Уникальный ключ GS_RNP_ReportDetail_daily_nmid**: `seller_nmid_month_year_key` = `seller_id_nmid_month_year` (например, `7e48139355452_250786648_04_2025`)
 - **CSV колонки**: порядок важен для LOAD DATA INFILE
 - **Удалены из таблицы**: `brand`, `name` — их нет в структуре БД
+- **JSON поля в GS_RNP_ReportDetail_daily_nmid**:
+  - `day_metrics`: массив дневных метрик для месяца (кодируется в Base64 в CSV)
+  - `stock_history`: массив объектов с датой, количеством остатков и стоимостью хранения
+  - `stock_today`: массив объектов с размерами и текущими остатками
 
 ### Частота выполнения
 
-- Бот выполняет один полный цикл (01→02→03→04→05→06)
+- Бот выполняет один полный цикл (01→02→03→04→05→06→TOTAL)
 - После завершения ждёт 5 минут (`time.sleep(300)`)
 - Затем завершается, Docker перезапускает контейнер (`restart: unless-stopped`)
 - Фактический интервал между циклами: ~5 минут + время перезапуска
+- **TOTAL воркфлоу** выполняется последним и включает три этапа: day_metrics, stock_history, stock_today
 
 ### Telegram-уведомления
 
