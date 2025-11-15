@@ -56,6 +56,8 @@ TOTAL_NMID_CSV_HOST_PATH = "/data/csv/GS_RNP_total_metrics_nmid.csv"
 TOTAL_NMID_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_metrics_nmid.csv"
 TOTAL_NMID_STOCK_HISTORY_CSV_HOST_PATH = "/data/csv/GS_RNP_total_metrics_nmid_stock_history.csv"
 TOTAL_NMID_STOCK_HISTORY_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_metrics_nmid_stock_history.csv"
+TOTAL_NMID_AD_STATS_CSV_HOST_PATH = "/data/csv/GS_RNP_total_stats_daily.csv"
+TOTAL_NMID_AD_STATS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_stats_daily.csv"
 WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
 WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
@@ -2210,7 +2212,8 @@ SELECT
   MAX(su.orders_status)          AS orders_status,
   MAX(su.sales_status)           AS sales_status,
   MAX(su.total_nmid_status)      AS total_nmid_status,
-  MAX(su.paid_storage_status)    AS paid_storage_status
+  MAX(su.paid_storage_status)    AS paid_storage_status,
+  MAX(su.ad_stats_status)        AS ad_stats_status
 FROM WB_products p
 LEFT JOIN WB_sellers         s  ON s.seller_id  = p.seller_id
 LEFT JOIN WB_sellers_updates su ON su.seller_id = p.seller_id
@@ -2365,6 +2368,32 @@ WHERE seller_id = %s
 ORDER BY nmId, `date`
 """
 
+TOTAL_NMID_AD_STATS_BY_SELLER_SQL = """
+SELECT
+  seller_id,
+  advert_id,
+  nmID,
+  `date`,
+  views,
+  clicks,
+  ctr,
+  cpc,
+  ad_expenses,
+  atbs,
+  orders,
+  canceled,
+  cr,
+  shks,
+  sum_price,
+  app_type,
+  avg_position
+FROM WB_ad_stats
+WHERE seller_id = %s
+  AND `date` >= %s
+  AND `date` < %s
+ORDER BY advert_id, `date`
+"""
+
 TOTAL_NMID_STOCK_HISTORY_SQL = """
 UPDATE GS_RNP_ReportDetail_daily_nmid AS r
 JOIN (
@@ -2511,6 +2540,7 @@ def fetch_total_nmid_cards(
         card["sales_status"] = parse_json_field(card.get("sales_status"))
         card["total_nmid_status"] = parse_json_field(card.get("total_nmid_status"))
         card["paid_storage_status"] = parse_json_field(card.get("paid_storage_status"))
+        card["ad_stats_status"] = parse_json_field(card.get("ad_stats_status"))
         result.append(card)
     return result
 
@@ -2588,6 +2618,51 @@ def fetch_storage_fee_by_seller(
     """Выгружает все строки WB_storage_fee по селлеру за период"""
     cursor.execute(
         TOTAL_NMID_STORAGE_FEE_BY_SELLER_SQL,
+        (
+            seller_id,
+            date_from,
+            date_to,
+        ),
+    )
+    return cursor.fetchall()
+
+
+def get_ad_stats_date_range(
+    ad_stats_status: Optional[Dict],
+    today: date,
+) -> tuple[str, str]:
+    """
+    Определяет период для выгрузки WB_ad_stats на основе ad_stats_status.
+    Возвращает (date_from, date_to).
+    """
+    tomorrow = today + timedelta(days=1)
+    
+    if isinstance(ad_stats_status, dict):
+        max_begin_date = ad_stats_status.get("maxBeginDate")
+        if max_begin_date:
+            max_date = parse_ymd_date(max_begin_date)
+            if max_date:
+                # Берём от maxBeginDate до сегодня
+                date_from = first_day_of_month(max_date)
+                date_to = tomorrow.isoformat()
+                return (date_from.isoformat(), date_to)
+    
+    # Если нет maxBeginDate - берём последние 15 дней (с захватом полного месяца)
+    start_candidate = today - timedelta(days=15)
+    date_from = first_day_of_month(start_candidate)
+    date_to = tomorrow.isoformat()
+    return (date_from.isoformat(), date_to)
+
+
+def fetch_ad_stats_by_seller(
+    cursor: mysql.connector.cursor.MySQLCursorDict,
+    seller_id: str,
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    """Выгружает все строки WB_ad_stats по селлеру за период"""
+    cursor.execute(
+        TOTAL_NMID_AD_STATS_BY_SELLER_SQL,
         (
             seller_id,
             date_from,
@@ -3142,6 +3217,9 @@ def parse_ad_stats_payload(payload: Any) -> List[Dict]:
                 if not isinstance(app, dict):
                     continue
                 app_type = to_int_or_none(app.get("appType") or app.get("app_type"))
+                # Если appType отсутствует, используем значение по умолчанию 99 (не 0, т.к. AD_STATS_SKIP_APP_TYPE_ZERO пропускает 0)
+                if app_type is None:
+                    app_type = 99
                 if AD_STATS_SKIP_APP_TYPE_ZERO and app_type == 0:
                     continue
 
@@ -3489,6 +3567,179 @@ def aggregate_stock_history_rows(
     return aggregated
 
 
+def aggregate_ad_stats_rows(ad_stats_rows: List[Dict]) -> List[Dict]:
+    """
+    Агрегирует строки WB_ad_stats по (seller_id, advert_id, year, month)
+    и формирует day_adstats JSON для каждого месяца.
+    
+    Args:
+        ad_stats_rows: список строк из WB_ad_stats
+    
+    Returns:
+        список записей для обновления с полями:
+        - seller_adid_month_year_key
+        - seller_id, advert_id, nmid, year, month
+        - day_adstats (JSON массив)
+    """
+    def to_number(v: Any, default: float = 0.0) -> float:
+        if v is None or v == "":
+            return default
+        try:
+            n = float(v)
+            # Проверка на NaN и Infinity (как Number.isFinite в JS)
+            if n != n or not (-float('inf') < n < float('inf')):
+                return default
+            return n
+        except (TypeError, ValueError):
+            return default
+    
+    def round_value(v: float, decimals: int = 3) -> float:
+        factor = 10 ** decimals
+        return round(v * factor) / factor
+    
+    # Группировка: key = "seller_id|advert_id|year|month"
+    groups: Dict[str, Dict] = {}
+    
+    skipped_count = 0
+    for row in ad_stats_rows:
+        seller_id = str(row.get("seller_id") or "")
+        advert_id = row.get("advert_id")
+        nmid = row.get("nmID")
+        
+        if not seller_id or advert_id is None or nmid is None:
+            skipped_count += 1
+            continue
+        
+        date_raw = str(row.get("date") or "")[:10]
+        if not date_raw or len(date_raw) < 10:
+            continue
+        
+        try:
+            parts = date_raw.split("-")
+            if len(parts) != 3:
+                continue
+            year = int(parts[0])
+            month = int(parts[1])  # 1..12
+            if not year or not month:
+                continue
+        except (ValueError, IndexError):
+            continue
+        
+        group_key = f"{seller_id}|{advert_id}|{year}|{month}"
+        
+        if group_key not in groups:
+            groups[group_key] = {
+                "seller_id": seller_id,
+                "advert_id": advert_id,
+                "year": year,
+                "month": month,
+                "nmid": nmid,
+                "days": {},  # dateStr -> агрегатор по дню
+            }
+        
+        group = groups[group_key]
+        
+        if date_raw not in group["days"]:
+            group["days"][date_raw] = {
+                "date": date_raw,
+                # суммы
+                "views_sum": 0.0,
+                "clicks_sum": 0.0,
+                "adexp_sum": 0.0,
+                "atbs_sum": 0.0,
+                "orders_sum_cnt": 0.0,
+                "shks_sum": 0.0,
+                "orders_money_sum": 0.0,
+                # для средних
+                "ctr_sum": 0.0,
+                "cpc_sum": 0.0,
+                "cr_sum": 0.0,
+                "avg_pos_sum": 0.0,
+                "rows_cnt": 0,
+            }
+        
+        day = group["days"][date_raw]
+        
+        views = to_number(row.get("views"))
+        clicks = to_number(row.get("clicks"))
+        adexp = to_number(row.get("ad_expenses"))
+        atbs = to_number(row.get("atbs"))
+        orders_cnt = to_number(row.get("orders"))
+        shks = to_number(row.get("shks"))
+        orders_money = to_number(row.get("sum_price"))
+        ctr = to_number(row.get("ctr"))
+        cpc = to_number(row.get("cpc"))
+        cr = to_number(row.get("cr"))
+        avg_pos = to_number(row.get("avg_position"))
+        
+        # Суммы
+        day["views_sum"] += views
+        day["clicks_sum"] += clicks
+        day["adexp_sum"] += adexp
+        day["atbs_sum"] += atbs
+        day["orders_sum_cnt"] += orders_cnt
+        day["shks_sum"] += shks
+        day["orders_money_sum"] += orders_money
+        
+        # Для средних
+        day["ctr_sum"] += ctr
+        day["cpc_sum"] += cpc
+        day["cr_sum"] += cr
+        day["avg_pos_sum"] += avg_pos
+        day["rows_cnt"] += 1
+    
+    # Формируем итоговые записи
+    aggregated = []
+    
+    for group_key, group in groups.items():
+        seller_id = group["seller_id"]
+        advert_id = group["advert_id"]
+        year = group["year"]
+        month = group["month"]
+        nmid = group["nmid"]
+        
+        seller_adid_month_year_key = f"{seller_id}_{advert_id}_{str(month).zfill(2)}_{year}"
+        
+        day_keys = sorted(group["days"].keys())  # сортировка по дате
+        day_adstats = []
+        
+        for date_str in day_keys:
+            d = group["days"][date_str]
+            rows_cnt = d["rows_cnt"] or 1
+            
+            day_adstats.append({
+                "date": date_str,
+                "views": d["views_sum"],  # В JS без int()
+                "clicks": d["clicks_sum"],  # В JS без int()
+                "ctr": round_value(d["ctr_sum"] / rows_cnt, 3),
+                "cpc": round_value(d["cpc_sum"] / rows_cnt, 3),
+                "adexp": round_value(d["adexp_sum"], 3),
+                "atbs": d["atbs_sum"],  # В JS без int()
+                "orders_cnt": d["orders_sum_cnt"],  # В JS без int()
+                "cr": round_value(d["cr_sum"] / rows_cnt, 3),
+                "shks": d["shks_sum"],  # В JS без int()
+                "orders_sum": round_value(d["orders_money_sum"], 3),
+                "avg_pos": round_value(d["avg_pos_sum"] / rows_cnt, 3),
+            })
+        
+        aggregated.append({
+            "seller_adid_month_year_key": seller_adid_month_year_key,
+            "month": month,
+            "year": year,
+            "seller_id": seller_id,
+            "nmid": nmid,
+            "advert_id": advert_id,
+            "day_adstats": day_adstats,
+        })
+    
+    if skipped_count > 0:
+        print(f"[WB-bot] TOTAL: aggregate_ad_stats_rows - пропущено {skipped_count} строк из {len(ad_stats_rows)} (нет seller_id/advert_id/nmID)", flush=True)
+    
+    print(f"[WB-bot] TOTAL: aggregate_ad_stats_rows - входных строк: {len(ad_stats_rows)}, групп: {len(groups)}, выходных записей: {len(aggregated)}", flush=True)
+    
+    return aggregated
+
+
 def write_stock_history_csv(rows: List[Dict], path: str) -> None:
     """Записывает агрегированные stock_history данные в CSV с Base64 кодированием JSON"""
     import csv
@@ -3598,6 +3849,154 @@ def load_stock_history_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> No
         
     except Error as exc:
         raise RuntimeError(f"UPSERT via temp table for stock_history failed: {exc}") from exc
+
+
+def write_total_ad_stats_csv(rows: List[Dict], path: str) -> None:
+    """Записывает агрегированные ad_stats данные для TOTAL воркфлоу в CSV с Base64 кодированием JSON"""
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Порядок полей должен соответствовать порядку в таблице (без id):
+    # seller_adid_month_year_key, month, year, seller_id, nmid, advert_id, day_adstats
+    fieldnames = [
+        "seller_adid_month_year_key",
+        "month",
+        "year",
+        "seller_id",
+        "nmid",
+        "advert_id",
+        "day_adstats",
+    ]
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            # Кодируем day_adstats в Base64, как для warehouses в STOCKS
+            day_adstats = row.get("day_adstats") or []
+            day_adstats_base64 = ""
+            if day_adstats:
+                try:
+                    day_adstats_json = json.dumps(day_adstats, ensure_ascii=False, separators=(',', ':'))
+                    json.loads(day_adstats_json)  # Проверка валидности
+                    day_adstats_base64 = base64.b64encode(day_adstats_json.encode("utf-8")).decode("ascii")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    day_adstats_base64 = ""
+            
+            writer.writerow(
+                {
+                    "seller_adid_month_year_key": row.get("seller_adid_month_year_key"),
+                    "seller_id": row.get("seller_id"),
+                    "advert_id": row.get("advert_id"),
+                    "nmid": row.get("nmid"),
+                    "year": row.get("year"),
+                    "month": row.get("month"),
+                    "day_adstats": day_adstats_base64 or "",
+                }
+            )
+
+
+def load_total_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    """
+    UPSERT через временную таблицу для обновления WB_ad_stats_daily (TOTAL воркфлоу):
+    1. Создаём временную таблицу
+    2. LOAD DATA INFILE во временную таблицу (быстро)
+    3. INSERT ... ON DUPLICATE KEY UPDATE из временной в целевую
+    """
+    temp_table = "WB_ad_stats_daily_temp"
+    
+    try:
+        # 1. Создаём временную таблицу (копия структуры целевой)
+        cursor.execute(f"""
+            CREATE TEMPORARY TABLE {temp_table} LIKE WB_ad_stats_daily
+        """)
+        
+        # 2. Загружаем данные во временную таблицу через LOAD DATA INFILE
+        load_start = time.time()
+        print(f"[WB-bot] TOTAL: загружаем CSV {TOTAL_NMID_AD_STATS_CSV_MYSQL_PATH} во временную таблицу...", flush=True)
+        cursor.execute(f"""
+            LOAD DATA INFILE '{TOTAL_NMID_AD_STATS_CSV_MYSQL_PATH}'
+            INTO TABLE {temp_table}
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              @seller_adid_month_year_key,
+              @month,
+              @year,
+              @seller_id,
+              @nmid,
+              @advert_id,
+              @day_adstats
+            )
+            SET
+              seller_adid_month_year_key = NULLIF(@seller_adid_month_year_key, ''),
+              month = NULLIF(@month, ''),
+              year = NULLIF(@year, ''),
+              seller_id = NULLIF(@seller_id, ''),
+              nmid = NULLIF(@nmid, ''),
+              advert_id = NULLIF(@advert_id, ''),
+              day_adstats = CASE
+                WHEN @day_adstats IS NULL OR @day_adstats = '' THEN JSON_ARRAY()
+                -- Новая схема: day_adstats сохраняем в CSV в base64, чтобы избежать проблем с кавычками и разделителями
+                -- Сначала декодируем Base64 в строку, затем проверяем и кастуем в JSON
+                WHEN JSON_VALID(CONVERT(FROM_BASE64(@day_adstats) USING utf8mb4)) 
+                  THEN CAST(CONVERT(FROM_BASE64(@day_adstats) USING utf8mb4) AS JSON)
+                -- Прямая проверка валидности JSON (если уже правильно сериализован через json.dumps)
+                WHEN JSON_VALID(@day_adstats) THEN CAST(@day_adstats AS JSON)
+                -- Обработка экранированных кавычек из CSV: CSV writer удваивает кавычки внутри полей
+                WHEN JSON_VALID(REPLACE(@day_adstats, '""', '"')) THEN CAST(REPLACE(@day_adstats, '""', '"') AS JSON)
+                ELSE JSON_ARRAY()
+              END
+        """)
+        load_elapsed = time.time() - load_start
+        print(f"[WB-bot] TOTAL: LOAD DATA INFILE во временную таблицу занял {load_elapsed:.2f} сек", flush=True)
+        
+        # 3. INSERT ... ON DUPLICATE KEY UPDATE из временной таблицы в целевую
+        # Используем seller_adid_month_year_key как уникальный ключ
+        replace_start = time.time()
+        print(f"[WB-bot] TOTAL: выполняем INSERT ... ON DUPLICATE KEY UPDATE из временной таблицы в WB_ad_stats_daily...", flush=True)
+        cursor.execute(f"""
+            INSERT INTO WB_ad_stats_daily
+            (
+              seller_adid_month_year_key,
+              month,
+              year,
+              seller_id,
+              nmid,
+              advert_id,
+              day_adstats
+            )
+            SELECT
+              seller_adid_month_year_key,
+              month,
+              year,
+              seller_id,
+              nmid,
+              advert_id,
+              day_adstats
+            FROM {temp_table}
+            ON DUPLICATE KEY UPDATE
+              seller_id = VALUES(seller_id),
+              advert_id = VALUES(advert_id),
+              nmid = VALUES(nmid),
+              year = VALUES(year),
+              month = VALUES(month),
+              day_adstats = VALUES(day_adstats)
+        """)
+        replace_elapsed = time.time() - replace_start
+        affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        print(f"[WB-bot] TOTAL: INSERT ... ON DUPLICATE KEY UPDATE завершён за {replace_elapsed:.2f} сек, затронуто строк: {affected}", flush=True)
+        
+        # 4. Временная таблица удалится автоматически при закрытии соединения
+        
+    except Error as exc:
+        raise RuntimeError(f"UPSERT via temp table for ad_stats failed: {exc}") from exc
 
 
 def write_total_nmid_csv(rows: List[Dict], path: str) -> None:
@@ -4948,12 +5347,26 @@ def load_ad_list_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
 
 
 def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    """
+    UPSERT через временную таблицу для обновления WB_ad_stats:
+    1. Создаём временную таблицу
+    2. LOAD DATA INFILE во временную таблицу (быстро)
+    3. REPLACE INTO из временной в целевую с фильтрацией валидных seller_id
+    """
+    temp_table = "WB_ad_stats_temp"
+    
     try:
+        # 1. Создаём временную таблицу (копия структуры целевой, но без внешних ключей)
+        cursor.execute(f"""
+            CREATE TEMPORARY TABLE {temp_table} LIKE WB_ad_stats
+        """)
+        
+        # 2. Загружаем данные во временную таблицу через LOAD DATA INFILE
+        # Используем оригинальную логику: seller_advert_date_key и seller_id загружаются напрямую
         cursor.execute(
             f"""
             LOAD DATA INFILE '{WB_AD_STATS_CSV_MYSQL_PATH}'
-            REPLACE
-            INTO TABLE WB_ad_stats
+            INTO TABLE {temp_table}
             CHARACTER SET utf8mb4
             FIELDS TERMINATED BY ','
             ENCLOSED BY '"'
@@ -4999,6 +5412,15 @@ def load_ad_stats_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
               avg_position = NULLIF(@avg_position, '')
             """
         )
+        
+        # 3. REPLACE INTO из временной таблицы в целевую, фильтруя только валидные seller_id
+        cursor.execute(f"""
+            REPLACE INTO WB_ad_stats
+            SELECT t.*
+            FROM {temp_table} t
+            INNER JOIN wb_sellers s ON s.seller_id = t.seller_id
+        """)
+        
     except Error as exc:
         raise RuntimeError(f"LOAD DATA INFILE for ad stats failed: {exc}") from exc
 
@@ -6489,11 +6911,27 @@ def main() -> int:
                                     advert_id = row.get("advertId")
                                     date_str = row.get("date")
                                     app_type = row.get("appType")
+                                    nm_id = row.get("nmId")
+                                    
+                                    # Формируем seller_advert_date_key только если все обязательные поля присутствуют
                                     if seller_id and advert_id is not None and date_str and app_type is not None:
-                                        row_out["seller_advert_date_key"] = f"{seller_id}_{advert_id}_{row.get('nmId', '')}_{date_str}_{app_type}"
+                                        row_out["seller_advert_date_key"] = f"{seller_id}_{advert_id}_{nm_id or ''}_{date_str}_{app_type}"
+                                        ad_stats_rows.append(row_out)
                                     else:
-                                        row_out["seller_advert_date_key"] = ""
-                                    ad_stats_rows.append(row_out)
+                                        # Пропускаем строки с неполными данными, чтобы избежать ошибки дубликата пустого ключа
+                                        missing_fields = []
+                                        if not seller_id:
+                                            missing_fields.append("seller_id")
+                                        if advert_id is None:
+                                            missing_fields.append("advertId")
+                                        if not date_str:
+                                            missing_fields.append("date")
+                                        if app_type is None:
+                                            missing_fields.append("appType")
+                                        print(
+                                            f"[WB-bot] Пропущена строка ad_stats с неполными данными (отсутствуют: {', '.join(missing_fields)})",
+                                            flush=True,
+                                        )
                             else:
                                 ad_stats_empty_campaigns[seller_id] += len(req["campaign_ids"])
 
@@ -7283,6 +7721,22 @@ def main() -> int:
         # Сохраняем пул артикулов для использования во втором цикле (stock_history)
         total_cards_by_seller: Dict[str, List[Dict]] = {}
 
+        # Начальное сообщение со всеми этапами
+        stage_msg_id: Optional[int] = None
+        if total_allowed:
+            initial_message = (
+                "<b>⚡️ Сводная</b>\n"
+                "<blockquote>▫️ 1. Подсчёт day_metrics для nmid\n"
+                "▫️ 2. Подсчёт истории остатков\n"
+                "▫️ 3. Подсчёт текущих остатков\n"
+                "▫️ 4. Подсчёт воронки\n"
+                "▫️ 5. Подсчет статистики РК</blockquote>"
+            )
+            stage_msg_reply = send_to_telegram(initial_message)
+            if isinstance(stage_msg_reply, dict):
+                result = stage_msg_reply.get("result") or {}
+                stage_msg_id = result.get("message_id")
+
         for seller in total_allowed:
             seller_id = seller["seller_id"]
             brand = seller.get("brand") or seller_id
@@ -7426,19 +7880,22 @@ def main() -> int:
                 total_db_loaded = True
                 print("[WB-bot] GS_RNP_ReportDetail_daily_nmid успешно обновлена через LOAD DATA INFILE.", flush=True)
                 
-                # Сообщение о завершении первого этапа (сохраняем message_id для редактирования)
+                # Редактируем сообщение о завершении первого этапа
                 stage1_message = (
                     "<b>⚡️ Сводная</b>\n"
                     "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                     "▫️ 2. Подсчёт истории остатков\n"
                     "▫️ 3. Подсчёт текущих остатков\n"
-                    "▫️ 4. Подсчёт воронки</blockquote>"
+                    "▫️ 4. Подсчёт воронки\n"
+                    "▫️ 5. Подсчет статистики РК</blockquote>"
                 )
-                stage_msg_reply = send_to_telegram(stage1_message)
-                stage_msg_id: Optional[int] = None
-                if isinstance(stage_msg_reply, dict):
-                    result = stage_msg_reply.get("result") or {}
-                    stage_msg_id = result.get("message_id")
+                if stage_msg_id is not None:
+                    try:
+                        edit_telegram_message(stage_msg_id, stage1_message)
+                    except Exception:
+                        pass
+                else:
+                    send_to_telegram(stage1_message)
                 
                 # Второй цикл: подсчёт истории остатков (stock_history) - оптимизированная версия
                 if total_cards_by_seller:
@@ -7525,7 +7982,8 @@ def main() -> int:
                         "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                         "☑️ 2. Подсчёт истории остатков\n"
                         "▫️ 3. Подсчёт текущих остатков\n"
-                        "▫️ 4. Подсчёт воронки</blockquote>"
+                        "▫️ 4. Подсчёт воронки\n"
+                        "▫️ 5. Подсчет статистики РК</blockquote>"
                     )
                     if stage_msg_id is not None:
                         try:
@@ -7575,7 +8033,8 @@ def main() -> int:
                         "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                         "☑️ 2. Подсчёт истории остатков\n"
                         "☑️ 3. Подсчёт текущих остатков\n"
-                        "▫️ 4. Подсчёт воронки</blockquote>"
+                        "▫️ 4. Подсчёт воронки\n"
+                        "▫️ 5. Подсчет статистики РК</blockquote>"
                     )
                     if stage_msg_id is not None:
                         try:
@@ -7625,7 +8084,8 @@ def main() -> int:
                         "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                         "☑️ 2. Подсчёт истории остатков\n"
                         "☑️ 3. Подсчёт текущих остатков\n"
-                        "☑️ 4. Подсчёт воронки</blockquote>"
+                        "☑️ 4. Подсчёт воронки\n"
+                        "▫️ 5. Подсчет статистики РК</blockquote>"
                     )
                     if stage_msg_id is not None:
                         try:
@@ -7634,6 +8094,124 @@ def main() -> int:
                             pass
                     else:
                         send_to_telegram(stage4_message)
+                    
+                    # Пятый цикл: подсчёт статистики РК (ad_stats)
+                    if total_cards_by_seller:
+                        ad_stats_updated = 0
+                        ad_stats_errors: List[str] = []
+                        all_ad_stats_aggregated: List[Dict] = []
+                        
+                        for seller_id, cards in total_cards_by_seller.items():
+                            brand = total_summary.get(seller_id, {}).get("brand", seller_id)
+                            
+                            if not cards:
+                                continue
+                            
+                            # Получаем ad_stats_status из первой карточки (они все одинаковые для селлера)
+                            ad_stats_status = cards[0].get("ad_stats_status")
+                            
+                            # Определяем период для ad_stats
+                            date_from, date_to = get_ad_stats_date_range(ad_stats_status, today_date)
+                            
+                            try:
+                                # Выгружаем все строки WB_ad_stats по селлеру за период
+                                ad_stats_rows = fetch_ad_stats_by_seller(
+                                    cursor_dict, seller_id, date_from, date_to
+                                )
+                                print(
+                                    f"[WB-bot] TOTAL: выгружено {len(ad_stats_rows)} строк WB_ad_stats для {brand} за период {date_from}→{date_to}",
+                                    flush=True,
+                                )
+                                
+                                if not ad_stats_rows:
+                                    continue
+                                
+                                # Агрегируем данные
+                                agg_start = time.time()
+                                aggregated = aggregate_ad_stats_rows(ad_stats_rows)
+                                agg_elapsed = time.time() - agg_start
+                                print(f"[WB-bot] TOTAL: агрегация ad_stats для {brand} заняла {agg_elapsed:.2f} сек ({len(ad_stats_rows)} строк → {len(aggregated) if aggregated else 0} записей)", flush=True)
+                                
+                                if aggregated:
+                                    all_ad_stats_aggregated.extend(aggregated)
+                                    print(
+                                        f"[WB-bot] TOTAL: агрегировано ad_stats для {len(aggregated)} записей ({brand})",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"[WB-bot] TOTAL: предупреждение - агрегация ad_stats вернула пустой результат для {brand} (входных строк: {len(ad_stats_rows)})",
+                                        flush=True,
+                                    )
+                            except Exception as exc:
+                                error_line = f"{brand} | ad_stats | {exc}"
+                                ad_stats_errors.append(error_line)
+                                print(f"[WB-bot] Ошибка TOTAL (ad_stats): {error_line}", file=sys.stderr, flush=True)
+                        
+                        # Записываем все данные в CSV и загружаем в БД одним запросом
+                        if all_ad_stats_aggregated:
+                            try:
+                                # Фильтруем только валидные seller_id (из total_cards_by_seller)
+                                valid_seller_ids = set(total_cards_by_seller.keys())
+                                filtered_aggregated = [
+                                    row for row in all_ad_stats_aggregated
+                                    if row.get("seller_id") in valid_seller_ids
+                                ]
+                                if len(filtered_aggregated) < len(all_ad_stats_aggregated):
+                                    skipped = len(all_ad_stats_aggregated) - len(filtered_aggregated)
+                                    print(f"[WB-bot] TOTAL: пропущено {skipped} записей ad_stats с невалидными seller_id", flush=True)
+                                
+                                csv_start = time.time()
+                                print(f"[WB-bot] TOTAL: записываем {len(filtered_aggregated)} записей ad_stats в CSV...", flush=True)
+                                write_total_ad_stats_csv(filtered_aggregated, TOTAL_NMID_AD_STATS_CSV_HOST_PATH)
+                                csv_elapsed = time.time() - csv_start
+                                print(f"[WB-bot] TOTAL: CSV записан за {csv_elapsed:.2f} сек, загружаем в БД...", flush=True)
+                                
+                                db_start = time.time()
+                                load_total_ad_stats_into_db(cursor)
+                                db_load_elapsed = time.time() - db_start
+                                print(f"[WB-bot] TOTAL: LOAD DATA INFILE занял {db_load_elapsed:.2f} сек", flush=True)
+                                
+                                commit_start = time.time()
+                                connection.commit()
+                                commit_elapsed = time.time() - commit_start
+                                print(f"[WB-bot] TOTAL: COMMIT занял {commit_elapsed:.2f} сек", flush=True)
+                                
+                                ad_stats_updated = len(all_ad_stats_aggregated)
+                                print(f"[WB-bot] TOTAL: обновлено ad_stats для {ad_stats_updated} записей (всего).", flush=True)
+                            except Exception as exc:
+                                error_line = f"ad_stats CSV/DB | {exc}"
+                                ad_stats_errors.append(error_line)
+                                print(f"[WB-bot] Ошибка TOTAL (ad_stats CSV/DB): {error_line}", file=sys.stderr, flush=True)
+                                traceback.print_exc()
+                        else:
+                            print(f"[WB-bot] TOTAL: нет данных для агрегации ad_stats (all_ad_stats_aggregated пуст).", flush=True)
+                        
+                        if ad_stats_errors:
+                            errors_text = html.escape("\n".join(ad_stats_errors))
+                            ad_stats_error_message = (
+                                "<b>⚡️ Сводная</b>\n"
+                                "<blockquote><b>Ошибки при обновлении ad_stats</b>\n"
+                                f"<code>{errors_text}</code></blockquote>"
+                            )
+                            send_to_telegram(ad_stats_error_message)
+                        
+                        # Редактируем сообщение о завершении пятого этапа
+                        stage5_message = (
+                            "<b>⚡️ Сводная</b>\n"
+                            "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
+                            "☑️ 2. Подсчёт истории остатков\n"
+                            "☑️ 3. Подсчёт текущих остатков\n"
+                            "☑️ 4. Подсчёт воронки\n"
+                            "☑️ 5. Подсчет статистики РК</blockquote>"
+                        )
+                        if stage_msg_id is not None:
+                            try:
+                                edit_telegram_message(stage_msg_id, stage5_message)
+                            except Exception:
+                                pass
+                        else:
+                            send_to_telegram(stage5_message)
             except Exception as db_err:
                 print(f"[WB-bot] Ошибка LOAD DATA для TOTAL: {db_err}", file=sys.stderr, flush=True)
                 error_line = f"Ошибка загрузки данных в GS_RNP_ReportDetail_daily_nmid: {db_err}"
