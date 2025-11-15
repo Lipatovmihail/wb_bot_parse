@@ -1,0 +1,1073 @@
+{
+  "name": "10 DB | ReportDetail",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.*\nFROM WB_sellers s\nJOIN WB_sellers_updates su ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        192,
+        224
+      ],
+      "id": "f67a98ae-a185-4781-a4e4-4a073f52d57c",
+      "name": "get_all_sellers",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "GS_RNP_ReportDetail",
+          "mode": "list",
+          "cachedResultName": "GS_RNP_ReportDetail"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "srid_seller_sale_key",
+        "valueToMatchOn": "={{ $json.srid +\"_\"+ $json.seller_id}}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "Date_order",
+              "value": "={{ $json.Date_order }}"
+            },
+            {
+              "column": "Date_cancel",
+              "value": "={{ $json.Date_cancel }}"
+            },
+            {
+              "column": "Warehouse",
+              "value": "={{ $json.Warehouse }}"
+            },
+            {
+              "column": "Warehouse_type",
+              "value": "={{ $json.Warehouse_type }}"
+            },
+            {
+              "column": "Country",
+              "value": "={{ $json.Country }}"
+            },
+            {
+              "column": "Okrug",
+              "value": "={{ $json.Okrug }}"
+            },
+            {
+              "column": "Region",
+              "value": "={{ $json.Region }}"
+            },
+            {
+              "column": "nmId",
+              "value": "={{ $json.nmId }}"
+            },
+            {
+              "column": "supplierArticle",
+              "value": "={{ $json.supplierArticle }}"
+            },
+            {
+              "column": "Size",
+              "value": "={{ $json.Size }}"
+            },
+            {
+              "column": "BC",
+              "value": "={{ $json.BC }}"
+            },
+            {
+              "column": "Brand",
+              "value": "={{ $json.Brand }}"
+            },
+            {
+              "column": "Category",
+              "value": "={{ $json.Category }}"
+            },
+            {
+              "column": "Subject",
+              "value": "={{ $json.Subject }}"
+            },
+            {
+              "column": "SPP",
+              "value": "={{ $json.SPP }}"
+            },
+            {
+              "column": "TotalPrice",
+              "value": "={{ $json.TotalPrice }}"
+            },
+            {
+              "column": "Discount",
+              "value": "={{ $json.Discount }}"
+            },
+            {
+              "column": "priceWithDisc",
+              "value": "={{ $json.priceWithDisc }}"
+            },
+            {
+              "column": "finishedPrice",
+              "value": "={{ $json.finishedPrice }}"
+            },
+            {
+              "column": "gNumber",
+              "value": "={{ $json.gNumber }}"
+            },
+            {
+              "column": "srid",
+              "value": "={{ $json.srid }}"
+            },
+            {
+              "column": "orderType",
+              "value": "={{ $json.orderType }}"
+            },
+            {
+              "column": "status",
+              "value": "={{ $json.Status }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -176,
+        1424
+      ],
+      "id": "ad43a59f-916f-4566-a653-6bd32377c88f",
+      "name": "insert_order",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * \nFROM WB_orders\nWHERE Date >= DATE_SUB(NOW(), INTERVAL {{ $json.depth_orders }} DAY)\nAND seller_id = '{{ $json.seller_id }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -160,
+        800
+      ],
+      "id": "e929f912-665c-402f-91e2-bc71fd60b259",
+      "name": "get_all_orders",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * \nFROM WB_sales\nWHERE Date >= DATE_SUB(NOW(), INTERVAL {{ $('Loop_ordesales').item.json.depth_sales }} DAY)\nAND seller_id = '{{ $('Loop_ordesales').item.json.seller_id }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2480,
+        592
+      ],
+      "id": "b67ae018-d537-4b17-9bdd-0b7dee9bb9f1",
+      "name": "get_all_sales",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Входные данные (из предыдущей ноды)\nconst orders = items.map(item => item.json);\n\n// Обрабатываем данные\nconst transformedOrders = orders.map(order => {\n    return {\n        json: {\n            // Определяем статус заказа\n            Status: order.isCancel ? \"Отмена\" : \"Доставка\",  // Если isCancel = 1 → \"Отмена\", иначе \"Доставка\"\n\n            Date_order: order.date,  // Дата заказа\n            Date_cancel: order.isCancel ? order.cancelDate : null,  // Дата отмены, если заказ отменен\n            Warehouse: order.warehouseName,  // Название склада\n            Warehouse_type: order.warehouseType,  // Тип склада\n            Country: order.countryName,  // Страна\n            Okrug: order.oblastOkrugName,  // Федеральный округ\n            Region: order.regionName,  // Регион\n            nmId: order.nmId,  // Номенклатурный ID\n            supplierArticle: order.supplierArticle,  // Артикул поставщика\n            Size: order.techSize,  // Размер\n            BC: order.barcode,  // Штрихкод\n            Brand: order.brand,  // Бренд\n            Category: order.category,  // Категория\n            Subject: order.subject,  // Тематика (например, Джинсы)\n            SPP: order.spp,  // Процент ССП\n            TotalPrice: parseFloat(order.totalPrice),  // Полная цена (переведена в число)\n            Discount: order.discountPercent,  // Скидка в %\n            priceWithDisc: parseFloat(order.priceWithDisc),  // Цена со скидкой (переведена в число)\n            finishedPrice: parseFloat(order.finishedPrice),  // Итоговая цена (переведена в число)\n            gNumber: order.gNumber,  // Номер заказа\n            srid: order.srid,  // SRID\n            orderType: order.orderType,  // Тип заказа\n\n            // Добавленные поля:\n            seller_id: order.seller_id || null,  // ID продавца (если есть, иначе null)\n            srid_seller_key: order.srid_seller_key || null  // Уникальный ключ продажи\n        }\n    };\n});\n\n// Возвращаем преобразованные данные\nreturn transformedOrders;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        1184
+      ],
+      "id": "d2f8e168-a419-443e-a3b0-d0b5030518c4",
+      "name": "update_data_orders"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Входные данные (из предыдущей ноды)\nconst sales = items.map(item => item.json);\n\n// Группируем данные по srid\nconst groupedSales = sales.reduce((acc, sale) => {\n    const sridKey = sale.srid;\n\n    // Если объект для srid ещё не создан – создаём заготовку\n    if (!acc[sridKey]) {\n        acc[sridKey] = {\n            // Даты и статус\n            Date_sales: null,\n            Date_return: null,\n            Status: null,\n\n            // Идентификаторы\n            srid: sale.srid,\n            seller_id: sale.seller_id || null,\n\n            // Атрибуты товара/заказа\n            Warehouse: sale.warehouseName,\n            Warehouse_type: sale.warehouseType,\n            Country: sale.countryName,\n            Okrug: sale.oblastOkrugName,\n            Region: sale.regionName,\n            nmId: sale.nmId,\n            supplierArticle: sale.supplierArticle,\n            Size: sale.techSize,\n            BC: sale.barcode,\n            Brand: sale.brand,\n            Category: sale.category,\n            Subject: sale.subject,\n            SPP: sale.spp,\n            gNumber: sale.gNumber,\n            orderType: sale.orderType,\n\n            // Финансовые показатели (инициализируем нулями)\n            // чтобы всегда были поля в результирующем объекте\n            TotalPrice: 0,\n            Discount: 0,\n            priceWithDisc: 0,\n            finishedPriceFact: 0,\n            paymentSaleAmount: 0,\n            forPay: 0,\n            ComWBRub: 0,\n            ComWBPercent: 0\n        };\n    }\n\n    // Определяем, это \"выкуп\" или \"возврат\"\n    const isSale = sale.saleID.startsWith(\"S\");\n    const isReturn = sale.saleID.startsWith(\"R\");\n\n    if (isSale) {\n        // Пишем дату продажи\n        acc[sridKey].Date_sales = sale.date;\n        // Сбрасываем дату возврата (если вдруг ранее она была)\n        acc[sridKey].Date_return = null;\n\n        // Заполняем данные \"как есть\" (без суммирования)\n        acc[sridKey].TotalPrice = parseFloat(sale.totalPrice);\n        acc[sridKey].Discount = sale.discountPercent;\n        acc[sridKey].priceWithDisc = parseFloat(sale.priceWithDisc);\n        acc[sridKey].finishedPriceFact = parseFloat(sale.finishedPrice);\n        acc[sridKey].paymentSaleAmount = parseFloat(sale.paymentSaleAmount);\n        acc[sridKey].forPay = parseFloat(sale.forPay);\n\n    } else if (isReturn) {\n        // Фиксируем дату возврата\n        acc[sridKey].Date_return = sale.date;\n        // Дату продажи не затираем — ведь мог быть сначала выкуп, а потом возврат\n        // но финансовые показатели будут от возврата\n\n        // Берём показатели по модулю, чтобы понимать «сумму» возврата\n        acc[sridKey].TotalPrice = Math.abs(parseFloat(sale.totalPrice));\n        acc[sridKey].Discount = sale.discountPercent;\n        acc[sridKey].priceWithDisc = Math.abs(parseFloat(sale.priceWithDisc));\n        acc[sridKey].finishedPriceFact = Math.abs(parseFloat(sale.finishedPrice));\n        acc[sridKey].paymentSaleAmount = Math.abs(parseFloat(sale.paymentSaleAmount));\n        acc[sridKey].forPay = Math.abs(parseFloat(sale.forPay));\n    }\n\n    return acc;\n}, {});\n\n// Формируем выходной массив\nconst result = Object.values(groupedSales).map(sale => {\n    // Определяем статус по датам\n    // Приоритет: если есть Date_return → \"Возврат\", иначе если есть Date_sales → \"Выкуп\"\n    if (sale.Date_return) {\n        sale.Status = \"Возврат\";\n    } else if (sale.Date_sales) {\n        sale.Status = \"Выкуп\";\n    }\n\n    // Округляем значения до двух знаков\n    sale.TotalPrice = Math.round(sale.TotalPrice * 100) / 100;\n    sale.priceWithDisc = Math.round(sale.priceWithDisc * 100) / 100;\n    sale.finishedPriceFact = Math.round(sale.finishedPriceFact * 100) / 100;\n    sale.paymentSaleAmount = Math.round(sale.paymentSaleAmount * 100) / 100;\n    sale.forPay = Math.round(sale.forPay * 100) / 100;\n\n    // Рассчитываем комиссию (рубли)\n    sale.ComWBRub = Math.round((sale.priceWithDisc - sale.forPay) * 100) / 100;\n\n    // Комиссия в процентах\n    sale.ComWBPercent = sale.priceWithDisc !== 0\n        ? Math.round(((sale.ComWBRub * 100) / sale.priceWithDisc) * 100) / 100\n        : 0;\n\n    // Если в итоге получилось 0 (обычно это при полном возврате),\n    // можно обнулить дополнительные поля\n    if (sale.finishedPriceFact === 0 && sale.forPay === 0) {\n        sale.ComWBRub = 0;\n        sale.ComWBPercent = 0;\n        sale.paymentSaleAmount = 0;\n    }\n\n    return { json: sale };\n});\n\n// Возвращаем результат\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        960
+      ],
+      "id": "e802886b-9837-4dc1-bd1b-4a5292469d9b",
+      "name": "update_data_sales"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "GS_RNP_ReportDetail",
+          "mode": "list",
+          "cachedResultName": "GS_RNP_ReportDetail"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "srid_seller_sale_key",
+        "valueToMatchOn": "={{ $json.srid +\"_\"+ $json.seller_id}}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "date_sales",
+              "value": "={{ $json.Date_sales }}"
+            },
+            {
+              "column": "date_return",
+              "value": "={{ $json.Date_return }}"
+            },
+            {
+              "column": "finishedPriceFact",
+              "value": "={{ $json.finishedPriceFact }}"
+            },
+            {
+              "column": "paymentSaleAmount",
+              "value": "={{ $json.paymentSaleAmount }}"
+            },
+            {
+              "column": "forPay",
+              "value": "={{ $json.forPay }}"
+            },
+            {
+              "column": "ComWBRub",
+              "value": "={{ $json.ComWBRub }}"
+            },
+            {
+              "column": "ComWBPercent",
+              "value": "={{ $json.ComWBPercent }}"
+            },
+            {
+              "column": "Warehouse",
+              "value": "={{ $json.Warehouse }}"
+            },
+            {
+              "column": "Warehouse_type",
+              "value": "={{ $json.Warehouse_type }}"
+            },
+            {
+              "column": "Country",
+              "value": "={{ $json.Country }}"
+            },
+            {
+              "column": "Okrug",
+              "value": "={{ $json.Okrug }}"
+            },
+            {
+              "column": "Region",
+              "value": "={{ $json.Region }}"
+            },
+            {
+              "column": "nmId",
+              "value": "={{ $json.nmId }}"
+            },
+            {
+              "column": "supplierArticle",
+              "value": "={{ $json.supplierArticle }}"
+            },
+            {
+              "column": "Size",
+              "value": "={{ $json.Size }}"
+            },
+            {
+              "column": "BC",
+              "value": "={{ $json.BC }}"
+            },
+            {
+              "column": "Brand",
+              "value": "={{ $json.Brand }}"
+            },
+            {
+              "column": "Category",
+              "value": "={{ $json.Category }}"
+            },
+            {
+              "column": "Subject",
+              "value": "={{ $json.Subject }}"
+            },
+            {
+              "column": "SPP",
+              "value": "={{ $json.SPP }}"
+            },
+            {
+              "column": "TotalPrice",
+              "value": "={{ $json.TotalPrice }}"
+            },
+            {
+              "column": "Discount",
+              "value": "={{ $json.Discount }}"
+            },
+            {
+              "column": "gNumber",
+              "value": "={{ $json.gNumber }}"
+            },
+            {
+              "column": "orderType",
+              "value": "={{ $json.orderType }}"
+            },
+            {
+              "column": "srid",
+              "value": "={{ $json.srid }}"
+            },
+            {
+              "column": "status",
+              "value": "={{ $json.Status }}"
+            },
+            {
+              "column": "priceWithDisc",
+              "value": "={{ $json.priceWithDisc }}"
+            },
+            {
+              "column": "finishedPrice",
+              "value": "={{ $json.finishedPriceFact }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2480,
+        1168
+      ],
+      "id": "9d0b21e8-bf42-4257-8107-fee8e8bdce64",
+      "name": "merge_sales",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "content": "## Заполняем данные по заказам и продажам в таблицу GS_RNP_ReportDetail\n",
+        "height": 960,
+        "width": 820
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -544,
+        640
+      ],
+      "id": "c78d6449-9ff7-4415-bcf3-f9c385cf38ea",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем массив всех элементов из входных данных\nconst items = $input.all();\n\n// Проверяем, исполнился ли узел \"send_logs_start07\"\nconst startNode = $node[\"send_logs_start_report\"];\nconst startTime = startNode && startNode.json && startNode.json.result \n    ? startNode.json.result.date \n    : Math.floor(Date.now() / 1000); // Берем текущее время, если узел не исполнился\n\n// Получаем текущее время (Unix timestamp)\nconst endTime = Math.floor(Date.now() / 1000);\n\n// Вычисляем время выполнения (разница в секундах)\nconst executionTime = endTime - startTime;\n\n// Конвертируем секунды в минуты и секунды\nconst minutes = Math.floor(executionTime / 60);\nconst seconds = executionTime % 60;\n\n// Подсчет количества успешных обновлений (success = true)\nconst successCount = items.filter(item => item.json && item.json.success === true).length;\n\n// Подсчет количества пустых итемов (означает \"нет заказов\")\nconst emptyCount = items.filter(item => Object.keys(item.json).length === 0).length;\n\n// Формируем итоговое сообщение с указанием времени выполнения\nconst summaryMessage = `<b>01 GS RNP | ReportDetail </b> завершен ✅\\n\\n` +\n    `Время: <b>${minutes} мин ${seconds} сек</b>\\n` +\n    `Обновлений БД: <b>${successCount}</b>\\n` +\n    `Нет заказов: <b>${emptyCount}</b>`;\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3152,
+        32
+      ],
+      "id": "d8516a3e-48bd-466b-a565-977ac736ecd5",
+      "name": "collapse",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -400,
+        1328
+      ],
+      "id": "13f87dd5-da81-4e0b-a3ca-987e90346ec8",
+      "name": "Loop_ordesales"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "df6eb790-ecec-47db-87a0-20196e430659",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -160,
+        1008
+      ],
+      "id": "786e82f5-b28f-4e15-835a-557f58c72554",
+      "name": "If4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0ee4ee1c-c004-41dd-966c-68ad8730875d",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2480,
+        784
+      ],
+      "id": "6f6944f2-bff7-4ec8-9223-c3b6cd9e4454",
+      "name": "If6"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>01 GS RNP | ReportDetail</b> | Запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        192,
+        0
+      ],
+      "id": "e8cb4b72-e29b-4856-a517-f67ba51e9510",
+      "name": "send_logs_start_report",
+      "webhookId": "44d40f44-c02e-48d3-8d20-40e69af04ebc",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "aff0b81d-ab4f-4ef2-a8b5-400318d1cb26",
+      "name": "Execute Workflow Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3152,
+        208
+      ],
+      "id": "8ee1f766-e8b8-4d4f-b027-4118acd542c6",
+      "name": "send_logs_finish",
+      "webhookId": "8442f0dd-5e91-40e8-b326-9479a54acf92",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO GS_RNP_ReportDetail (\n    srid_seller_sale_key,\n    seller_id,\n    Date_order,\n    Date_cancel,\n    Warehouse,\n    Warehouse_type,\n    Country,\n    Okrug,\n    Region,\n    nmId,\n    supplierArticle,\n    Size,\n    BC,\n    Brand,\n    Category,\n    Subject,\n    SPP,\n    TotalPrice,\n    Discount,\n    priceWithDisc,\n    finishedPrice,\n    gNumber,\n    srid,\n    orderType,\n    status\n)\nSELECT\n    -- Уникальный ключ (srid + \"_\" + seller_id)\n    CONCAT(srid, '_', seller_id) AS srid_seller_sale_key,\n    seller_id,\n\n    -- Дата заказа\n    `date` AS Date_order,\n\n    -- Дата отмены, если заказ отменён\n    CASE WHEN isCancel = 1 THEN cancelDate ELSE NULL END AS Date_cancel,\n\n    -- Данные о складе, стране и регионе\n    warehouseName       AS Warehouse,\n    warehouseType       AS Warehouse_type,\n    countryName         AS Country,\n    oblastOkrugName     AS Okrug,\n    regionName          AS Region,\n\n    -- Информация о товаре\n    nmId,\n    supplierArticle,\n    techSize            AS Size,\n    barcode             AS BC,\n    brand               AS Brand,\n    category            AS Category,\n    subject             AS Subject,\n\n    -- Процент ССП\n    spp                 AS SPP,\n\n    -- Ценовые поля (если нужно, можно явно приводить к DECIMAL)\n    totalPrice          AS TotalPrice,\n    discountPercent     AS Discount,\n    priceWithDisc       AS priceWithDisc,\n    finishedPrice       AS finishedPrice,\n\n    -- Номер заказа и SRID\n    gNumber,\n    srid,\n\n    -- Тип заказа (Клиентский и т.д.)\n    orderType,\n\n    -- Статус (если isCancel=1, то 'Отмена', иначе 'Доставка')\n    CASE WHEN isCancel = 1 THEN 'Отмена' ELSE 'Доставка' END AS status\nFROM WB_orders\n-- При необходимости указываем условие отбора, например:\n-- WHERE seller_id = 'нужный_seller_id'\nON DUPLICATE KEY UPDATE\n  seller_id       = VALUES(seller_id),\n  Date_order      = VALUES(Date_order),\n  Date_cancel     = VALUES(Date_cancel),\n  Warehouse       = VALUES(Warehouse),\n  Warehouse_type  = VALUES(Warehouse_type),\n  Country         = VALUES(Country),\n  Okrug           = VALUES(Okrug),\n  Region          = VALUES(Region),\n  nmId            = VALUES(nmId),\n  supplierArticle = VALUES(supplierArticle),\n  Size            = VALUES(Size),\n  BC              = VALUES(BC),\n  Brand           = VALUES(Brand),\n  Category        = VALUES(Category),\n  Subject         = VALUES(Subject),\n  SPP             = VALUES(SPP),\n  TotalPrice      = VALUES(TotalPrice),\n  Discount        = VALUES(Discount),\n  priceWithDisc   = VALUES(priceWithDisc),\n  finishedPrice   = VALUES(finishedPrice),\n  gNumber         = VALUES(gNumber),\n  srid            = VALUES(srid),\n  orderType       = VALUES(orderType),\n  status          = VALUES(status);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        768,
+        1200
+      ],
+      "id": "f5da1e55-ee6d-4b80-949e-fb2de8a2dcf3",
+      "name": "MySQL"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        704,
+        0
+      ],
+      "id": "f145e0bc-2295-45d4-a50c-40690281d77d",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем уникальные seller_id\nconst sellerList = [];\nconst sellerMap = {};\n\nitems.forEach(item => {\n  const sId = item.json.seller_id;\n  if (sId && !sellerMap[sId]) {\n    sellerMap[sId] = true;\n    sellerList.push(sId);\n  }\n});\n\n// Общее число уникальных селлеров\nconst totalSellers = sellerList.length;\n\n// Формируем выходные итемы\nreturn items.map((item) => {\n  const brand = item.json.wb_api_brand || 'Не указан';\n  const sId = item.json.seller_id;\n\n  // Находим индекс данного seller_id в массиве уникальных селлеров\n  // +1, потому что нам нужна нумерация с 1\n  const sellerIndex = sellerList.indexOf(sId) + 1;\n\n  // Формируем текст\n  const text = `<b>Селлер:</b> ${sellerIndex} из ${totalSellers}\\n<b>Бренд:</b> ${brand}`;\n\n  // Возвращаем обновлённый item\n  return {\n    json: {\n      ...item.json,\n      text,\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "fd2c2af6-8318-4d79-ba8f-d32cd7d55f2b",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO GS_RNP_ReportDetail (\n    srid_seller_sale_key,\n    seller_id,\n    Date_order,\n    Date_cancel,\n    Warehouse,\n    Warehouse_type,\n    Country,\n    Okrug,\n    Region,\n    nmId,\n    supplierArticle,\n    Size,\n    BC,\n    Brand,\n    Category,\n    Subject,\n    SPP,\n    TotalPrice,\n    Discount,\n    priceWithDisc,\n    finishedPrice,\n    gNumber,\n    srid,\n    orderType,\n    status\n)\nSELECT\n    CONCAT(srid, '_', seller_id) AS srid_seller_sale_key,\n    seller_id,\n    `date` AS Date_order,\n    CASE WHEN isCancel = 1 THEN cancelDate ELSE NULL END AS Date_cancel,\n    warehouseName       AS Warehouse,\n    warehouseType       AS Warehouse_type,\n    countryName         AS Country,\n    oblastOkrugName     AS Okrug,\n    regionName          AS Region,\n    nmId,\n    supplierArticle,\n    techSize            AS Size,\n    barcode             AS BC,\n    brand               AS Brand,\n    category            AS Category,\n    subject             AS Subject,\n    spp                 AS SPP,\n    totalPrice          AS TotalPrice,\n    discountPercent     AS Discount,\n    priceWithDisc       AS priceWithDisc,\n    finishedPrice       AS finishedPrice,\n    gNumber,\n    srid,\n    orderType,\n    CASE WHEN isCancel = 1 THEN 'Отмена' ELSE 'Доставка' END AS status\nFROM WB_orders\nWHERE seller_id = '{{ $json[\"seller_id\"] }}'\nON DUPLICATE KEY UPDATE\n  seller_id       = VALUES(seller_id),\n  Date_order      = VALUES(Date_order),\n  Date_cancel     = VALUES(Date_cancel),\n  Warehouse       = VALUES(Warehouse),\n  Warehouse_type  = VALUES(Warehouse_type),\n  Country         = VALUES(Country),\n  Okrug           = VALUES(Okrug),\n  Region          = VALUES(Region),\n  nmId            = VALUES(nmId),\n  supplierArticle = VALUES(supplierArticle),\n  Size            = VALUES(Size),\n  BC              = VALUES(BC),\n  Brand           = VALUES(Brand),\n  Category        = VALUES(Category),\n  Subject         = VALUES(Subject),\n  SPP             = VALUES(SPP),\n  TotalPrice      = VALUES(TotalPrice),\n  Discount        = VALUES(Discount),\n  priceWithDisc   = VALUES(priceWithDisc),\n  finishedPrice   = VALUES(finishedPrice),\n  gNumber         = VALUES(gNumber),\n  srid            = VALUES(srid),\n  orderType       = VALUES(orderType),\n  status          = VALUES(status);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        928,
+        224
+      ],
+      "id": "0e842dc8-3e9f-46db-9649-3a5150a823d4",
+      "name": "input_orders",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "=<b>01 GS RNP | ReportDetail</b>\n▫️ Этап 1 | Обработка заказов\n{{ $('Loop').item.json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        224
+      ],
+      "id": "918711d4-4a3f-43d6-9940-a0ecea38cab1",
+      "name": "send_logs_finish1",
+      "webhookId": "8442f0dd-5e91-40e8-b326-9479a54acf92",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем все входные данные в массив\nconst allData = items.map(item => item.json);\n\n// Возвращаем один итем, содержащий массив всех данных\nreturn [\n  {\n    json: {\n      mergedData: allData,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1632,
+        0
+      ],
+      "id": "02129ac6-3461-4818-9015-d6d1eb9f7d78",
+      "name": "Code1",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": {
+          "__rl": true,
+          "value": "WB_sellers",
+          "mode": "list",
+          "cachedResultName": "WB_sellers"
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        1632,
+        224
+      ],
+      "id": "f4208711-a792-49a3-90a4-b69274470aeb",
+      "name": "get_all_sellers1",
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0dac9c1b-4162-4ad7-aea3-dc57686bac33",
+              "leftValue": "={{ $json.gs_rnp_access }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1888,
+        224
+      ],
+      "id": "c161f123-38b6-41c1-9cb1-d9320529f145",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем уникальные seller_id\nconst sellerList = [];\nconst sellerMap = {};\n\nitems.forEach(item => {\n  const sId = item.json.seller_id;\n  if (sId && !sellerMap[sId]) {\n    sellerMap[sId] = true;\n    sellerList.push(sId);\n  }\n});\n\n// Общее число уникальных селлеров\nconst totalSellers = sellerList.length;\n\n// Формируем выходные итемы\nreturn items.map((item) => {\n  const brand = item.json.wb_api_brand || 'Не указан';\n  const sId = item.json.seller_id;\n\n  // Находим индекс данного seller_id в массиве уникальных селлеров\n  // +1, потому что нам нужна нумерация с 1\n  const sellerIndex = sellerList.indexOf(sId) + 1;\n\n  // Формируем текст\n  const text = `<b>Селлер:</b> ${sellerIndex} из ${totalSellers}\\n<b>Бренд:</b> ${brand}`;\n\n  // Возвращаем обновлённый item\n  return {\n    json: {\n      ...item.json,\n      text,\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        0
+      ],
+      "id": "aecdae9b-792a-4c82-b7e2-33ee872cc57b",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2160,
+        0
+      ],
+      "id": "060ed5cf-eeae-48a0-950e-53bc7b66e7a0",
+      "name": "Loop1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO GS_RNP_ReportDetail (\n    srid_seller_sale_key,\n    seller_id,\n    date_sales,\n    date_return,\n    finishedPriceFact,\n    paymentSaleAmount,\n    forPay,\n    ComWBRub,\n    ComWBPercent,\n    Warehouse,\n    Warehouse_type,\n    Country,\n    Okrug,\n    Region,\n    nmId,\n    supplierArticle,\n    Size,\n    BC,\n    Brand,\n    Category,\n    Subject,\n    SPP,\n    TotalPrice,\n    Discount,\n    gNumber,\n    srid,\n    orderType,\n    status,\n    priceWithDisc,\n    finishedPrice\n)\nSELECT\n  /* Уникальный ключ: srid + \"_\" + seller_id */\n  CONCAT(w.srid, '_', w.seller_id) AS srid_seller_sale_key,\n\n  w.seller_id,\n\n  /* Самая поздняя дата продажи (если продажи были) */\n  ls.lastSaleDate AS date_sales,\n\n  /* Самая поздняя дата возврата (если возвраты были) */\n  lr.lastReturnDate AS date_return,\n\n  /* Финальные поля берём из «последнего события» (по дате) */\n  ABS(w.finishedPrice)     AS finishedPriceFact,\n  ABS(w.paymentSaleAmount) AS paymentSaleAmount,\n  ABS(w.forPay)            AS forPay,\n\n  /* Комиссия WB в рублях */\n  ROUND(ABS(w.priceWithDisc) - ABS(w.forPay), 2) AS ComWBRub,\n\n  /* Комиссия WB в % */\n  CASE\n    WHEN ABS(w.priceWithDisc) != 0\n    THEN ROUND(( (ABS(w.priceWithDisc) - ABS(w.forPay)) * 100 / ABS(w.priceWithDisc) ), 2)\n    ELSE 0\n  END AS ComWBPercent,\n\n  /* Общие данные по месту и товару (из последней записи w) */\n  w.warehouseName   AS Warehouse,\n  w.warehouseType   AS Warehouse_type,\n  w.countryName     AS Country,\n  w.oblastOkrugName AS Okrug,\n  w.regionName      AS Region,\n  w.nmId,\n  w.supplierArticle,\n  w.techSize        AS Size,\n  w.barcode         AS BC,\n  w.brand           AS Brand,\n  w.category        AS Category,\n  w.subject         AS Subject,\n  w.spp             AS SPP,\n\n  /* Цены по модулю, как в JavaScript */\n  ABS(w.totalPrice)     AS TotalPrice,\n  w.discountPercent     AS Discount,\n  w.gNumber,\n  w.srid,\n  w.orderType,\n\n  /* Статус: если был возврат → Возврат, иначе если была продажа → Выкуп */\n  CASE\n    WHEN lr.lastReturnDate IS NOT NULL THEN 'Возврат'\n    WHEN ls.lastSaleDate   IS NOT NULL THEN 'Выкуп'\n    ELSE NULL\n  END AS status,\n\n  /* Цена со скидкой (по модулю) */\n  ABS(w.priceWithDisc)   AS priceWithDisc,\n\n  /* Для поля finishedPrice тоже используем finishedPriceFact */\n  ABS(w.finishedPrice)    AS finishedPrice\n\nFROM\n  /* (1) Находим для каждой пары (srid, seller_id) последнюю запись */\n  (\n    SELECT\n      srid,\n      seller_id,\n      MAX(`date`) AS lastEventDate\n    FROM WB_sales\n    GROUP BY srid, seller_id\n  ) le\n  /* Присоединяем таблицу WB_sales, чтобы взять самую «свежую» запись */\n  JOIN WB_sales w\n    ON  w.srid      = le.srid\n    AND w.seller_id = le.seller_id\n    AND w.`date`    = le.lastEventDate\n\n  /* (2) Самая поздняя дата возврата (если saleID LIKE 'R%') */\n  LEFT JOIN (\n    SELECT\n      srid,\n      seller_id,\n      MAX(`date`) AS lastReturnDate\n    FROM WB_sales\n    WHERE saleID LIKE 'R%'\n    GROUP BY srid, seller_id\n  ) lr\n    ON lr.srid      = le.srid\n    AND lr.seller_id = le.seller_id\n\n  /* (3) Самая поздняя дата продажи (saleID LIKE 'S%') */\n  LEFT JOIN (\n    SELECT\n      srid,\n      seller_id,\n      MAX(`date`) AS lastSaleDate\n    FROM WB_sales\n    WHERE saleID LIKE 'S%'\n    GROUP BY srid, seller_id\n  ) ls\n    ON ls.srid      = le.srid\n    AND ls.seller_id = le.seller_id\n\n/* (4) Фильтр по seller_id динамически из n8n */\nWHERE w.seller_id = '{{ $json[\"seller_id\"] }}'\n\n/* (5) Если уже есть такая запись – обновляем поля */\nON DUPLICATE KEY UPDATE\n  seller_id         = VALUES(seller_id),\n  date_sales        = VALUES(date_sales),\n  date_return       = VALUES(date_return),\n  finishedPriceFact = VALUES(finishedPriceFact),\n  paymentSaleAmount = VALUES(paymentSaleAmount),\n  forPay            = VALUES(forPay),\n  ComWBRub          = VALUES(ComWBRub),\n  ComWBPercent      = VALUES(ComWBPercent),\n  Warehouse         = VALUES(Warehouse),\n  Warehouse_type    = VALUES(Warehouse_type),\n  Country           = VALUES(Country),\n  Okrug             = VALUES(Okrug),\n  Region            = VALUES(Region),\n  nmId              = VALUES(nmId),\n  supplierArticle   = VALUES(supplierArticle),\n  Size              = VALUES(Size),\n  BC                = VALUES(BC),\n  Brand             = VALUES(Brand),\n  Category          = VALUES(Category),\n  Subject           = VALUES(Subject),\n  SPP               = VALUES(SPP),\n  TotalPrice        = VALUES(TotalPrice),\n  Discount          = VALUES(Discount),\n  gNumber           = VALUES(gNumber),\n  srid              = VALUES(srid),\n  orderType         = VALUES(orderType),\n  status            = VALUES(status),\n  priceWithDisc     = VALUES(priceWithDisc),\n  finishedPrice     = VALUES(finishedPrice);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2384,
+        224
+      ],
+      "id": "025dfa3c-7e4d-458f-8b24-08122487f7c4",
+      "name": "input_orders1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "=<b>01 GS RNP | ReportDetail</b>\n☑️ Этап 1 | Обработка заказов\n▫️ Этап 2 | Обработка продаж\n{{ $('Loop1').item.json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2608,
+        224
+      ],
+      "id": "6e536ec9-6e6f-4d6f-9713-2f7d82fc4148",
+      "name": "send_logs_finish2",
+      "webhookId": "8442f0dd-5e91-40e8-b326-9479a54acf92",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "L1EQloODLXpeWMTD",
+          "mode": "list",
+          "cachedResultName": "11 DB | PURPRICE"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        3152,
+        448
+      ],
+      "id": "27e8ebf8-e817-433a-a2cc-791cf5d167ac",
+      "name": "Call '11 DB | PURPRICE'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_all_sellers": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_data_sales": {
+      "main": [
+        [
+          {
+            "node": "merge_sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_orders": {
+      "main": [
+        [
+          {
+            "node": "If4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_ordesales": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_all_sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If4": {
+      "main": [
+        [
+          {
+            "node": "update_data_orders",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop_ordesales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If6": {
+      "main": [
+        [
+          {
+            "node": "update_data_sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start_report": {
+      "main": [
+        [
+          {
+            "node": "get_all_sellers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start_report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish": {
+      "main": [
+        [
+          {
+            "node": "Call '11 DB | PURPRICE'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "input_orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "input_orders": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish1": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_sellers1": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "get_all_sellers1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop1": {
+      "main": [
+        [
+          {
+            "node": "collapse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "input_orders1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "input_orders1": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish2": {
+      "main": [
+        [
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "Loop1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ed82b947-2797-4ca5-822c-591cc1847da3",
+  "meta": {
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "IvwANgFS101yqSLk",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.517Z",
+      "updatedAt": "2025-10-10T12:03:26.517Z",
+      "id": "VJZ1GKkGN6Id3ylE",
+      "name": "30 min"
+    },
+    {
+      "createdAt": "2025-10-15T12:39:15.749Z",
+      "updatedAt": "2025-10-15T12:39:15.749Z",
+      "id": "kKc7aGJkadBwn3P4",
+      "name": "GS RNP"
+    }
+  ]
+}

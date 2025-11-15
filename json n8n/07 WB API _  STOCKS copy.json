@@ -1,0 +1,1113 @@
+{
+  "name": "07 WB API |  STOCKS copy",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -4288,
+        784
+      ],
+      "id": "7e2a38d8-7703-4eca-bba5-43ff838de174",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — build_stocks_requests v1.0\n * Назначение:\n *   Сформировать по каждому селлеру запрос на актуальные остатки (STOCKS) \"в моменте\".\n *   Эмиссия: по 1 item на селлера, без дат и без задержек.\n *\n * Ожидаемый вход (json каждого item):\n *   - seller_id: string\n *   - wb_api_brand: string\n *   - wb_api | wb_api_key: string\n */\n\nconst src = $input.all();\n\n/* ── Хелперы ─────────────────────────────────── */\nconst escapeHtml = (s) =>\n  String(s ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\n/* ── Сбор по селлерам (устраняем дубли по seller_id) ── */\nconst perSeller = new Map();\n/**\n * perSeller[seller_id] = { brand, token, idx }\n */\nfor (let i = 0; i < src.length; i++) {\n  const j = src[i]?.json || {};\n  const seller_id = String(j.seller_id ?? '').trim();\n  if (!seller_id) continue;\n\n  const brand = String(j.wb_api_brand ?? seller_id).trim();\n  const token = String(j.wb_api ?? j.wb_api_key ?? '').trim();\n\n  if (!perSeller.has(seller_id)) {\n    perSeller.set(seller_id, { brand, token, idx: i });\n  }\n}\n\nconst all = Array.from(perSeller.entries())\n  .map(([seller_id, v]) => ({ seller_id, ...v }))\n  .sort((a, b) => a.brand.localeCompare(b.brand, 'ru'));\n\n/* ── Короткий summary (опционально) ──────────── */\nconst summaryText = all\n  .map((s, i) => `${i + 1}. ${s.brand} | ${s.seller_id}`)\n  .join('\\n');\n\n/* ── Эмиссия (по 1 item на селлера) ──────────── */\nconst total = all.length;\nconst out = [];\n\nfor (let i = 0; i < all.length; i++) {\n  const s = all[i];\n  const { seller_id, brand, token } = s;\n\n  out.push({\n    json: {\n      seller_id,\n      wb_api_brand: brand,\n      wb_api: token,\n      text: summaryText,\n      texttg:\n        `<b>7 WB API | STOCKS</b>\\n` +\n        `<blockquote>` +\n        `1 этап. Создаем отчеты\\n` +\n        `Бренд: ${escapeHtml(brand)}\\n` +\n        `Всего: ${i + 1} из ${total}\\n` +\n        `</blockquote>`\n    }\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3744,
+        576
+      ],
+      "id": "f629b843-037d-4ca6-9ed1-a8008500997a",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  s.seller_id,\n  s.wb_api_key,\n  s.wb_api_brand\nFROM WB_sellers AS s\nJOIN WB_sellers_updates AS su\n  ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -3744,
+        784
+      ],
+      "id": "5a2e8d4d-50f5-4805-a431-5cf0f6eefe3b",
+      "name": "get_all_token",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 1000,
+      "executeOnce": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>07 WB API | STOCKS</b> запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -3952,
+        784
+      ],
+      "id": "1863d424-dd72-40f8-8b27-90ab20951a9a",
+      "name": "send_start",
+      "webhookId": "45ea7f34-f6e4-4419-b547-29fe6e57ee1e",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<blockquote>{{ $json.text }}</blockquote>",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -3408,
+        384
+      ],
+      "id": "39a61ca2-c64b-4b3b-9d7d-8578626f980b",
+      "name": "send_step_1",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": true,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -3408,
+        576
+      ],
+      "id": "37e853f0-a4b4-402d-986f-f2e002961236",
+      "name": "Loop"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_start').first().json.result.message_id }}",
+        "text": "={{ $json.texttg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -3328,
+        832
+      ],
+      "id": "2f8f2581-d103-484b-b57d-f94f9553b072",
+      "name": "send_create",
+      "webhookId": "81793ac4-76a7-43f2-bd8e-870af5c5a6d8",
+      "executeOnce": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "groupByBrand",
+              "value": "true"
+            },
+            {
+              "name": "groupBySubject",
+              "value": "true"
+            },
+            {
+              "name": "groupBySa",
+              "value": "true"
+            },
+            {
+              "name": "groupByNm",
+              "value": "true"
+            },
+            {
+              "name": "groupByBarcode",
+              "value": "true"
+            },
+            {
+              "name": "groupBySize",
+              "value": "true"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Loop').item.json.wb_api }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "9cd7e0a5-8a67-45f1-afa7-b5a51bbf6369",
+      "name": "get_create",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -3120,
+        832
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -2912,
+        816
+      ],
+      "id": "cf65a763-2afd-4534-9018-9f8eb19a4ebe",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "amount": 20
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -1696,
+        560
+      ],
+      "id": "d6cb31ca-ae4a-4a03-a02e-6ef319da275a",
+      "name": "Wait",
+      "webhookId": "32e77a19-ff8b-4182-a53f-1a781610d480"
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -2704,
+        816
+      ],
+      "id": "f3db537b-70bd-41d0-9662-fc49c189e2bc",
+      "name": "Wait2",
+      "webhookId": "ee5558a7-6549-47de-b672-bc3b9fcdb342"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_create').first().json.result.message_id }}",
+        "text": "={{ $json.text }}\n\n<blockquote>Задержка 1 минута</blockquote>",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1696,
+        400
+      ],
+      "id": "e0ba46f1-8f3e-4fd9-9043-4bedc82a0355",
+      "name": "send_logs_start_step2",
+      "webhookId": "f00f3d1b-6f5b-4d4c-b40e-c09f3455d43c",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -1488,
+        560
+      ],
+      "id": "08333546-b775-4dac-9320-44c29fd7df57",
+      "name": "Loop5"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_start').first().json.result.message_id }}",
+        "text": "={{ $json.texttg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1440,
+        816
+      ],
+      "id": "317ffbc0-6c9a-42e2-a8df-4e27bf31c60e",
+      "name": "send_logs_start_step3",
+      "webhookId": "45ea7f34-f6e4-4419-b547-29fe6e57ee1e",
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        -1008,
+        800
+      ],
+      "id": "8a964caa-d9c6-4bdd-9a9d-b1d43d7b9a07",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — STOCKS → flatten taskId + TG text v1.1\n *\n * Вход (каждый item.json):\n *   - wb_api_brand: string\n *   - text: string (опционально, может содержать нумерованный список брендов)\n *   - data: any (ищем taskId внутри)\n *\n * Выход:\n *   - json.taskId\n *   - json.texttg  (по требуемому шаблону)\n *   - json.text    (оставляем как есть, если был)\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* ── Утилиты ─────────────────────────────────── */\nconst escapeHtml = (s) =>\n  String(s ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\nfunction extractTaskId(data) {\n  if (!data) return null;\n  if (typeof data.taskId === 'string' && data.taskId.trim()) return data.taskId.trim();\n  if (data.result && typeof data.result.taskId === 'string' && data.result.taskId.trim()) {\n    return data.result.taskId.trim();\n  }\n  if (Array.isArray(data)) {\n    for (const x of data) {\n      if (x && typeof x.taskId === 'string' && x.taskId.trim()) return x.taskId.trim();\n    }\n  }\n  return null;\n}\n\n/* ── Пытаемся извлечь порядок брендов из baseline text (если он нумерованный) ──\n   Ожидаемый формат строк:\n   \"1. <Бренд> | <seller_id>\"\n*/\nlet baselineText = '';\nfor (const it of items) {\n  const t = it.json?.text;\n  if (t && String(t).trim()) { baselineText = String(t); break; }\n}\nconst baselineOrder = [];\nif (baselineText) {\n  const lines = baselineText.split(/\\r?\\n/);\n  for (const line of lines) {\n    const m = line.match(/^\\s*\\d+\\.\\s*([^|]+?)\\s*(?:\\|.*)?$/);\n    if (m) {\n      const brand = m[1].trim();\n      if (brand) baselineOrder.push(brand);\n    }\n  }\n}\n\n/* ── Строим индекс «позиция селлера» ── */\nconst brandOrderFromItems = [];\nfor (const it of items) {\n  const b = String(it.json?.wb_api_brand || '').trim();\n  if (b && !brandOrderFromItems.includes(b)) brandOrderFromItems.push(b);\n}\n\n// Итоговый порядок: baseline → затем то, чего нет в baseline, в порядке входа\nconst finalOrder = [...baselineOrder];\nfor (const b of brandOrderFromItems) {\n  if (!finalOrder.includes(b)) finalOrder.push(b);\n}\n// Если baseline пустой, будет просто порядок входа\nconst brandIndex = new Map();\nfor (let i = 0; i < finalOrder.length; i++) brandIndex.set(finalOrder[i], i + 1);\n\nconst total = items.length;\n\n/* ── Эмиссия ── */\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const it = items[i];\n  const j = { ...(it.json || {}) };\n\n  const brand = String(j.wb_api_brand || '').trim();\n  const taskId = extractTaskId(j.data);\n  j.taskId = taskId || null;\n\n  const brandEsc = escapeHtml(brand || '—');\n  const taskIdEsc = escapeHtml(taskId || '—');\n\n  // Позиция: сначала пробуем по финальному порядку брендов, иначе — по индексу итема\n  const idx = brandIndex.get(brand) || (i + 1);\n\n  j.texttg =\n    `<b>7 WB API | STOCKS</b>\\n` +\n    `<blockquote>` +\n    `✅ Этап 1. Созданы отчеты\\n` +\n    `▫️ Этап 2. Сбор данных\\n` +\n    `Бренд: ${brandEsc}\\n` +\n    `TaskId: ${taskIdEsc}\\n` +\n    `Всего: ${idx} из ${total}\\n` +\n    `</blockquote>`;\n\n  out.push({ json: j });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1968,
+        560
+      ],
+      "id": "a6aa7215-011f-4853-96bc-b30185b0172e",
+      "name": "create_item"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "WB_stocks_v2",
+          "mode": "list",
+          "cachedResultName": "WB_stocks_v2"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_bc_key",
+        "valueToMatchOn": "={{ $json.seller_id +\"_\"+ $json.barcode }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "subjectName",
+              "value": "={{ $json.subjectName }}"
+            },
+            {
+              "column": "vendorCode",
+              "value": "={{ $json.vendorCode }}"
+            },
+            {
+              "column": "nmId",
+              "value": "={{ $json.nmId }}"
+            },
+            {
+              "column": "barcode",
+              "value": "={{ $json.barcode }}"
+            },
+            {
+              "column": "techSize",
+              "value": "={{ $json.techSize }}"
+            },
+            {
+              "column": "volume",
+              "value": "={{ $json.volume }}"
+            },
+            {
+              "column": "quantity",
+              "value": "={{ $json.quantity }}"
+            },
+            {
+              "column": "inWayToClient",
+              "value": "={{ $json.inWayToClient }}"
+            },
+            {
+              "column": "inWayFromClient",
+              "value": "={{ $json.inWayFromClient }}"
+            },
+            {
+              "column": "quantityFull",
+              "value": "={{ $json.quantityFull }}"
+            },
+            {
+              "column": "warehouses",
+              "value": "={{ JSON.stringify($json.warehouses) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        480,
+        128
+      ],
+      "id": "f2d70ad4-7ebc-45fb-af1a-2821c2a1b235",
+      "name": "upsert_data_in_final1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 1000,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        208,
+        -96
+      ],
+      "id": "38ab9381-0521-4011-bc1c-00f5ff1a8841",
+      "name": "Loop4"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_start').first().json.result.message_id }}",
+        "text": "={{ $('Loop4').first().json.texttg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        128
+      ],
+      "id": "1a806564-6544-4100-b079-59eb8cbd1658",
+      "name": "send_logs_finish1",
+      "webhookId": "45ea7f34-f6e4-4419-b547-29fe6e57ee1e",
+      "executeOnce": false,
+      "retryOnFail": false,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_start').first().json.result.message_id }}",
+        "text": "=<b>13 WB API | Storage Fee</b>\n☑️ Этап 1. Создание отчетов taskID\n☑️ Этап 2. Сбор данных по API WB\n☑️ Этап 3. Сохранение данных в БД \n{{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        704,
+        -112
+      ],
+      "id": "7314d5cc-be34-417c-ac1d-a502eb88b026",
+      "name": "send_logs_finish2",
+      "webhookId": "45ea7f34-f6e4-4419-b547-29fe6e57ee1e",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Добавление данных бачами по 1000 шт",
+        "height": 580,
+        "width": 1060
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        -176
+      ],
+      "id": "94237616-8cd5-4f22-aa75-1c2330c04027",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — WB STOCKS → prepare insert v2.0\n *\n * Что делает:\n * 1) Отбрасывает селлеров с ошибками WB или без barcode.\n * 2) Извлекает из warehouses:\n *      - quantity        = \"Всего находится на складах\"\n *      - inWayToClient   = \"В пути до получателей\"\n *      - inWayFromClient = \"В пути возвраты на склад WB\"\n *      - quantityFull    = сумма трёх выше.\n * 3) Формирует texttg:\n *    <b>07 WB API | STOCKS</b>\n *    ✅ Этап 1. Созданы отчеты\n *    ✅ Этап 2. Сбор данных\n *    ▫️ Этап 3. Сохранение данных\n *    Селлер: x из y\n *    Бренд: ...\n *    Итем селлера: ...\n *    Всего итемов: ...\n * 4) Возвращает готовые объекты для записи в таблицу WB_stocks_v2.\n */\n\nconst items = $input.all();\n\n/* ── helpers ─────────────────────────────────── */\nconst escapeHtml = (s) =>\n  String(s ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\nconst hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);\nconst fmtInt = (n) => Number(n).toLocaleString('ru-RU').replace(',', ' ');\n\n/* ── 1) фильтр: убираем ошибки и пустые barcode ─ */\nconst valid = items.filter(it => {\n  const j = it.json || {};\n  const barcode = String(j.barcode ?? '').trim();\n  const err = j.error || j.errorMessage || j.message?.toString?.().match?.(/error|ошиб/i);\n  return barcode && !err;\n});\nif (!valid.length) return [];\n\n/* ── 2) группировка по брендам для нумерации ─ */\nconst perBrand = new Map();\nfor (const { json } of valid) {\n  const brand = String(json.wb_api_brand ?? '').trim() || String(json.seller_id ?? '').trim();\n  if (!perBrand.has(brand)) perBrand.set(brand, []);\n  perBrand.get(brand).push(json);\n}\nconst brands = Array.from(perBrand.keys());\nbrands.sort((a, b) => a.localeCompare(b, 'ru'));\n\n/* ── 3) Основная обработка ─ */\nconst totalGrouped = valid.length;\nconst out = [];\n\nlet globalIdx = 0;\nfor (let bIdx = 0; bIdx < brands.length; bIdx++) {\n  const brand = brands[bIdx];\n  const arr = perBrand.get(brand);\n  const y = arr.length;\n  const sellerIdx = bIdx + 1;\n  const sellersTotal = brands.length;\n\n  for (let i = 0; i < arr.length; i++) {\n    globalIdx++;\n    const j = arr[i];\n\n    const brandEsc = escapeHtml(brand);\n\n    // --- warehouses парсинг ---\n    const whs = Array.isArray(j.warehouses) ? j.warehouses : [];\n    const findQty = (name) => {\n      const f = whs.find(w => String(w.warehouseName ?? '').trim() === name);\n      return f ? Number(f.quantity || 0) : 0;\n    };\n\n    const quantity        = findQty('Всего находится на складах');\n    const inWayToClient   = findQty('В пути до получателей');\n    const inWayFromClient = findQty('В пути возвраты на склад WB');\n    const quantityFull    = quantity + inWayToClient + inWayFromClient;\n\n    const row = {\n      seller_id: j.seller_id,\n      seller_bc_key: `${j.seller_id}_${j.barcode}`,\n      subjectName: j.subjectName ?? null,\n      vendorCode: j.vendorCode ?? null,\n      nmId: j.nmId ?? null,\n      barcode: j.barcode ?? null,\n      techSize: j.techSize ?? null,\n      volume: j.volume ?? null,\n      quantity,\n      inWayToClient,\n      inWayFromClient,\n      quantityFull,\n      warehouses: whs, // сохранится в JSON-формате\n      texttg:\n        `<b>07 WB API | STOCKS</b>\\n` +\n        `<blockquote>` +\n        `✅ Этап 1. Созданы отчеты\\n` +\n        `✅ Этап 2. Сбор данных\\n` +\n        `▫️ Этап 3. Сохранение данных\\n` +\n        `Селлер: ${fmtInt(sellerIdx)} из ${fmtInt(sellersTotal)}\\n` +\n        `Бренд: ${brandEsc}\\n` +\n        `Итем селлера: ${fmtInt(i + 1)} из ${fmtInt(y)}\\n` +\n        `Всего итемов: ${fmtInt(globalIdx)} из ${fmtInt(totalGrouped)}\\n` +\n        `</blockquote>`\n    };\n\n    out.push({ json: row });\n  }\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        -96
+      ],
+      "id": "92561af8-2788-4203-a8bd-3a2f0121c264",
+      "name": "Code6"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все входящие элементы\nconst items = $input.all();\n\n// Безопасно получаем стартовое время из узла\nconst startNode = $node[\"send_start\"];\nconst startTime = startNode?.json?.result?.date;\n\n// Заголовок\nlet summaryMessage = ` `;\n\nif (startTime) {\n  const endTime = Math.floor(Date.now() / 1000);\n  const executionTime = endTime - startTime;\n  const minutes = Math.floor(executionTime / 60);\n  const seconds = executionTime % 60;\n  summaryMessage += `<blockquote>Время: ${minutes} мин ${seconds} сек</blockquote>`;\n}\n\nreturn [{ json: { message: summaryMessage } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -112
+      ],
+      "id": "61613963-32b7-4527-a4b5-0cbc519a43b6",
+      "name": "collapse",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": {
+          "__rl": true,
+          "value": "WB_sellers_updates",
+          "mode": "list",
+          "cachedResultName": "WB_sellers_updates"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_id",
+        "valueToMatchOn": "={{ $json.seller_id }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "paid_storage_status",
+              "value": "={{ JSON.stringify($json.paid_storage_status) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -16,
+        784
+      ],
+      "id": "c78a8bae-380a-44b9-a01c-dcd7f859c35f",
+      "name": "ins_upd_adexpenses",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>14 WB API | PAID STORAGE</b>\n<blockquote><b>Статус обновлен ✅</b>\n{{ $('create_status').first().json.text }}\n</blockquote>\n",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -288,
+        1024
+      ],
+      "id": "26196fd2-fa4b-4655-b325-6f1eae0f1f1b",
+      "name": "send_finish",
+      "webhookId": "aae4a473-2aa1-4a36-9c27-794f7b994377",
+      "retryOnFail": true,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "vrSpdEfvPSd3QMe6",
+          "name": "Мия AI [RNP]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — build_paid_storage_status v1.1\n *\n * Что делает:\n * - Группирует по seller_id.\n * - Отсекает селлеров с ошибкой WB (ни одной строки с полем `date`).\n * - Вычисляет:\n *    leftBoundary/rightBoundary по полю `date` (YYYY-MM-DD),\n *    lastTotalRow (кол-во строк селлера в батче с `date`),\n *    lastBeginDate (текущий BeginDate),\n *    maxBeginDate (минимум из прошлых maxBeginDate и текущего BeginDate).\n * - Правила статуса:\n *    * если прошлый отсутствует → status = 'left'\n *    * иначе status = 'right', если:\n *         (A) прошлый уже 'right' ИЛИ\n *         (B) текущий BeginDate <= (сегодня(МСК) - 180 дней) ИЛИ\n *         (C) прошлый maxBeginDate <= (сегодня(МСК) - 180 дней)\n *      иначе status = 'left'\n * - Расширяет границы покрытия факта (по `date`):\n *    leftBoundary = min(old.leftBoundary, new.leftBoundary)\n *    rightBoundary = max(old.rightBoundary, new.rightBoundary)\n * - ВЫХОД: `paid_storage_status` — ОДИН ОБЪЕКТ (без массива).\n * - `continue`: 0, если все селлеры в этом запуске 'right', иначе 1.\n * - Общий `text` по всем селлерам с фиксацией смены статуса.\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* ── Время/даты (MSK) ───────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\nconst pad = (n) => String(n).padStart(2, '0');\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\nconst ymdUTC = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\n// сегодня по МСК (без времени)\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  return ymdUTC(new Date(d.getTime() - days * MS_DAY));\n};\n\n// парсеры/мин-макс\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMDf = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Чтение прошлого статуса (совместимо: объект или массив) ─────────── */\nconst pickPrevStatusObj = (val) => {\n  if (!val) return null;\n  if (Array.isArray(val)) return val.length ? val[val.length - 1] : null;\n  if (typeof val === 'object') return val;\n  return null;\n};\n\n/* ── Группировка по селлеру ──────────────────── */\nconst perSeller = new Map();\n/**\n * perSeller[sellerId] = {\n *   brand: string,\n *   rows: array of json,\n *   prevObj: object|null,        // последний снимок (если передан)\n * }\n */\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  if (!perSeller.has(sellerId)) {\n    perSeller.set(sellerId, {\n      brand: String(json.wb_api_brand ?? '') || sellerId,\n      rows: [],\n      prevObj: null,\n    });\n  }\n  const b = perSeller.get(sellerId);\n  b.rows.push(json);\n\n  // читаем прошлое paid_storage_status один раз (может быть объект или массив)\n  if (b.prevObj === null && ('paid_storage_status' in json)) {\n    b.prevObj = pickPrevStatusObj(json.paid_storage_status);\n  }\n}\n\n/* ── Порог 180 дней (включительно) ───────────── */\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обработка по селлеру ────────────────────── */\nconst out = [];\nconst lines = []; // для общего summary\nlet rowsTotal = 0;\nconst results = []; // для вычисления continue\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const allRows = bucket.rows || [];\n  const brand = bucket.brand || '';\n\n  // 1) Оставляем только валидные по WB: есть поле date\n  const valid = allRows.filter(r => firstYMD(r.date));\n  if (!valid.length) {\n    // селлер с ошибкой WB — отсекаем полностью\n    continue;\n  }\n\n  const lastTotalRow = valid.length;\n  rowsTotal += lastTotalRow;\n\n  // 2) Границы по факту (date)\n  let leftBoundary = null;\n  let rightBoundary = null;\n  for (const r of valid) {\n    const d = firstYMD(r.date);\n    if (d) {\n      leftBoundary = minYMD(leftBoundary, d);\n      rightBoundary = maxYMDf(rightBoundary, d);\n    }\n  }\n\n  // 3) Текущий BeginDate в батче (если их несколько — берём минимальный)\n  let currentBeginDate = null;\n  for (const r of valid) {\n    const bDate = firstYMD(r.beginDate);\n    if (bDate) currentBeginDate = minYMD(currentBeginDate, bDate);\n  }\n  const lastBeginDate = currentBeginDate || null;\n\n  // 4) Предыдущее состояние\n  const prev = bucket.prevObj ?? null;\n  const prevStatus = prev?.status ?? null;\n  const prevMaxBegin = firstYMD(prev?.maxBeginDate);\n  const prevLeftBoundary = firstYMD(prev?.leftBoundary);\n  const prevRightBoundary = firstYMD(prev?.rightBoundary);\n\n  // 5) Новый maxBeginDate\n  let newMaxBeginDate = null;\n  if (!prev) {\n    newMaxBeginDate = currentBeginDate || null;\n  } else {\n    newMaxBeginDate = minYMD(prevMaxBegin, currentBeginDate) || prevMaxBegin || currentBeginDate || null;\n  }\n\n  // 6) Решение по статусу\n  let newStatus;\n  if (!prev) {\n    newStatus = 'left';\n  } else {\n    const condA = prevStatus === 'right';\n    const condB = currentBeginDate && (currentBeginDate <= threshold180);\n    const condC = prevMaxBegin && (prevMaxBegin <= threshold180);\n    newStatus = (condA || condB || condC) ? 'right' : 'left';\n  }\n\n  // 7) Расширение границ факта\n  const mergedLeftBoundary  = minYMD(prevLeftBoundary, leftBoundary) || leftBoundary || prevLeftBoundary || null;\n  const mergedRightBoundary = maxYMDf(prevRightBoundary, rightBoundary) || rightBoundary || prevRightBoundary || null;\n\n  // 8) Собираем СНИМОК (объект)\n  const statusObj = {\n    status: newStatus,\n    nowTime: ymdHmsUTC(nowMSK()),\n    lastTotalRow: lastTotalRow,\n    leftBoundary: mergedLeftBoundary,\n    maxBeginDate: newMaxBeginDate,\n    lastBeginDate: lastBeginDate,\n    rightBoundary: mergedRightBoundary,\n  };\n\n  // 9) Строка для общего summary\n  const line =\n    `${newMaxBeginDate || 'null'} | ${prevStatus || 'null'} → ${newStatus} | ${lastTotalRow} | ${brand}`;\n  lines.push({ brand, line });\n\n  // 10) Копим для continue\n  results.push({ sellerId, brand, newStatus });\n\n  // 11) Вывод по селлеру\n  out.push({\n    json: {\n      seller_id: sellerId,\n      wb_api_brand: brand,\n      paid_storage_status: statusObj, // <-- теперь ОДИН ОБЪЕКТ, без квадратных скобок\n      text: '',                      // заполним ниже общим summary\n      continue: 1,                   // финально установим ниже для всех\n    },\n  });\n}\n\n/* ── Если всех «съели» ошибками — вернуть пусто ─ */\nif (!out.length) return [];\n\n/* ── continue: 0 когда все RIGHT ─────────────── */\nconst allRight = results.every(r => r.newStatus === 'right');\nconst continueFlag = allRight ? 0 : 1;\n\n/* ── Общий summary text ──────────────────────── */\nlines.sort((a, b) => a.brand.localeCompare(b.brand, 'ru'));\nconst body = lines.map(x => x.line).join('\\n');\nconst sellersTotal = out.length;\n\nconst commonText =\n  `Всего селлеров: ${sellersTotal} | всего строк: ${rowsTotal}\\n` +\n  body;\n\n/* ── Проставляем общий text и continue всем ─── */\nfor (const e of out) {\n  e.json.text = commonText;\n  e.json.sellersTotal = sellersTotal;\n  e.json.rowsTotal = rowsTotal;\n  e.json.continue = continueFlag;\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        784
+      ],
+      "id": "06e54349-f23e-426b-83a2-100ebbc3fe15",
+      "name": "create_status"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node — build_paid_storage_status v1.0\n *\n * Что делает:\n * - Группирует по seller_id.\n * - Отсекает селлеров с ошибкой WB (ни одной строки с полем `date`).\n * - Вычисляет:\n *    leftBoundary/rightBoundary по полю `date` (YYYY-MM-DD),\n *    lastTotalRow (кол-во строк селлера в батче с `date`),\n *    lastBeginDate (текущий BeginDate),\n *    maxBeginDate (минимум из прошлых maxBeginDate и текущего BeginDate).\n * - Правила статуса:\n *    * если прошлый отсутствует → status='left'\n *    * иначе status='right', если:\n *         (A) прошлый уже 'right' ИЛИ\n *         (B) текущий BeginDate <= (сегодня(МСК) - 180 дней) ИЛИ\n *         (C) прошлый maxBeginDate <= (сегодня(МСК) - 180 дней)\n *      иначе status='left'\n * - Расширяет границы покрытия факта:\n *    leftBoundary = min(old.leftBoundary, new.leftBoundary)\n *    rightBoundary = max(old.rightBoundary, new.rightBoundary)\n * - Аппендит снимок в массив `paid_storage_status`.\n * - Ставит `continue`: 0, если **все** селлеры в этом запуске перешли/находятся в 'right', иначе 1.\n * - Формирует общий `text` по всем селлерам с фиксацией смены статуса.\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* ── Время/даты (MSK) ───────────────────────── */\nconst MS_DAY = 86_400_000;\nconst MSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3\nconst pad = (n) => String(n).padStart(2, '0');\nconst nowMSK = () => new Date(Date.now() + MSK_OFFSET_MS);\nconst ymdUTC = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\nconst ymdHmsUTC = (d) =>\n  `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +\n  `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\n\n// сегодня по МСК (без времени)\nconst todayMSK_YMD = () => {\n  const d = nowMSK();\n  return ymdUTC(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())));\n};\nconst mskTodayMinusDaysYMD = (days) => {\n  const d = nowMSK();\n  return ymdUTC(new Date(d.getTime() - days * MS_DAY));\n};\n\n// парсеры/мин-макс\nconst firstYMD = (s) => {\n  const m = String(s ?? '').match(/^(\\d{4}-\\d{2}-\\d{2})/);\n  return m ? m[1] : null;\n};\nconst minYMD = (a, b) => (a == null ? b : b == null ? a : (a < b ? a : b));\nconst maxYMDf = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));\n\n/* ── Чтение прошлого статуса ─────────────────── */\nconst pickPrevStatusObj = (val) => {\n  if (!val) return null;\n  if (Array.isArray(val)) return val.length ? val[val.length - 1] : null;\n  if (typeof val === 'object') return val;\n  return null;\n};\nconst pickPrevStatusArr = (val) => {\n  if (!val) return [];\n  if (Array.isArray(val)) return val.slice();\n  if (typeof val === 'object') return [val];\n  return [];\n};\n\n/* ── Группировка по селлеру ──────────────────── */\nconst perSeller = new Map();\n/**\n * perSeller[sellerId] = {\n *   brand: string,\n *   rows: array of json,\n *   prevObj: object|null,        // последний снимок\n *   prevArr: array,              // полный прошлый массив\n * }\n */\nfor (const { json } of items) {\n  const sellerId = String(json.seller_id ?? '').trim();\n  if (!sellerId) continue;\n\n  if (!perSeller.has(sellerId)) {\n    perSeller.set(sellerId, {\n      brand: String(json.wb_api_brand ?? '') || sellerId,\n      rows: [],\n      prevObj: null,\n      prevArr: [],\n    });\n  }\n  const b = perSeller.get(sellerId);\n  b.rows.push(json);\n\n  // читаем прошлое paid_storage_status: берём только из первого встретившегося\n  if (b.prevObj === null && ('paid_storage_status' in json)) {\n    b.prevObj = pickPrevStatusObj(json.paid_storage_status);\n    b.prevArr = pickPrevStatusArr(json.paid_storage_status);\n  }\n}\n\n/* ── Порог 180 дней (включительно) ───────────── */\nconst threshold180 = mskTodayMinusDaysYMD(180);\n\n/* ── Обработка по селлеру ────────────────────── */\nconst out = [];\nconst lines = []; // для общего summary\nlet rowsTotal = 0;\n\nconst results = []; // для вычисления continue\n\nfor (const [sellerId, bucket] of perSeller.entries()) {\n  const allRows = bucket.rows || [];\n  const brand = bucket.brand || '';\n\n  // 1) Оставляем только валидные по WB: есть поле date\n  const valid = allRows.filter(r => firstYMD(r.date));\n  if (!valid.length) {\n    // селлер с ошибкой WB — отсекаем полностью\n    continue;\n  }\n\n  const lastTotalRow = valid.length;\n  rowsTotal += lastTotalRow;\n\n  // 2) Границы по факту (date)\n  let leftBoundary = null;\n  let rightBoundary = null;\n  for (const r of valid) {\n    const d = firstYMD(r.date);\n    if (d) {\n      leftBoundary = minYMD(leftBoundary, d);\n      rightBoundary = maxYMDf(rightBoundary, d);\n    }\n  }\n\n  // 3) Текущие BeginDate в батче (на случай, если их нес-ко — берём минимальный как \"текущий\")\n  let currentBeginDate = null;\n  for (const r of valid) {\n    const bDate = firstYMD(r.beginDate);\n    if (bDate) currentBeginDate = minYMD(currentBeginDate, bDate);\n  }\n  const lastBeginDate = currentBeginDate || null; // \"последняя дата запроса BeginDate\"\n\n  // 4) Предыдущее состояние\n  const prev = bucket.prevObj ?? null;\n  const prevStatus = prev?.status ?? null;\n  const prevMaxBegin = firstYMD(prev?.maxBeginDate);\n  const prevLeftBoundary = firstYMD(prev?.leftBoundary);\n  const prevRightBoundary = firstYMD(prev?.rightBoundary);\n\n  // 5) Новый maxBeginDate (минимум из прошлого и текущего beginDate)\n  let newMaxBeginDate = null;\n  if (!prev) {\n    newMaxBeginDate = currentBeginDate || null;\n  } else {\n    newMaxBeginDate = minYMD(prevMaxBegin, currentBeginDate) || prevMaxBegin || currentBeginDate || null;\n  }\n\n  // 6) Решение по статусу\n  let newStatus;\n  if (!prev) {\n    newStatus = 'left';\n  } else {\n    const condA = prevStatus === 'right';\n    const condB = currentBeginDate && (currentBeginDate <= threshold180);\n    const condC = prevMaxBegin && (prevMaxBegin <= threshold180);\n    newStatus = (condA || condB || condC) ? 'right' : 'left';\n  }\n\n  // 7) Расширение границ факта\n  const mergedLeftBoundary  = minYMD(prevLeftBoundary, leftBoundary) || leftBoundary || prevLeftBoundary || null;\n  const mergedRightBoundary = maxYMDf(prevRightBoundary, rightBoundary) || rightBoundary || prevRightBoundary || null;\n\n  // 8) Собираем снимок\n  const statusObj = {\n    status: newStatus,\n    nowTime: ymdHmsUTC(nowMSK()),\n    lastTotalRow: lastTotalRow,\n    leftBoundary: mergedLeftBoundary,\n    maxBeginDate: newMaxBeginDate,\n    lastBeginDate: lastBeginDate,\n    rightBoundary: mergedRightBoundary,\n  };\n\n  // 9) Аппендим в массив paid_storage_status\n  const newArr = (bucket.prevArr || []).concat([statusObj]);\n\n  // 10) Линия для общего summary\n  const line =\n    `${newMaxBeginDate || 'null'} | ${prevStatus || 'null'} → ${newStatus} | ${lastTotalRow} | ${brand}`;\n  lines.push({ brand, line });\n\n  // 11) Сохраняем результат\n  results.push({ sellerId, brand, newStatus, statusObj, paid_storage_status: newArr });\n\n  out.push({\n    json: {\n      seller_id: sellerId,\n      wb_api_brand: brand,\n      paid_storage_status: newArr, // массив со свежим снимком\n      text: '',                    // заполним ниже общим summary\n      continue: 1,                 // поставим финально ниже для всех\n    },\n  });\n}\n\n/* ── Если всех «съели» ошибками — вернуть пусто ─ */\nif (!out.length) return [];\n\n/* ── continue: 0 когда все RIGHT ─────────────── */\nconst allRight = results.every(r => r.newStatus === 'right');\nconst continueFlag = allRight ? 0 : 1;\n\n/* ── Общий summary text ──────────────────────── */\nlines.sort((a, b) => a.brand.localeCompare(b.brand, 'ru'));\nconst body = lines.map(x => x.line).join('\\n');\nconst sellersTotal = out.length;\n\nconst commonText =\n  `Всего селлеров: ${sellersTotal} | всего строк: ${rowsTotal}\\n` +\n  body;\n\n/* ── Проставляем общий text и continue всем ─── */\nfor (const e of out) {\n  e.json.text = commonText;\n  e.json.sellersTotal = sellersTotal;\n  e.json.rowsTotal = rowsTotal;\n  e.json.continue = continueFlag;\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -336,
+        1296
+      ],
+      "id": "a1c76403-a6de-4ff2-aaf3-858cb5441da5",
+      "name": "create_status1"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 2
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -4240,
+        560
+      ],
+      "id": "56319d4a-c8eb-4970-bd6c-bf3b24b6700e",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "91458f6c-8bb4-4e08-b638-bf930b310f00",
+              "leftValue": "={{ $('create_status').first().json.continue }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -16,
+        1024
+      ],
+      "id": "488f459c-df3d-4823-8c98-8c6fc1410b4e",
+      "name": "If",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "e0jd4791F79uBguw",
+          "mode": "list",
+          "cachedResultName": "14 WB API | PAID STORAGE"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        992
+      ],
+      "id": "4919e81f-1fcd-41b1-a0ba-ec4e62b81518",
+      "name": "Execute Workflow1"
+    },
+    {
+      "parameters": {
+        "url": "=https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{{ $('Loop5').item.json.taskId }}/download",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={\n  \"task_id\": \"{{ $('Loop5').item.json.taskId }}\"\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Loop5').item.json.wb_api }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5553fa05-d2a6-4552-83b2-b5331471cc07",
+      "name": "get_stocks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1232,
+        816
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "send_start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "send_step_1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_token": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_start": {
+      "main": [
+        [
+          {
+            "node": "get_all_token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop": {
+      "main": [
+        [
+          {
+            "node": "create_item",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "send_create",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_create": {
+      "main": [
+        [
+          {
+            "node": "get_create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_create": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Wait2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait2": {
+      "main": [
+        [
+          {
+            "node": "Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop5": {
+      "main": [
+        [
+          {
+            "node": "Code6",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "send_logs_start_step3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start_step3": {
+      "main": [
+        [
+          {
+            "node": "get_stocks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge2": {
+      "main": [
+        [
+          {
+            "node": "Loop5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_item": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start_step2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "upsert_data_in_final1": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop4": {
+      "main": [
+        [
+          {
+            "node": "collapse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "upsert_data_in_final1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish1": {
+      "main": [
+        [
+          {
+            "node": "Loop4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code6": {
+      "main": [
+        [
+          {
+            "node": "Loop4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "collapse": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ins_upd_adexpenses": {
+      "main": [
+        [
+          {
+            "node": "send_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_finish": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_status": {
+      "main": [
+        [
+          {
+            "node": "ins_upd_adexpenses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "send_start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_stocks": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "dd7e7d01-710f-4d90-bd8e-ff942cdc2cb6",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "ov1M45ceb7OI3pTe",
+  "tags": [
+    {
+      "createdAt": "2025-10-10T12:03:26.513Z",
+      "updatedAt": "2025-10-10T12:03:26.513Z",
+      "id": "DWIWzcfScXXtsibW",
+      "name": "WB"
+    },
+    {
+      "createdAt": "2025-10-10T12:03:26.517Z",
+      "updatedAt": "2025-10-10T12:03:26.517Z",
+      "id": "VJZ1GKkGN6Id3ylE",
+      "name": "30 min"
+    }
+  ]
+}

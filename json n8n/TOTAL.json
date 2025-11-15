@@ -1,0 +1,2410 @@
+{
+  "name": "TOTAL",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  s.*,\n  su.total_sku,\n  (\n    SELECT COUNT(*) \n    FROM GS_RNP_ReportDetail r \n    WHERE r.seller_id = s.seller_id\n  ) AS report_count\nFROM WB_sellers s\nJOIN WB_sellers_updates su ON su.seller_id = s.seller_id\nWHERE su.in_workrnp = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        320,
+        3792
+      ],
+      "id": "1bdd3d24-d857-49f3-8ff8-852361565b8f",
+      "name": "get_all_sellers",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1002613685383",
+        "text": "=<b>10 GS RNP | Сводная</b> | Запуск...",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_notification": true,
+          "parse_mode": "HTML",
+          "message_thread_id": 2
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        48,
+        3792
+      ],
+      "id": "2e72df17-9a44-427c-9952-feeb2455bcd9",
+      "name": "send_logs_start_report",
+      "webhookId": "e626ba0f-e542-44c6-992c-0be0a1cb876c",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -208,
+        3792
+      ],
+      "id": "10cbf88c-a526-4748-8088-7dcdc9752568",
+      "name": "Execute Workflow Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = items.map(item => item.json);\n\n// Получаем общее количество итемов (для нумерации)\nconst totalCount = data.length;\n\n// Формируем текст для каждого итема\nconst result = data.map((entry, index) => {\n    const pos = index + 1;\n    const text = `<b>03 GS RNP | Сводная </b>\\n` +\n                 `<blockquote><b>Обновление листа Сводная</b>\\n` +\n                 `Селлер: ${pos} из ${totalCount}\\n` +\n                 `Бренд: ${entry.wb_api_brand}\\n` +\n                 `Продажи: ${entry.report_count}</blockquote>`;\n    return { json: { ...entry, text } };\n});\n\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        3792
+      ],
+      "id": "8428b4dc-bce9-4260-8eed-e96d0ef1cc51",
+      "name": "Code5"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n    p.*,                      \n    s.wb_api_brand,            \n    su.total_sku\nFROM WB_products          AS p\nLEFT JOIN WB_sellers       AS s  ON s.seller_id = p.seller_id\nLEFT JOIN WB_sellers_updates su  ON su.seller_id = p.seller_id\nWHERE p.seller_id = '{{ $json.seller_id }}'     ",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2752,
+        368
+      ],
+      "id": "dd40770d-fabf-4f5a-bc2e-760b71db3d6e",
+      "name": "get_all_barcode",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* ───────────── 1. собрали товары продавца ───────────── */\nWITH products AS (\n    SELECT *,\n           ROW_NUMBER() OVER (PARTITION BY skus ORDER BY id) AS rn\n    FROM WB_products\n    WHERE seller_id = '{{ $json.seller_id }}'\n),\n\n/* ───────────── 2. подсчитали остатки ───────────── */\nstock_quant AS (\n    SELECT\n        barcode,\n        SUM(quantityFull)    AS quantityFull,\n        SUM(inWayFromClient) AS inWayFromClient,\n        SUM(inWayToClient)   AS inWayToClient,\n        SUM(quantity)        AS quantity,\n        MIN(category)        AS category\n    FROM WB_stocks\n    WHERE seller_id = '{{ $json.seller_id }}'\n    GROUP BY barcode\n),\n\n/* ───────────── 3. самая свежая цена/скидка из WB_products_prices ───────────── */\nprice_latest AS (\n    SELECT *\n    FROM (\n        SELECT\n            nmID,\n            techSizeName,\n            price               AS Price,\n            discountedPrice,\n            clubDiscountedPrice,\n            discount            AS Discount,\n            clubDiscount,\n            ROW_NUMBER() OVER (\n                PARTITION BY nmID, techSizeName\n                ORDER BY id DESC\n            ) AS rn\n        FROM WB_products_prices\n        WHERE seller_id = '{{ $json.seller_id }}'\n    ) t\n    WHERE rn = 1\n),\n\n/* ───────────── 4. самая свежая закупочная + логистика по штрих-коду ───────────── */\npur_price_latest AS (\n    SELECT\n        Barcode,\n        Pur_price,\n        Logistics_cost,                -- новый столбец\n        ROW_NUMBER() OVER (\n            PARTITION BY Barcode\n            ORDER BY `Date` DESC\n        ) AS rn\n    FROM GS_RNP_PurPrice\n)\n\nSELECT JSON_ARRAYAGG(\n         JSON_OBJECT(\n           /* --- WB_products --- */\n           'id',                  p.id,\n           'nmID',                p.nmID,\n           'vendorCode',          p.vendorCode,\n           'subjectName',         p.subjectName,\n           'brand',               p.brand,\n           'title',               p.title,\n           'photo',               p.photo,\n           'dimensions_length',   p.dimensions_length,\n           'dimensions_width',    p.dimensions_width,\n           'dimensions_height',   p.dimensions_height,\n           'dimensions_isValid',  p.dimensions_isValid,\n           'weightBrutto',        p.weightBrutto,\n           'size',                p.size,\n           'tags',                p.tags,\n           'skus',                p.skus,\n           'seller_id',           p.seller_id,\n           'seller_skus_key',     p.seller_skus_key,\n\n           /* --- агрегаты остатков --- */\n           'quantityFull',        IFNULL(sq.quantityFull, 0),\n           'inWayFromClient',     IFNULL(sq.inWayFromClient, 0),\n           'inWayToClient',       IFNULL(sq.inWayToClient, 0),\n           'quantity',            IFNULL(sq.quantity, 0),\n           'category',            sq.category,\n\n           /* --- цены и скидки WB --- */\n           'Price',               IFNULL(pl.Price, 0),\n           'discountedPrice',     IFNULL(pl.discountedPrice, 0),\n           'clubDiscountedPrice', IFNULL(pl.clubDiscountedPrice, 0),\n           'Discount',            IFNULL(pl.Discount, 0),\n           'clubDiscount',        IFNULL(pl.clubDiscount, 0),\n\n           /* --- закупка и логистика --- */\n           'Pur_price',           IFNULL(ppl.Pur_price, 0),\n           'Logistics_cost',      IFNULL(ppl.Logistics_cost, 0)\n         )\n       ) AS products\nFROM products p\nLEFT JOIN stock_quant      sq  ON sq.barcode       = p.skus\nLEFT JOIN price_latest     pl  ON pl.nmID          = p.nmID\n                               AND pl.techSizeName = p.size\nLEFT JOIN pur_price_latest ppl ON ppl.Barcode      = p.skus\n                               AND ppl.rn = 1\nWHERE p.rn = 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        3632
+      ],
+      "id": "6c735419-fb9e-4b69-9c5f-45d42bb9d20b",
+      "name": "get_all_products1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT JSON_ARRAYAGG(\n         JSON_OBJECT(\n           'id',                 s.id,\n           'seller_id',          s.seller_id,\n           'seller_whs_bc_key',  s.seller_whs_bc_key,\n           'lastChangeDate',     s.lastChangeDate,\n           'warehouseName',      s.warehouseName,\n           'supplierArticle',    s.supplierArticle,\n           'nmId',               s.nmId,\n           'barcode',            s.barcode,\n           'quantity',           s.quantity,\n           'inWayToClient',      s.inWayToClient,\n           'inWayFromClient',    s.inWayFromClient,\n           'quantityFull',       s.quantityFull,\n           'category',           s.category,\n           'subject',            s.subject,\n           'brand',              s.brand,\n           'techSize',           s.techSize,\n           'Price',              s.Price,\n           'Discount',           s.Discount,\n           'isSupply',           s.isSupply,\n           'isRealization',      s.isRealization,\n           'SCCode',             s.SCCode\n         )\n       ) AS stocks\nFROM WB_stocks s\nWHERE s.seller_id = '{{ $json.seller_id }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        4016
+      ],
+      "id": "3250b2ac-8abc-4c11-95e2-1ee9dec06b89",
+      "name": "get_all_stocks1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "numberInputs": 7,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        -2064,
+        4176
+      ],
+      "id": "4451f791-404e-4acf-bc2b-2cb64671bc71",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT DISTINCT\n       p.nmID,\n       p.brand,\n       s.wb_api_brand\nFROM   WB_products AS p\nJOIN   WB_sellers  AS s ON s.seller_id = p.seller_id\nWHERE  p.seller_id = '{{ $json.seller_id }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2688,
+        4976
+      ],
+      "id": "4635226b-2711-40a5-98f7-4d6a9c8ffa44",
+      "name": "get_all_nmids1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node\n * Создаёт ссылку вида:\n * https://card.wb.ru/cards/detail?appType=1&curr=rub&dest=-1257786&nm=<nmID>\n */\n\nconst seen = new Set();          // чтобы поймать дубли\n\nreturn items.reduce((out, item) => {\n\tconst id = item.json.nmID;\n\n\t// пропускаем уже встречавшийся nmID\n\tif (seen.has(id)) return out;\n\tseen.add(id);\n\n\tout.push({\n\t\tjson: {\n\t\t\tnmID:          id,\n\t\t\tbrand:         item.json.brand,\n\t\t\twb_api_brand:  item.json.wb_api_brand,\n\t\t\tlink:          `https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1281209&nm=${id}`,\n          \n\t\t},\n\t});\n\treturn out;\n}, []);\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2688,
+        4832
+      ],
+      "id": "d6fd1f2e-f1f6-4bb2-971b-d7305ef51c55",
+      "name": "create_link1"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.link }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "user-agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "fedcf9ee-e485-490a-9e58-be85a0704af4",
+      "name": "parsing_cart1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2448,
+        4976
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node\n * На входе: items[].json.data  – строка-JSON (или уже объект) карточки WB\n * На выходе: один item → { json: { pricerating: [ {...}, {...}, … ] } }\n */\n\nconst pricerating = items.map(item => {\n\t// 1. Разбор входа\n\tconst raw    = item.json?.data ?? item.json;\n\tconst parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;\n\n\t// 2. Ссылки\n\tconst params  = parsed?.params              || {};\n\tconst product = parsed?.data?.products?.[0] || {};\n\tconst sizes   = product.sizes               || [];\n\tconst stocks  = sizes.flatMap(s => s.stocks || []);\n\n\t// 3. Метрики\n\tconst whSet    = new Set(stocks.map(s => s.wh));\n\tconst dists    = stocks.map(s => s.dist).filter(n => n != null);\n\tconst hasStock = stocks.some(s => (s.qty ?? s.quantity ?? 0) > 0);\n\n\t// 4. Готовим объект\n\treturn {\n\t\tnmID:                   product.id                ?? null,\n\t\tsupplierId:             product.supplierId        ?? null,\n\t\tdest:                   params.dest              ?? null,\n\t\tsupplierRating:         product.supplierRating    ?? null,\n\t\treviewRating:           product.reviewRating      ?? null,\n\t\tnmReviewRating:         product.nmReviewRating    ?? null,\n\t\tfeedbacks:              product.feedbacks         ?? null,\n\t\tnmFeedbacks:            product.nmFeedbacks       ?? null,\n\n\t\tstatus:                 hasStock ? 'В продаже' : 'Нет в наличии',\n\n\t\tpanelPromoId:           product.panelPromoId      ?? null,\n\t\tpromoTextCard:          product.promoTextCard     ?? null,\n\t\tpromotionscont:        (product.promotions || []).length,\n\n\t\tpriceU:                 product.priceU            ?? null,\n\t\tsalePriceU:             product.salePriceU        ?? null,\n\t\tlogisticsCost:          product.logisticsCost     ?? null,\n\t\tsale:                   product.sale              ?? null,\n\t\treturnCost:             product.returnCost        ?? null,\n\n\t\tsizes_rank:             sizes[0]?.rank           ?? null,\n\t\tsizes_stocks_wh_count:  whSet.size,\n\t\tsizes_stocks_dist_min:  dists.length ? Math.min(...dists) : null,\n\t\tsizes_stocks_dist_max:  dists.length ? Math.max(...dists) : null,\n\t};\n});\n\n// 5. Возвращаем один item с массивом pricerating\nreturn [\n\t{\n\t\tjson: {\n\t\t\tpricerating\n\t\t}\n\t}\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2448,
+        4832
+      ],
+      "id": "e7ec1926-b012-40e9-ad40-987fc0a96c81",
+      "name": "create_data_cards1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -2976,
+        3472
+      ],
+      "id": "989b1e0f-84ab-4b71-a7d3-31c91a71decf",
+      "name": "Loop1"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node  \n * Формирует payload для Google Sheets (batchUpdate)\n * ───────────────────────────────────────────────────────────────────\n *  • Логика products / pricerating / adexpenses / storagefee /\n *    acceptance сохранена.\n *  • Исправлена работа с sales:\n *      – поддержка структуры { bc_metrics: [...] }\n *      – суммирование day_metrics.returns_cnt[ ] и, при отсутствии,\n *        day_metrics.sales_cnt[ ].\n *  • Добавлено ранее:\n *      – AU14:AU  – возвраты за прошлый период (ret_cnt_prev)\n *      – AY13:CC13 – даты динамики продаж\n *      – AY14:CC   – продажи-шт. по дням (sales_cnt)\n *      – DB13:EF13 / DB14:EF   – динамика заказов (orders_cnt)\n *      – CE14:CX   – агрегаты заказов/выручки\n *  • Новое (предыдущий коммит):\n *      Данные заказов + динамика заказов\n *        CE14:CE  – дней без заказов (days_no_orders_cur)\n *        … (см. прежний список CE-CX)\n *      Доработан блок рекламы\n *        ES14:ES  – фактические затраты на рекламу по ШК (за последние 31 день)\n *  • Новое (текущий коммит):\n *      ▸ ET14:ET   – TACoS текущего периода = ES / EI, %\n *      ▸ FD14:FD   – цена в ЛК (discountedPrice)\n *      ▸ FE14:FE   – цена на сайте = (salePriceU – logisticsCost) / 100, ₽\n *      ▸ FG14:FG   – СПП % = (FD – FE) / FD\n *      ▸ FL14:FL   – логистика прямая (Logistics_cost)\n *      ▸ GG13:HK13 / GG14:HK   – динамика выручки продаж **до СПП** (sales_pre)\n *      ▸ HO13:IS13 / HO14:IS   – динамика выручки продаж **после СПП** (sales_post)\n *      ▸ IW13:KA13 / IW14:KA   – динамика выручки заказов **до СПП** (orders_pre)\n *      ▸ KE13:LI13 / KE14:LI   – динамика выручки заказов **после СПП** (orders_post)\n *      ▸ LM13:MQ13 / LM14:MQ   – динамика **СПП %** (spp)\n *      ▸ MU13:NY13 / MU14:NY   – динамика **затрат на рекламу** (ad_spend)\n */\n\nconst MS_PER_DAY = 86_400_000;\nconst now        = new Date();\nconst tzOffset   = now.getTimezoneOffset() * 60_000;\nconst todayFloor = new Date(now.getTime() - tzOffset);\ntodayFloor.setUTCHours(0, 0, 0, 0);\n\nconst num    = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };\nconst toStr  = v => v === 0 ? '0' : (v != null ? String(v).replace('.', ',') : '');\nconst sumArr = arr => Array.isArray(arr) ? arr.reduce((a, b) => a + (num(b) || 0), 0) : 0;\n\n/* ─── входные массивы ────────────────────────────────────────────── */\nconst {\n  products    = [],\n  pricerating = [],\n  adexpenses  = [],\n  storagefee  = [],\n  acceptance  = [],\n  sales       = {},          // может быть объектом\n} = items[0]?.json ?? {};\n\n/* ─── массив sales с учётом возможной структуры ──────────────────── */\nconst salesArr = Array.isArray(sales)               ? sales\n               : Array.isArray(sales.bc_metrics)    ? sales.bc_metrics\n               : [];\n\n/* ─── заголовок дат (31 день, последние –30…0) ──────────────────── */\nconst formatHeaderDate = iso => `${iso.slice(8, 10)}.${iso.slice(5, 7)}`;\n\nlet headerDates = [];\nif (salesArr.length && Array.isArray(salesArr[0].day_metrics?.dates)) {\n  const raw = salesArr[0].day_metrics.dates;\n  if (raw.length === 31) headerDates = raw.map(formatHeaderDate);\n}\nif (!headerDates.length) {                                   // запасной вариант\n  const startCur = new Date(todayFloor.getTime() - 30 * MS_PER_DAY);\n  headerDates = Array.from({ length: 31 }, (_, i) => {\n    const d = new Date(startCur.getTime() + i * MS_PER_DAY);\n    return `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;\n  });\n}\n\n/* ─── мапа продаж по штрих-коду ──────────────────────────────────── */\nconst salesByBC = new Map();\nsalesArr.forEach(s => {\n  const bc = s.barcode ?? s.BC ?? s.skus;\n  if (bc) salesByBC.set(bc, s);\n});\n\n/* ─── nmID → список ШК (для распределения рекламы) ──────────────── */\nconst bcListByNm = new Map();\nfor (const p of products) {\n  const nm = p.nmID ?? p.nmid;\n  const bc = p.skus ?? p.BC ?? '';\n  if (!nm || !bc) continue;\n  if (!bcListByNm.has(nm)) bcListByNm.set(nm, []);\n  bcListByNm.get(nm).push(bc);\n}\n\n/* ─── распределение затрат на рекламу ────────────────────────────── */\nconst adByBC    = new Map();           // итог на ШК → ES\nconst adDynByBC = new Map();           // [31] на ШК → MU…NY\n\n(adexpenses || []).forEach(exp => {\n  const nm  = exp.nmid ?? exp.nmID ?? exp.nmId;\n  const sum = num(exp.updSum) || 0;\n  if (!nm || sum === 0) return;\n\n  const bcList = bcListByNm.get(nm) || [];\n  if (!bcList.length) return;\n\n  /* индекс дня внутри 31-дневного окна (-30 … 0) */\n  let dayIdx = -1;\n  if (exp.updTime) {\n    const d = new Date(exp.updTime + 'T00:00:00Z');\n    dayIdx = Math.floor((d - (todayFloor.getTime() - 30 * MS_PER_DAY)) / MS_PER_DAY);\n    if (dayIdx < 0 || dayIdx > 30) dayIdx = -1;\n  }\n\n  /* распределяем между ШК */\n  let shares = [];\n\n  if (bcList.length === 1) {\n    shares = [[bcList[0], sum]];\n  } else {\n    const ordersPerBC = bcList.map(bc => {\n      const sl = salesByBC.get(bc) || {};\n      let cnt  = 0;\n      if (dayIdx >= 0 &&\n          Array.isArray(sl.day_metrics?.orders_cnt) &&\n          Array.isArray(sl.day_metrics?.dates)) {\n        const dIdx = sl.day_metrics.dates.findIndex(dt => dt === exp.updTime);\n        if (dIdx >= 0) cnt = num(sl.day_metrics.orders_cnt[dIdx]) || 0;\n      }\n      return [bc, cnt];\n    });\n\n    const totalOrders = ordersPerBC.reduce((a, [_, c]) => a + c, 0);\n\n    if (totalOrders > 0) {\n      shares = ordersPerBC.map(([bc, cnt]) => [bc, (sum * cnt) / totalOrders]);\n    } else {\n      const even = sum / bcList.length;\n      shares = bcList.map(bc => [bc, even]);\n    }\n  }\n\n  /* записываем суммы */\n  shares.forEach(([bc, part]) => {\n    if (dayIdx >= 0) {                              // только текущее 31-дневное окно\n      adByBC.set(bc, (adByBC.get(bc) || 0) + part);\n\n      if (!adDynByBC.has(bc)) adDynByBC.set(bc, Array(31).fill(0));\n      adDynByBC.get(bc)[dayIdx] += part;\n    }\n  });\n});\n\n/* ─── пересчёт итогов ES из динамики (гарантирует равенство) ────── */\nfor (const [bc, dyn] of adDynByBC.entries()) {\n  adByBC.set(bc, dyn.reduce((a, v) => a + v, 0));\n}\n\n/* ─── счётчики для приёмки (по nmID) ─────────────────────────────── */\nconst sizeCntByNm = new Map();\nfor (const p of products) {\n  const nm = p.nmID ?? p.nmid;\n  if (!nm) continue;\n  sizeCntByNm.set(nm, (sizeCntByNm.get(nm) || 0) + 1);\n}\n\n/* ─── мапы хранения и приёмки ────────────────────────────────────── */\nconst storageByBC = new Map();\n(storagefee || []).forEach(s => {\n  const bc = s.barcode ?? s.BC ?? s.skus; if (!bc) return;\n  storageByBC.set(bc, (storageByBC.get(bc) || 0) + (num(s.warehousePrice) || 0));\n});\nconst acceptanceByNm = new Map();\n(acceptance || []).forEach(a => {\n  const nm = a.nmID ?? a.nmid ?? a.nmId; if (!nm) return;\n  acceptanceByNm.set(nm, (acceptanceByNm.get(nm) || 0) + (num(a.total) || 0));\n});\n\n/* ─── pricerating мапа ───────────────────────────────────────────── */\nconst priceMap = new Map(pricerating.map(r => [(r.nmID ?? r.nmid ?? r.id), r]));\n\n/* ─── индексы столбцов ──────────────────────────────────────────── */\nconst baseCols = [\n  'B','C','D','E','F','G','H','I','J','K','L',\n  'M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',\n  'AA','AB','AC','AD','AE','AF','AG','AH','AI','AJ','AK','AL','AM',\n  'AN','AO','AP','AQ','AR','AS','AT','AU'\n];\nconst baseIdx = Object.fromEntries(baseCols.map((c,i)=>[c,i]));\n\nconst metricCols = ['EH','EI','EJ','EK','EL','EM','EN','EO','EP','EQ','ER','ES','ET','EU'];\nconst metricIdx  = Object.fromEntries(metricCols.map((c,i)=>[c,i]));\n\nconst priceCols = ['FD','FE','FF','FG','FH','FI','FJ','FK','FL'];\nconst priceIdx  = Object.fromEntries(priceCols.map((c,i)=>[c,i]));\n\n/* ─── подготовка строк для Sheets ───────────────────────────────── */\nconst rowsBase        = [];\nconst rowsMetrics     = [];\nconst rowsPrice       = [];\nconst rowsAcc         = [];\nconst rowsSalesDyn    = [];   // sales_cnt\nconst rowsOrdDyn      = [];   // orders_cnt\nconst rowsOrdAgg      = [];\nconst rowsSalesPre    = [];   // sales_pre\nconst rowsSalesPost   = [];   // sales_post\nconst rowsOrdersPre   = [];   // orders_pre\nconst rowsOrdersPost  = [];   // orders_post\nconst rowsSppDyn      = [];   // spp %\nconst rowsAdDyn       = [];   // ad_spend\n\n/* ─── проход по товарам ─────────────────────────────────────────── */\nconst productsSorted = [...products].sort((a,b)=>(a.nmID ?? a.nmid) - (b.nmID ?? b.nmid));\n\nfor (const p of productsSorted) {\n  const nmID = p.nmID ?? p.nmid;\n  const bc   = p.skus ?? p.BC ?? '';\n  const pr   = priceMap.get(nmID) || {};\n  const sl   = salesByBC.get(bc)  || {};\n\n  /* === B … AU (основная таблица) ================================= */\n  const b = Array(baseCols.length).fill('');\n\n  b[baseIdx.B]  = (p.photo && nmID) ? `=IMAGE(\"${p.photo}\")` : '';\n  b[baseIdx.C]  = nmID ? `=ГИПЕРССЫЛКА(\"https://www.wildberries.ru/catalog/${nmID}/detail.aspx?targetUrl=GP\";\"${nmID}\")` : '';\n  b[baseIdx.D]  = p.vendorCode ?? '';\n  b[baseIdx.E]  = p.title ?? '';\n  b[baseIdx.F]  = bc;\n  b[baseIdx.G]  = p.brand ?? '';\n  b[baseIdx.H]  = pr.status && pr.status !== '' ? pr.status : 'Скрыт';\n  b[baseIdx.I]  = p.category ?? '';\n  b[baseIdx.J]  = p.subjectName ?? '';\n  b[baseIdx.K]  = pr.nmReviewRating ?? '';\n  b[baseIdx.L]  = p.size ?? '';\n\n  const pur   = num(p.Pur_price);\n  const qFull = num(p.quantityFull);\n\n  b[baseIdx.O] = pur != null && qFull != null ? toStr((pur * qFull).toFixed(2)) : '';\n  b[baseIdx.P] = qFull ?? 0;\n  b[baseIdx.Q] = p.quantity ?? 0;\n  b[baseIdx.R] = p.inWayToClient ?? 0;\n  b[baseIdx.S] = p.inWayFromClient ?? 0;\n\n  const dim = v => v != null ? toStr(v) : '';\n  b[baseIdx.U] = dim(num(p.dimensions_length));\n  b[baseIdx.V] = dim(num(p.dimensions_width));\n  b[baseIdx.W] = dim(num(p.dimensions_height));\n  b[baseIdx.X] = dim(num(p.weightBrutto));\n  b[baseIdx.Y] = dim(\n    p.dimensions_length && p.dimensions_width && p.dimensions_height\n      ? ((p.dimensions_length * p.dimensions_width * p.dimensions_height) / 1000).toFixed(2)\n      : null\n  );\n  b[baseIdx.Z] = p.dimensions_isValid === 1 ? 'Да' : 'Нет';\n\n  /* === блок продаж текущий / предыдущий ========================= */\n  const daysNoSalesCur = sl.days_no_sales_cur ?? '';\n  const salesCntCur    = num(sl.sales_cnt_cur) ?? sumArr(sl.day_metrics?.sales_cnt);\n  const revPostSppCur  = num(sl.sales_post_spp_cur) ?? num(sl.sales_rev_post_spp_cur);\n  const revPreSppCur   = num(sl.sales_pre_spp_cur)  ?? num(sl.sales_rev_pre_spp_cur);\n\n  const avgPostSppCur = salesCntCur ? (revPostSppCur ?? 0) / salesCntCur : null;\n  const sppCurPct     = revPreSppCur ? ((revPreSppCur - (revPostSppCur ?? 0)) / revPreSppCur) : null;\n\n  const returnsCur    = sl.day_metrics ? sumArr(sl.day_metrics.returns_cnt) : 0;\n\n  const salesCntPrev   = num(sl.sales_cnt_prev) ?? 0;\n  const revPostSppPrev = num(sl.sales_post_spp_prev) ?? num(sl.sales_rev_post_spp_prev);\n  const revPreSppPrev  = num(sl.sales_pre_spp_prev)  ?? num(sl.sales_rev_pre_spp_prev);\n\n  const avgPostSppPrev = salesCntPrev ? (revPostSppPrev ?? 0) / salesCntPrev : null;\n  const sppPrevPct     = revPreSppPrev ? ((revPreSppPrev - (revPostSppPrev ?? 0)) / revPreSppPrev) : null;\n\n  const returnsPrev = num(sl.ret_cnt_prev) ?? 0;\n\n  b[baseIdx.AB] = daysNoSalesCur;\n  b[baseIdx.AC] = salesCntCur;\n  b[baseIdx.AE] = avgPostSppCur  != null ? toStr(avgPostSppCur.toFixed(2)) : '';\n  b[baseIdx.AG] = revPostSppCur != null ? toStr(revPostSppCur.toFixed(2)) : '';\n  b[baseIdx.AI] = revPreSppCur  != null ? toStr(revPreSppCur .toFixed(2)) : '';\n  b[baseIdx.AK] = sppCurPct     != null ? toStr((sppCurPct * 100).toFixed(2)) : '';\n  b[baseIdx.AM] = returnsCur;\n\n  b[baseIdx.AP] = salesCntPrev;\n  b[baseIdx.AQ] = avgPostSppPrev != null ? toStr(avgPostSppPrev.toFixed(2)) : '';\n  b[baseIdx.AR] = revPostSppPrev != null ? toStr(revPostSppPrev.toFixed(2)) : '';\n  b[baseIdx.AS] = revPreSppPrev  != null ? toStr(revPreSppPrev .toFixed(2)) : '';\n  b[baseIdx.AT] = sppPrevPct     != null ? toStr((sppPrevPct * 100).toFixed(2)) : '';\n  b[baseIdx.AU] = returnsPrev;\n\n  rowsBase.push(b);\n\n  /* === новые метрики EH … EU  =================================== */\n  const ordersCntCur      = num(sl.orders_cnt_cur) ?? 0;\n  const ordersRevPostCur  = num(sl.orders_post_spp_cur) ?? num(sl.orders_rev_post_spp_cur);\n  const cogsSalesCur      = num(sl.cogs_sales_cur);\n  const comwbSalesCur     = num(sl.comwb_sales_cur);\n  const forPayCur         = num(sl.forpay_cur);\n  const commissionPct     = revPreSppCur ? ((revPreSppCur - (forPayCur ?? 0)) / revPreSppCur) : null;\n  const logCostCur        = num(sl.log_cost_cur);\n  const logRetCur         = num(sl.log_ret_cur);\n\n  const buyoutPct = ordersCntCur ? Math.min((salesCntCur ?? 0) / ordersCntCur, 1) : null;\n\n  /* TACoS */\n  const adSpendCur = adByBC.get(bc) || 0;\n  const tacosCurPct = revPostSppCur ? (adSpendCur / revPostSppCur) : null;\n\n  const m = Array(metricCols.length).fill('');\n\n  m[metricIdx.EH] = ordersRevPostCur != null ? toStr(ordersRevPostCur.toFixed(2)) : '';\n  m[metricIdx.EI] = revPostSppCur    != null ? toStr(revPostSppCur .toFixed(2))  : '';\n  m[metricIdx.EJ] = buyoutPct        != null ? toStr((buyoutPct * 100).toFixed(2)) : '';\n  m[metricIdx.EK] = sppCurPct        != null ? toStr((sppCurPct  * 100).toFixed(2)) : '';\n  m[metricIdx.EL] = cogsSalesCur     != null ? toStr(cogsSalesCur.toFixed(2))      : '';\n  m[metricIdx.EN] = comwbSalesCur    != null ? toStr(comwbSalesCur.toFixed(2))     : '';\n  m[metricIdx.EO] = commissionPct    != null ? toStr((commissionPct * 100).toFixed(2)) : '';\n  m[metricIdx.EP] = logCostCur       != null ? toStr(logCostCur.toFixed(2))        : '';\n  m[metricIdx.ER] = logRetCur        != null ? toStr(logRetCur .toFixed(2))        : '';\n\n  m[metricIdx.ES] = toStr(adSpendCur.toFixed(2));                                             // затраты на рекламу\n  m[metricIdx.ET] = tacosCurPct     != null ? toStr((tacosCurPct * 100).toFixed(2)) : '';     // TACoS %\n  m[metricIdx.EU] = toStr((storageByBC.get(bc) || 0));                                        // хранение\n\n  rowsMetrics.push(m);\n\n  /* === блок цен FD … FL ========================================= */\n  const pRow = Array(priceCols.length).fill('');\n\n  /* FD – цена в ЛК (discountedPrice, в рублях) */\n  const priceLK = num(p.discountedPrice);\n  pRow[priceIdx.FD] = priceLK != null ? toStr(priceLK) : '';\n\n  /* FE – цена на сайте (в рублях) */\n  const salePriceU      = num(pr.salePriceU);       // в копейках\n  const logisticsCostPr = num(pr.logisticsCost);    // в копейках\n  const sitePriceKopec  = (salePriceU != null && logisticsCostPr != null)\n    ? salePriceU - logisticsCostPr\n    : null;\n  const sitePrice       = sitePriceKopec != null ? sitePriceKopec / 100 : null;  // в рублях\n  pRow[priceIdx.FE] = sitePrice != null ? toStr(sitePrice.toFixed(2)) : '';\n\n  /* FG – СПП % */\n  const sppPct = (priceLK && sitePrice != null)\n    ? ((priceLK - sitePrice) / priceLK)\n    : null;\n  pRow[priceIdx.FG] = sppPct != null ? toStr((sppPct * 100).toFixed(2)) : '';\n\n  /* FH – себестоимость закупки (Pur_price) */\n  pRow[priceIdx.FH] = pur != null ? toStr(pur) : '';\n\n  /* FL – логистика прямая (Logistics_cost) */\n  const logCostDirect = num(p.Logistics_cost);\n  pRow[priceIdx.FL] = logCostDirect != null ? toStr(logCostDirect) : '';\n\n  rowsPrice.push(pRow);\n\n  /* === приёмка EV =============================================== */\n  const accTot = acceptanceByNm.get(nmID) || 0;\n  const share  = sizeCntByNm.get(nmID) ? accTot / sizeCntByNm.get(nmID) : 0;\n  rowsAcc.push([toStr(share.toFixed(2)) || '0']);\n\n  /* === динамика продаж AY … CC (sales_cnt) ====================== */\n  let dynSalesCntRow = Array(31).fill(0);\n  if (Array.isArray(sl.day_metrics?.sales_cnt) && sl.day_metrics.sales_cnt.length === 31) {\n    dynSalesCntRow = sl.day_metrics.sales_cnt.map(cnt => num(cnt) || 0);\n  }\n  rowsSalesDyn.push(dynSalesCntRow);\n\n  /* === динамика заказов DB … EF (orders_cnt) ==================== */\n  let dynOrdersCntRow = Array(31).fill(0);\n  if (Array.isArray(sl.day_metrics?.orders_cnt) && sl.day_metrics.orders_cnt.length === 31) {\n    dynOrdersCntRow = sl.day_metrics.orders_cnt.map(cnt => num(cnt) || 0);\n  }\n  rowsOrdDyn.push(dynOrdersCntRow);\n\n  /* === новые динамики выручки и СПП (31 день) ==================== */\n  const toArr = (arr, fixed = 2) =>\n    arr.length === 31\n      ? arr.map(v => toStr((num(v) || 0).toFixed(fixed)))\n      : Array(31).fill('0');\n\n  const dm = sl.day_metrics || {};\n\n  rowsSalesPre.push(  toArr(dm.sales_pre  || []) );\n  rowsSalesPost.push( toArr(dm.sales_post || []) );\n  rowsOrdersPre.push( toArr(dm.orders_pre || []) );\n  rowsOrdersPost.push(toArr(dm.orders_post|| []) );\n  rowsSppDyn.push(   toArr(dm.spp        || []) );   // СПП %\n\n  /* === динамика затрат на рекламу MU … NY ======================= */\n  rowsAdDyn.push( toArr(adDynByBC.get(bc) || Array(31).fill(0)) );\n\n  /* === агрегированные поля заказов CE … CX ====================== */\n  const daysNoOrdersCur = sl.days_no_orders_cur ?? '';\n\n  const ordersRevPreCur   = num(sl.orders_pre_spp_cur) ?? num(sl.orders_rev_pre_spp_cur);\n  const sppOrdersCurPct   = ordersRevPreCur\n    ? ((ordersRevPreCur - (ordersRevPostCur ?? 0)) / ordersRevPreCur)\n    : null;\n  const canCntCur         = num(sl.can_cnt_cur) ?? 0;\n\n  const ordersCntPrev     = num(sl.orders_cnt_prev) ?? 0;\n  const ordersRevPostPrev = num(sl.orders_post_spp_prev) ?? num(sl.orders_rev_post_spp_prev);\n  const ordersRevPrePrev  = num(sl.orders_pre_spp_prev)  ?? num(sl.orders_rev_pre_spp_prev);\n  const avgOrderPriceCur  = ordersCntCur  ? (ordersRevPostCur  ?? 0) / ordersCntCur  : null;\n  const avgOrderPricePrev = ordersCntPrev ? (ordersRevPostPrev ?? 0) / ordersCntPrev : null;\n  const sppOrdersPrevPct  = ordersRevPrePrev\n    ? ((ordersRevPrePrev - (ordersRevPostPrev ?? 0)) / ordersRevPrePrev)\n    : null;\n  const canCntPrev        = num(sl.can_cnt_prev) ?? 0;\n\n  const agg = Array(20).fill('');\n\n  agg[ 0] = daysNoOrdersCur;                                                 // CE\n  agg[ 1] = ordersCntCur;                                                   // CF\n  agg[ 3] = avgOrderPriceCur  != null ? toStr(avgOrderPriceCur.toFixed(2)) : ''; // CH\n  agg[ 5] = ordersRevPostCur  != null ? toStr(ordersRevPostCur.toFixed(2)) : ''; // CJ\n  agg[ 7] = ordersRevPreCur   != null ? toStr(ordersRevPreCur .toFixed(2)) : ''; // CL\n  agg[ 9] = sppOrdersCurPct   != null ? toStr((sppOrdersCurPct*100).toFixed(2)) : ''; // CN\n  agg[11] = canCntCur;                                                      // CP\n\n  agg[14] = ordersCntPrev;                                                  // CS\n  agg[15] = avgOrderPricePrev != null ? toStr(avgOrderPricePrev.toFixed(2)) : ''; // CT\n  agg[16] = ordersRevPostPrev != null ? toStr(ordersRevPostPrev.toFixed(2)) : ''; // CU\n  agg[17] = ordersRevPrePrev  != null ? toStr(ordersRevPrePrev .toFixed(2)) : ''; // CV\n  agg[18] = sppOrdersPrevPct  != null ? toStr((sppOrdersPrevPct * 100).toFixed(2)) : ''; // CW\n  agg[19] = canCntPrev;                                                    // CX\n\n  rowsOrdAgg.push(agg);\n}\n\n/* ─── финальный payload для Sheets ─────────────────────────────── */\nreturn [{\n  json: {\n    valueInputOption: 'USER_ENTERED',\n    data: [\n      /* заголовки-даты */\n      { range: 'Сводная!AY13:CC13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!DB13:EF13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!GG13:HK13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!HO13:IS13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!IW13:KA13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!KE13:LI13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!LM13:MQ13', majorDimension: 'ROWS', values: [headerDates] },\n      { range: 'Сводная!MU13:NY13', majorDimension: 'ROWS', values: [headerDates] },  // ad_spend\n\n      /* основные блоки */\n      { range: 'Сводная!B14:AU',  majorDimension: 'ROWS', values: rowsBase     },\n      { range: 'Сводная!EH14:EU', majorDimension: 'ROWS', values: rowsMetrics  },\n      { range: 'Сводная!EV14:EV', majorDimension: 'ROWS', values: rowsAcc      },\n      { range: 'Сводная!FD14:FL', majorDimension: 'ROWS', values: rowsPrice    },\n\n      /* динамики и агрегаты */\n      { range: 'Сводная!AY14:CC', majorDimension: 'ROWS', values: rowsSalesDyn },\n      { range: 'Сводная!DB14:EF', majorDimension: 'ROWS', values: rowsOrdDyn   },\n      { range: 'Сводная!CE14:CX', majorDimension: 'ROWS', values: rowsOrdAgg   },\n\n      /* новые динамики выручки / СПП */\n      { range: 'Сводная!GG14:HK', majorDimension: 'ROWS', values: rowsSalesPre   },  // sales_pre\n      { range: 'Сводная!HO14:IS', majorDimension: 'ROWS', values: rowsSalesPost  },  // sales_post\n      { range: 'Сводная!IW14:KA', majorDimension: 'ROWS', values: rowsOrdersPre  },  // orders_pre\n      { range: 'Сводная!KE14:LI', majorDimension: 'ROWS', values: rowsOrdersPost },  // orders_post\n      { range: 'Сводная!LM14:MQ', majorDimension: 'ROWS', values: rowsSppDyn     },  // spp %\n      { range: 'Сводная!MU14:NY', majorDimension: 'ROWS', values: rowsAdDyn      },  // ad_spend\n    ],\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1824,
+        4256
+      ],
+      "id": "958d3206-a320-45f1-bded-ef4a5c0492bd",
+      "name": "create_body1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1qqYhvdWt72Mok2MZ0p309te1ToAsy8OAjNeQjmt6-PU/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1616,
+        4256
+      ],
+      "id": "e31335f9-5ff5-45ab-b52d-9977fad9d9a6",
+      "name": "insert_data1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/*  ▸ {{ $json.seller_id }} – подставляется из n8n / GraphQL / PostgREST и т. д.  */\nSELECT\n  JSON_OBJECT(\n    'seller_id',  '{{ $json.seller_id }}',\n    'bc_metrics',\n      (\n        SELECT JSON_ARRAYAGG(\n                 JSON_OBJECT(\n                   'barcode',                rd.barcode,\n                   'nmid',                   rd.nmid,\n                   /* ───── текущие 31 день ───── */\n                   'days_no_sales_cur',      rd.days_no_sales_cur,\n                   'days_no_orders_cur',     rd.days_no_orders_cur,\n                   'sales_rev_pre_spp_cur',  rd.sales_rev_pre_spp_cur,\n                   'sales_rev_post_spp_cur', rd.sales_rev_post_spp_cur,\n                   'sales_cnt_cur',          rd.sales_cnt_cur,\n                   'ret_cnt_cur',            rd.ret_cnt_cur,                  \n                   'orders_rev_pre_spp_cur', rd.orders_rev_pre_spp_cur,\n                   'orders_rev_post_spp_cur',rd.orders_rev_post_spp_cur,\n                   'orders_cnt_cur',         rd.orders_cnt_cur,\n                   'can_cnt_cur',            rd.can_cnt_cur,    \n                   'comwb_sales_cur',        rd.comwb_sales_cur,\n                   'forpay_cur',             rd.forpay_cur,\n                   'log_cost_cur',           rd.log_cost_cur,\n                   'log_ret_cur',            rd.log_ret_cur,\n                   'cogs_sales_cur',         rd.cogs_sales_cur,\n                    \n                   /* ───── предыдущие 31 день ───── */\n                   'sales_rev_pre_spp_prev',  rd.sales_rev_pre_spp_prev,\n                   'sales_rev_post_spp_prev', rd.sales_rev_post_spp_prev,\n                   'sales_cnt_prev',          rd.sales_cnt_prev,\n                   'ret_cnt_prev',            rd.ret_cnt_prev,        \n                   'orders_rev_pre_spp_prev', rd.orders_rev_pre_spp_prev,\n                   'orders_rev_post_spp_prev',rd.orders_rev_post_spp_prev,\n                   'orders_cnt_prev',         rd.orders_cnt_prev,\n                   'can_cnt_prev',            rd.can_cnt_prev,      \n                   'comwb_sales_prev',        rd.comwb_sales_prev,\n                   'forpay_prev',             rd.forpay_prev,\n                   'log_cost_prev',           rd.log_cost_prev,\n                   'log_ret_prev',            rd.log_ret_prev,\n                   'cogs_sales_prev',         rd.cogs_sales_prev,\n                   /* ───── динамика по дням (JSON) ───── */\n                   'day_metrics',             rd.day_metrics\n                 )\n               )\n        FROM GS_RNP_ReportDetail_daily rd\n        WHERE rd.seller_id = '{{ $json.seller_id }}'\n      )\n  )                 AS sales;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        3808
+      ],
+      "id": "25bf97d1-1505-46bd-ab7e-84e34be34910",
+      "name": "get_all_sales1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT JSON_ARRAYAGG(\n         JSON_OBJECT(\n           'advertId',    s.advertId,\n           'campName',    s.campName,\n           'advertType',  s.advertType,\n           'paymentType', s.paymentType,\n           'advertStatus',s.advertStatus,\n           'updNum',      s.updNum,\n           'updTime',     s.updTime,\n           'updSum',      s.updSum,\n           'seller_id',   s.seller_id,\n           'nmid',        s.nmid,\n           'brand',       s.brand,\n           'subjectName', s.subjectName\n         )\n       ) AS adexpenses\nFROM WB_ad_expenses s\nWHERE s.seller_id = '{{ $json.seller_id }}'\n  AND s.updTime   >= DATE_SUB(NOW(), INTERVAL 62 DAY);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        4192
+      ],
+      "id": "800c8ef5-4138-4d84-89ca-618dacb1fa63",
+      "name": "get_adexpenses1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT JSON_ARRAYAGG(\n         JSON_OBJECT(\n           'date',             sf.date,\n           'warehouse',        sf.warehouse,\n           'warehousePrice',   sf.warehousePrice,\n           'volume',           sf.volume,\n           'size',             sf.size,\n           'barcode',          sf.barcode,\n           'subject',          sf.subject,\n           'brand',            sf.brand,\n           'vendorCode',       sf.vendorCode,\n           'nmid',             sf.nmid,\n           'barcodesCount',    sf.barcodesCount,\n           'palletCount',      sf.palletCount,\n           'loyaltyDiscount',  sf.loyaltyDiscount\n         )\n       ) AS storagefee\nFROM WB_storage_fee_final sf\nWHERE sf.seller_id = '{{ $json.seller_id }}'\n  AND sf.date      >= DATE_SUB(NOW(), INTERVAL 31 DAY);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        4400
+      ],
+      "id": "31c11b68-21cb-4fc6-b734-203182db63cf",
+      "name": "get_storage_fee2",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT JSON_ARRAYAGG(\n         JSON_OBJECT(\n           'shkCreateDate',    sf.shkCreateDate,\n           'nmID',             sf.nmID,\n           'count',            sf.count,\n           'total',            sf.total\n         )\n       ) AS acceptance\nFROM WB_acceptance_final sf\nWHERE sf.seller_id = '{{ $json.seller_id }}'\n  AND sf.shkCreateDate  >= DATE_SUB(NOW(), INTERVAL 62 DAY);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        -2448,
+        4592
+      ],
+      "id": "9907bee6-f1e7-4527-a557-28ab9b97214f",
+      "name": "get_storage_fee3",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — date_from/date_to по total_sku (помесячно)\n *\n * Вход: один item = товар селлера.\n *\n * Логика:\n * 1) Если total_sku === null:\n *      - считаем селлера новым;\n *      - берем today - 180 дней;\n *      - сдвигаем начало к 1 числу месяца этого дня;\n *      - режем на месяцы до today;\n *      - последний месяц обрезаем по today.\n *\n * 2) Если total_sku !== null:\n *      - total_sku — JSON / объект с полем day_metrics (YYYY-MM-DD);\n *      - lastDay = day_metrics;\n *      - берем lastDay - 14 дней (оверлап);\n *      - сдвигаем начало к 1 числу месяца этой даты;\n *      - режем по месяцам до lastDay;\n *      - последний месяц обрезаем по lastDay.\n *\n * 3) Если total_sku есть, но парс не удался или нет day_metrics:\n *      - используем логику \"новый селлер\" (как в п.1).\n */\n\nconst srcItems = $input.all();\nif (!srcItems.length) return [];\n\n/* — Утилиты — */\nconst pad = n => String(n).padStart(2, '0');\nconst fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;\nconst firstDayOfMonth = d => new Date(d.getFullYear(), d.getMonth(), 1);\nconst lastDayOfMonth  = d => new Date(d.getFullYear(), d.getMonth() + 1, 0); // 0-й день след. месяца\nconst addMonths = (d, delta) => new Date(d.getFullYear(), d.getMonth() + delta, 1);\nconst dayMs = 86_400_000;\n\nconst parseDate = (s) => {\n  if (!s) return null;\n  const t = String(s).trim();\n  if (!t) return null;\n  // поддержим \"YYYY-MM-DD\" и \"YYYY-MM-DD HH:MM:SS\"\n  const iso = t.includes(' ') ? t.replace(' ', 'T') : t;\n  const d = new Date(iso);\n  return isNaN(d.getTime()) ? null : d;\n};\n\n/* — Константы — */\nconst today            = new Date();           // момент выполнения узла\nconst startOf2025      = new Date(2025, 0, 1);\nconst lookBackNewDays  = 180;                 // для новых селлеров\nconst overlapOldDays   = 14;                  // оверлап для существующих (day_metrics - 14)\n\n/* — Генерация чанков — */\n\nfunction buildChunksForNewSeller() {\n  const earliest = new Date(today.getTime() - lookBackNewDays * dayMs);\n  let rangeStart = firstDayOfMonth(earliest);\n\n  // Не уходим левее 01.01.2025 (если нужно, можно убрать это ограничение)\n  if (rangeStart < startOf2025) rangeStart = new Date(startOf2025);\n\n  const chunks = [];\n  for (let cur = new Date(rangeStart); cur <= today; cur = addMonths(cur, 1)) {\n    const isLastMonth = (cur.getFullYear() === today.getFullYear() &&\n                         cur.getMonth() === today.getMonth());\n    let end = isLastMonth ? today : lastDayOfMonth(cur);\n    if (end < cur) break;\n    chunks.push([cur, end]);\n  }\n  return chunks;\n}\n\nfunction buildChunksForExistingSeller(lastDay) {\n  if (!lastDay || isNaN(lastDay.getTime())) {\n    return buildChunksForNewSeller();\n  }\n\n  const from = new Date(lastDay.getTime() - overlapOldDays * dayMs);\n  let rangeStart = firstDayOfMonth(from);\n\n  if (rangeStart < startOf2025) rangeStart = new Date(startOf2025);\n\n  const chunks = [];\n  for (let cur = new Date(rangeStart); cur <= lastDay; cur = addMonths(cur, 1)) {\n    const isLastMonth = (cur.getFullYear() === lastDay.getFullYear() &&\n                         cur.getMonth() === lastDay.getMonth());\n    let end = isLastMonth ? lastDay : lastDayOfMonth(cur);\n    if (end < cur) break;\n    chunks.push([cur, end]);\n  }\n  return chunks;\n}\n\n/* — Основной проход — */\n\nconst out = [];\n\nfor (const item of srcItems) {\n  const base = item.json;\n  let chunks = [];\n\n  const totalSku = base.total_sku;\n\n  if (totalSku == null) {\n    // Новый селлер\n    chunks = buildChunksForNewSeller();\n  } else {\n    // Пытаемся вытащить day_metrics из total_sku\n    let meta;\n    try {\n      meta = (typeof totalSku === 'string') ? JSON.parse(totalSku) : totalSku;\n    } catch (e) {\n      meta = null;\n    }\n\n    const lastDayMetrics = meta ? parseDate(meta.day_metrics) : null;\n\n    if (lastDayMetrics) {\n      chunks = buildChunksForExistingSeller(lastDayMetrics);\n    } else {\n      // total_sku есть, но без валидного day_metrics → считаем как новый\n      chunks = buildChunksForNewSeller();\n    }\n  }\n\n  // Клонируем на каждый чанк\n  for (const [from, to] of chunks) {\n    const clone = JSON.parse(JSON.stringify(item));\n    clone.json.date_from = fmt(from);\n    clone.json.date_to   = fmt(to);\n    out.push(clone);\n  }\n}\n\n/* — Прогресс-бар по чанкам — */\n\nconst totalCount = out.length;\nconst totalsPerSeller = {};\n\nfor (const { json } of out) {\n  const sid = String(json.seller_id ?? '');\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n}\n\nconst countersPerSeller = {};\n\nout.forEach((elem, idx) => {\n  const d   = elem.json;\n  const sid = String(d.seller_id ?? '');\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n  const frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n  const filled     = Math.min(10, Math.max(0, Math.floor(frac * 10)));\n  const bar        = '▮'.repeat(filled) + '▯'.repeat(10 - filled);\n  const percent    = Math.round(frac * 100);\n  const brand      = d.wb_api_brand || d.brand || '';\n\n  d.textg =\n    `<b>10 GS RNP | Сводная</b>\\n` +\n    `<blockquote>▫️Этап 1. Подсчет day_metrics\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ Артикулы селлера: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Артикулов всего: ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\n/* — Готово — */\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3104,
+        368
+      ],
+      "id": "71a50a1f-c38a-4a25-94db-ccf2c9e34d68",
+      "name": "Code12"
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3424,
+        368
+      ],
+      "id": "5f9fb344-3638-4be4-b5e1-9efae1d6aeb7",
+      "name": "Loop_weakly2"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node\n * Агрегируем заказы покарточно-помесячно → массив JSON\n * (готово для последующего Insert/Upsert в GS_RNP_ReportDetail_daily).\n *\n * ✓ Проценты выкупа / отмен / возвратов считаем ТОЛЬКО по дате заказа (Date_order)\n *   └ в числителе — число заказов того дня с нужным финальным статусом\n *   └ в знаменателе — все заказы того дня с финальным статусом\n * ✓ Суммы денег (rev, commissions и т.д.) привязываем к фактическим датам\n *   Date_cancel / date_sales / date_return.\n *\n * Особенности доработки:\n * 1. Месяц формируется с ведущим нулём (“01” … “12”).\n * 2. Поле seller_bc_month_year_key соответствует формату\n *    seller_id_barcode_MM_YYYY — т.е. «01» вместо «1».\n */\n\nconst inputItems = items;\nconst groups = {};\n\n//────────────────────────────────────────────────────────────────────\n// 1. ГРУППИРОВКА по seller_id + barcode + месяц + год\n//────────────────────────────────────────────────────────────────────\nfunction comboKey(seller, bc, mStr, y) {\n\treturn `${seller}_${bc}_${mStr}_${y}`; // ключ с «01»\n}\n\nfunction monthYear(dateStr) {\n\tconst d = new Date(dateStr);\n\tconst mStr = String(d.getUTCMonth() + 1).padStart(2, '0'); // \"01\" … \"12\"\n\treturn [mStr, d.getUTCFullYear()];\n}\n\n/* обходит сплошной диапазон месяцев от from до to и вызывает cb(date,mStr) */\nfunction addMonthSpan(from, to, cb) {\n\tlet d = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));\n\twhile (d <= to) {\n\t\tconst mStr = String(d.getUTCMonth() + 1).padStart(2, '0');\n\t\tcb(d, mStr);\n\t\td.setUTCMonth(d.getUTCMonth() + 1);\n\t}\n}\n\nfor (const itm of inputItems) {\n\tconst o = itm.json;\n\tconst months = new Set();\n\n\t['Date_order', 'date_sales', 'Date_cancel', 'date_return']\n\t\t.forEach(f => {\n\t\t\tif (o[f]) {\n\t\t\t\tconst [mStr, y] = monthYear(o[f]);\n\t\t\t\tmonths.add(`${mStr}-${y}`);\n\t\t\t}\n\t\t});\n\n\t/* если продаж не было, заполняем диапазон месяцев “от-до” */\n\tif (months.size === 0) {\n\t\taddMonthSpan(new Date(o.date_from), new Date(o.date_to),\n\t\t\t(_d, mStr) => months.add(`${mStr}-${_d.getUTCFullYear()}`));\n\t}\n\n\tfor (const m of months) {\n\t\tconst [monthStr, year] = m.split('-');      // monthStr = \"01\"\n\t\tconst key = comboKey(o.seller_id, o.BC, monthStr, year);\n\n\t\tif (!groups[key]) {\n\t\t\tgroups[key] = {\n\t\t\t\tmeta: {\n\t\t\t\t\tseller_bc_month_year_key: key,\n\t\t\t\t\tmonth: +monthStr,           // числовое 1 … 12, но ключ уже с «01»\n\t\t\t\t\tyear: +year,\n\t\t\t\t\tseller_id: o.seller_id,\n\t\t\t\t\twb_api_brand: o.wb_api_brand ?? '',\n\t\t\t\t\tSubject: o.Subject ?? '',\n\t\t\t\t\tbarcode: o.BC,\n\t\t\t\t\ttitle: o.title ?? '',\n\t\t\t\t\tphoto: o.photo ?? '',\n\t\t\t\t\tnmid: o.nmID ?? null,\n\t\t\t\t\tsupplierArticle: o.supplierArticle ?? '',\n\t\t\t\t\tsize: o.Size ?? ''\n\t\t\t\t},\n\t\t\t\torders: []\n\t\t\t};\n\t\t}\n\t\tgroups[key].orders.push(o);\n\t}\n}\n\n//────────────────────────────────────────────────────────────────────\n// 2. ДНЕВНЫЕ МЕТРИКИ\n//────────────────────────────────────────────────────────────────────\nconst sum = (arr, f) => arr.reduce((a, v) => a + (parseFloat(v[f]) || 0), 0);\nconst avg = (arr, f) => arr.length ? arr.reduce((a, v) => a + (parseFloat(v[f]) || 0), 0) / arr.length : null;\n\nconst outputs = [];\n\nfor (const g of Object.values(groups)) {\n\tconst { month, year } = g.meta;\n\tconst first = new Date(Date.UTC(year, month - 1, 1));\n\tconst last  = new Date(Date.UTC(year, month    , 0));\n\n\tconst dayMetrics = [];\n\n\tfor (let d = new Date(first); d <= last; d.setUTCDate(d.getUTCDate() + 1)) {\n\t\tconst dateStr = d.toISOString().slice(0, 10);\n\n\t\t/* заказы по дате размещения */\n\t\tconst ord = g.orders.filter(o => (o.Date_order ?? '').startsWith(dateStr));\n\n\t\t/* счётчики финальных статусов */\n\t\tconst buyCnt  = ord.filter(o => o.status === 'Выкуп').length;\n\t\tconst cancCnt = ord.filter(o => o.status === 'Отмена').length;\n\t\tconst retCnt  = ord.filter(o => o.status === 'Возврат').length;\n\t\tconst denom   = buyCnt + cancCnt + retCnt;\n\n\t\tconst pct = num => denom ? +((num / denom) * 100).toFixed(2) : 0;\n\n\t\t/* события (деньги) по фактическим датам */\n\t\tconst buyEvt  = g.orders.filter(o => o.status === 'Выкуп'   && (o.date_sales   ?? '').startsWith(dateStr));\n\t\tconst cancEvt = g.orders.filter(o => o.status === 'Отмена'  && (o.Date_cancel  ?? '').startsWith(dateStr));\n\t\tconst retEvt  = g.orders.filter(o => o.status === 'Возврат' && (o.date_return ?? '').startsWith(dateStr));\n\n\t\tdayMetrics.push({\n\t\t\tdate:            dateStr,\n\n\t\t\torders_sum_pre:  sum(ord, 'priceWithDisc'),\n\t\t\torders_sum_post: sum(ord, 'finishedPrice'),\n\t\t\torders_cnt:      ord.length,\n\n\t\t\t/* отмены */\n\t\t\tcancels_cnt:     cancEvt.length,\n\t\t\tcancels_sum:     sum(cancEvt, 'finishedPrice'),\n\t\t\tcancel_perc:     pct(cancCnt),\n\n\t\t\t/* выкупы */\n\t\t\tsales_prep_rev:  sum(buyEvt, 'priceWithDisc'),\n\t\t\tsales_post_rev:  sum(buyEvt, 'finishedPrice'),\n\t\t\tsales_cnt:       buyEvt.length,\n\t\t\tsales_buyout:    pct(buyCnt),\n\n\t\t\t/* возвраты */\n\t\t\treturns_cnt:     retEvt.length,\n\t\t\treturns_sum:     sum(retEvt, 'finishedPrice'),\n\t\t\treturns_perc:    pct(retCnt),\n\n\t\t\t/* комиссии и выплаты */\n\t\t\tcommission_sum:  sum(buyEvt, 'ComWBRub'),\n\t\t\tcommission_perc: avg(buyEvt, 'ComWBPercent'),\n\t\t\tforpay:          sum(buyEvt, 'forPay'),\n\n\t\t\t/* логистика */\n\t\t\tlog_to:          sum(ord, 'Logistics_toclient_cost'),\n\t\t\tlog_from:        sum(cancEvt, 'Logistics_return_cost') + sum(retEvt, 'Logistics_return_cost'),\n\n\t\t\t/* средний СПП */\n\t\t\tspp: ord.length ? +(\n\t\t\t\tord.reduce((a, o) => {\n\t\t\t\t\tconst pre  = parseFloat(o.priceWithDisc)  || 0;\n\t\t\t\t\tconst post = parseFloat(o.finishedPrice) || 0;\n\t\t\t\t\treturn a + (pre ? ((pre - post) / pre) : 0);\n\t\t\t\t}, 0) / ord.length * 100\n\t\t\t).toFixed(2) : null,\n\n\t\t\t/* себестоимость */\n\t\t\tcogs:            sum(buyEvt, 'Pur_price'),\n\t\t});\n\t}\n\n\t//────────────────────────────────────────────────────────────────\n\t// 3. ВЫХОД\n\t//────────────────────────────────────────────────────────────────\n\toutputs.push({\n\t\tjson: {\n\t\t\t...g.meta,\n\t\t\tday_metrics: dayMetrics   // массив объектов\n\t\t}\n\t});\n}\n\nreturn outputs;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3696,
+        624
+      ],
+      "id": "f6e40cea-50a3-4f05-a32c-0e28a2fa74af",
+      "name": "create_data2"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/*  ──────────────────────────────────────────────────────────────────────────\n   Данные по (seller_id, BC) за период {{ $json[\"date_from\"] }}–{{ $json[\"date_to\"] }}\n────────────────────────────────────────────────────────────────────────── */\n\nSELECT\n    /* системные метки периода и карточки товара — ВСЕГДА не-NULL */\n    '{{ $json[\"date_from\"] }}' AS date_from,\n    '{{ $json[\"date_to\"]   }}' AS date_to,\n    '{{ $json[\"title\"]     }}' AS title,\n    '{{ $json[\"photo\"]     }}' AS photo,\n\n    /* ключевые поля */\n    COALESCE(d.BC,        p.skus)        AS BC,\n    p.nmID,\n    COALESCE(d.seller_id, p.seller_id)   AS seller_id,\n    s.wb_api_brand,\n\n    /* гарантируемые поля */\n    COALESCE(d.Size,            p.Size)          AS Size,\n    COALESCE(d.supplierArticle, p.vendorCode)    AS supplierArticle,\n    COALESCE(d.Subject,         p.subjectName)   AS Subject,\n\n    /* показатели из GS_RNP_ReportDetail (могут быть NULL) */\n    d.id,\n    d.status,\n    d.srid_seller_sale_key,\n    d.Date_order,\n    d.Date_cancel,\n    d.date_sales,\n    d.date_return,\n    d.Warehouse,\n    d.Warehouse_type,\n    d.Country,\n    d.Okrug,\n    d.Region,\n    d.nmId                AS nmId_sale,\n    d.SPP,\n    d.TotalPrice,\n    d.Discount,\n    d.priceWithDisc,\n    d.finishedPrice,\n    d.gNumber,\n    d.srid,\n    d.orderType,\n    d.finishedPriceFact,\n    d.paymentSaleAmount,\n    d.forPay,\n    d.ComWBRub,\n    d.ComWBPercent,\n    d.Pur_price,\n    d.Logistics_toclient_cost,\n    d.Logistics_return_cost,\n    d.Pur_date\n\nFROM   WB_products             AS p\n\n/* продажи/возвраты только внутри заданного диапазона */\nLEFT   JOIN GS_RNP_ReportDetail AS d\n       ON  d.BC        = p.skus\n       AND d.seller_id = p.seller_id\n       AND d.Date_order BETWEEN '{{ $json[\"date_from\"] }}'\n                             AND '{{ $json[\"date_to\"]   }}'\n\n/* бренд продавца */\nLEFT   JOIN WB_sellers          AS s\n       ON  s.seller_id = p.seller_id\n\nWHERE  p.skus      = '{{ $json[\"skus\"] }}'\n  AND  p.seller_id = '{{ $json[\"seller_id\"] }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        624
+      ],
+      "id": "837f71d3-daf8-4b19-b8ec-da5dac69eb5d",
+      "name": "get_sales_rows5",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly2').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4144,
+        624
+      ],
+      "id": "9b21f425-63c3-43b8-b2b6-adf4c5c74b8e",
+      "name": "send_logs_finish4",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "GS_RNP_ReportDetail_daily",
+          "mode": "list",
+          "cachedResultName": "GS_RNP_ReportDetail_daily"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_bc_month_year_key",
+        "valueToMatchOn": "={{ $json.seller_bc_month_year_key }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "month",
+              "value": "={{ $json.month }}"
+            },
+            {
+              "column": "year",
+              "value": "={{ $json.year }}"
+            },
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "wb_api_brand",
+              "value": "={{ $json.wb_api_brand }}"
+            },
+            {
+              "column": "Subject",
+              "value": "={{ $json.Subject }}"
+            },
+            {
+              "column": "barcode",
+              "value": "={{ $json.barcode }}"
+            },
+            {
+              "column": "title",
+              "value": "={{ $json.title }}"
+            },
+            {
+              "column": "photo",
+              "value": "={{ $json.photo }}"
+            },
+            {
+              "column": "nmid",
+              "value": "={{ $json.nmid }}"
+            },
+            {
+              "column": "supplierArticle",
+              "value": "={{ $json.supplierArticle }}"
+            },
+            {
+              "column": "size",
+              "value": "={{ $json.size }}"
+            },
+            {
+              "column": "day_metrics",
+              "value": "={{ JSON.stringify($json.day_metrics) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3920,
+        624
+      ],
+      "id": "fb6ffde3-213d-44d0-b688-be9f888257fc",
+      "name": "upsert_rows2",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* список (seller_id, nmid) + JSON-массив всех уникальных штрих-кодов */\nSELECT\n    t.seller_id,\n    t.nmid,\n    JSON_ARRAYAGG(t.barcode) AS barcodes         -- ← в агрегат идёт уже dedup-набор\nFROM (\n    SELECT DISTINCT\n           rd.seller_id,\n           rd.nmid,\n           rd.barcode\n    FROM   GS_RNP_ReportDetail_daily rd\n    WHERE  rd.seller_id = '{{ $json.seller_id }}'\n) AS t\nGROUP BY\n    t.seller_id,\n    t.nmid;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2880,
+        1552
+      ],
+      "id": "d6bbd7db-e608-4f91-b56b-ce5dbb66e60f",
+      "name": "get_all_nmids3",
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO WB_storage_fee_daily\n        (seller_bc_month_year_key,\n         seller_id,\n         month,\n         year,\n         nmid,\n         barcode,\n         day_storage)\n\nSELECT\n    /* ключ вида seller_barcode_MM_YYYY */\n    CONCAT('{{ $json[\"seller_id\"] }}', '_',\n           '{{ $json[\"skus\"] }}', '_',\n           DATE_FORMAT(fee_date,'%m_%Y'))          AS seller_bc_month_year_key,\n\n    '{{ $json[\"seller_id\"] }}'                     AS seller_id,\n    MONTH(fee_date)                                AS month,\n    YEAR(fee_date)                                 AS year,\n    ANY_VALUE(nmid)                                AS nmid,\n    '{{ $json[\"skus\"] }}'                          AS barcode,\n\n    /* плоский массив объектов {date, storage} */\n    JSON_ARRAYAGG(\n        JSON_OBJECT(\n            'date',    DATE_FORMAT(fee_date,'%Y-%m-%d'),\n            'storage', storage_sum\n        )\n    )                                              AS day_storage\n\nFROM (\n        /* суточная агрегация ТОЛЬКО в пределах date_from…date_to */\n        SELECT\n            DATE(`date`)        AS fee_date,\n            SUM(warehousePrice) AS storage_sum,\n            ANY_VALUE(nmId)     AS nmid\n        FROM WB_storage_fee_final\n        WHERE seller_id  = '{{ $json[\"seller_id\"] }}'\n          AND barcode    = '{{ $json[\"skus\"] }}'\n          AND `date` BETWEEN '{{ $json[\"date_from\"] }}'  -- ← нижняя граница\n                         AND '{{ $json[\"date_to\"] }}'    -- ← верхняя граница\n        GROUP BY DATE(`date`)\n        ORDER BY DATE(`date`)\n) AS daily\n\n/* одна запись на месяц, если диапазон захватывает несколько месяцев → будет несколько строк */\nGROUP BY YEAR(fee_date), MONTH(fee_date)\n\nON DUPLICATE KEY UPDATE\n    day_storage = VALUES(day_storage),   -- полностью перезаписываем массив\n    nmid        = VALUES(nmid),\n    month       = VALUES(month),\n    year        = VALUES(year);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        1216
+      ],
+      "id": "d6868ed9-f6e1-4702-8bdb-c019afd07091",
+      "name": "json_storage",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* ───────── входные параметры из n8n ───────── */\nSET @seller_id     := '{{ $json[\"seller_id\"] }}';\nSET @nmid          := '{{ $json[\"nmid\"] }}';\nSET @barcodes_json := '{{ JSON.stringify($json[\"barcodes\"]) }}';\n\n/* ───────── INSERT … SELECT 1-строка-на-месяц ───────── */\nINSERT INTO WB_ad_expenses_daily\n        (seller_bc_month_year_key,\n         seller_id,\n         month,\n         year,\n         nmid,\n         barcode,\n         day_adexpenses)\n\nSELECT\n    CONCAT(@seller_id,'_',calc.barcode,'_',\n           DATE_FORMAT(calc.order_date,'%m_%Y'))            AS seller_bc_month_year_key,\n    @seller_id                                             AS seller_id,\n    MONTH(calc.order_date)                                 AS month,\n    YEAR(calc.order_date)                                  AS year,\n    @nmid                                                  AS nmid,\n    calc.barcode                                           AS barcode,\n\n    /* плоский массив объектов {date, acceptance} */\n    JSON_ARRAYAGG(\n        JSON_OBJECT(\n            'date',    DATE_FORMAT(calc.order_date,'%Y-%m-%d'),\n            'adexpenses', calc.alloc_sum\n        )\n    )                                                      AS day_adexpenses\n\nFROM (\n        /* ----------- вся «математика» по дням ----------- */\n        SELECT\n            o.barcode,\n            o.order_date,\n            CASE\n                WHEN t.total_orders > 0\n                     THEN ROUND(a.ad_sum * o.orders_cnt / t.total_orders, 2)\n                ELSE ROUND(a.ad_sum / t.sku_cnt, 2)\n            END AS alloc_sum\n        FROM\n            /* 1. заказы по каждому SKU-дню */\n            (\n              SELECT\n                  g.barcode,\n                  jt.dt                     AS order_date,\n                  COALESCE(jt.orders_cnt,0) AS orders_cnt\n              FROM GS_RNP_ReportDetail_daily g\n              JOIN JSON_TABLE(@barcodes_json,'$[*]'\n                              COLUMNS(bc VARCHAR(24) PATH '$')) b\n                    ON g.barcode = b.bc\n              CROSS JOIN JSON_TABLE(\n                         g.day_metrics,'$[*]'\n                         COLUMNS(\n                           dt         DATE PATH '$.date',\n                           orders_cnt INT  PATH '$.orders_cnt'\n                         )\n                       ) jt\n              WHERE g.seller_id = @seller_id\n                AND g.nmid      = @nmid\n            ) o\n\n            /* 2. дневные расходы на рекламу */\n            JOIN (\n                  SELECT DATE(updTime) AS ad_date,\n                         SUM(updSum)  AS ad_sum\n                  FROM   WB_ad_expenses\n                  WHERE  seller_id = @seller_id\n                    AND  nmid      = @nmid\n                  GROUP BY ad_date\n            ) a  ON a.ad_date = o.order_date\n\n            /* 3. totals по всему артикулу (qty & #SKU) */\n            JOIN (\n                  SELECT\n                      DATE(jt2.dt)            AS order_date,\n                      SUM(jt2.orders_cnt)     AS total_orders,\n                      JSON_LENGTH(@barcodes_json) AS sku_cnt\n                  FROM GS_RNP_ReportDetail_daily g2\n                  JOIN JSON_TABLE(@barcodes_json,'$[*]'\n                                  COLUMNS(bc VARCHAR(24) PATH '$')) b2\n                        ON g2.barcode = b2.bc\n                  CROSS JOIN JSON_TABLE(\n                             g2.day_metrics,'$[*]'\n                             COLUMNS(\n                               dt         DATE PATH '$.date',\n                               orders_cnt INT  PATH '$.orders_cnt'\n                             )\n                           ) jt2\n                  WHERE g2.seller_id = @seller_id\n                    AND g2.nmid      = @nmid\n                  GROUP BY order_date\n            ) t ON t.order_date = o.order_date\n) calc\n\n/* ------ группируем в ОДНУ строку на месяц ------ */\nGROUP BY\n    calc.barcode,\n    YEAR(calc.order_date),\n    MONTH(calc.order_date)\n\n/* ------ если ключ уже есть → просто заменяем JSON ------ */\nON DUPLICATE KEY UPDATE\n    day_adexpenses = VALUES(day_adexpenses),\n    month          = VALUES(month),\n    year           = VALUES(year),\n    nmid           = VALUES(nmid);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        1808
+      ],
+      "id": "727e0f2f-1f6d-4e2f-9547-c0fed6293e6c",
+      "name": "json_adexpense",
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Заполнение day_metrics\nВытаскиваем чанками продажи и формируем канву и хронологию с начала года",
+        "height": 580,
+        "width": 960
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3344,
+        288
+      ],
+      "id": "84c1d79d-7eb3-42cd-8657-1400ea3b6860",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "batchSize": 250,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3392,
+        976
+      ],
+      "id": "79504cf7-37f2-4951-9ed3-33c947c2feda",
+      "name": "Loop_weakly3"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly3').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        1216
+      ],
+      "id": "fe618339-3f9b-484c-aa63-7e83a66bdda6",
+      "name": "send_logs_finish7",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — формирует диапазоны date_from / date_to + текст прогресса\n *\n * Правила:\n * ────────────────────────────────────────────────────────────────\n * 1. Если `rnp_reportdetail_daily` == null\n *    → берём ОДИН диапазон “c 1 января текущего года по сегодня”.\n *\n * 2. Если `rnp_reportdetail_daily` содержит дату (ISO datetime / timestamp)\n *    → отнимаем 14 дней от этой даты, берём 1-е число того месяца\n *      и ставим его в date_from; date_to = сегодня.\n *      Пример: today = 04-08-2025,  rnp = 2025-07-10 → 14 дней назад\n *              = 26-06-2025 → начало месяца = 01-06-2025.\n *\n * На каждый входной элемент создаётся ровно ОДИН выходной.\n */\n\nconst srcItems = $input.all();\nif (!srcItems.length) return [];\n\n/* ─ Утилиты ─ */\nconst pad  = n => String(n).padStart(2, '0');\nconst fmt  = d => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\nconst firstDay = d => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));\nconst dayMs = 86_400_000;\n\n/* ─ Константы ─ */\nconst today = new Date();        // «сейчас» узла (локальный, но ISO-строка будет UTC)\n\n/* ─ Формируем выход ─ */\nconst out = [];\n\nfor (const item of srcItems) {\n\tconst base = item.json;\n\tlet dateFrom, dateTo;\n\n\t/* 1) Есть данные → 14 дней назад от даты RNP, округлённые до 1-го числа месяца */\n\tif (base.rnp_reportdetail_daily != null) {\n\t\t// Пытаемся распарсить ISO или timestamp\n\t\tconst rnpDate = new Date(base.rnp_reportdetail_daily);\n\t\tconst minus14 = new Date(rnpDate.getTime() - 14 * dayMs);\n\t\tdateFrom = firstDay(minus14);\n\t\tdateTo   = today;\n\t}\n\n\t/* 2) Данных нет → c 1 января текущего года */\n\telse {\n\t\tdateFrom = new Date(Date.UTC(today.getUTCFullYear(), 0, 1)); // 01-01-YYYY\n\t\tdateTo   = today;\n\t}\n\n\t/* Клонируем элемент и дописываем поля */\n\tconst clone = JSON.parse(JSON.stringify(item)); // deep copy\n\tclone.json.date_from = fmt(dateFrom);\n\tclone.json.date_to   = fmt(dateTo);\n\tout.push(clone);\n}\n\n/* ─ Прогресс-бар (по элементам) ─ */\nconst totalCount = out.length;\nconst totalsPerSeller = {};\nout.forEach(({ json }) => {\n\tconst sid = String(json.seller_id ?? \"\");\n\ttotalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n});\n\nconst countersPerSeller = {};\nout.forEach((elem, idx) => {\n\tconst d   = elem.json;\n\tconst sid = String(d.seller_id ?? \"\");\n\tcountersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n\tconst localIdx   = countersPerSeller[sid];\n\tconst localTotal = totalsPerSeller[sid];\n\tconst frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n\tconst bar        = '▮'.repeat(Math.floor(frac * 10)) + '▯'.repeat(10 - Math.floor(frac * 10));\n\tconst percent    = Math.round(frac * 100);\n\tconst brand      = d.wb_api_brand || d.brand || '';\n\n\td.textg =\n\t\t`<b>10 GS RNP | Сводная</b>\\n` +\n\t\t`<blockquote>☑️ Этап 1. Подсчёт day_metrics\\n` +\n\t\t`▫️ Этап 2. Подсчёт day_storage\\n` +\n\t\t`     ╠ Бренд: ${brand}\\n` +\n\t\t`     ╠ Артикулы селлера: ${localIdx} из ${localTotal}\\n` +\n\t\t`     ╠ Артикулов всего: ${idx + 1} из ${totalCount}\\n` +\n\t\t`     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\n/* ─ Готово ─ */\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3104,
+        976
+      ],
+      "id": "3ab493ca-0afc-4e11-a28b-5af8a5b2e4b4",
+      "name": "Code16"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — просто добавляет / обновляет поле textg\n * для каждого входного элемента (никаких расчётов дат).\n *\n * Формат текста:\n * ------------------------------------------------------------\n * <b>10 GS RNP | Сводная</b>\n * <blockquote>☑️ Этап 1. Подсчёт day_metrics\n * ☑️ Этап 2. Подсчёт day_storage\n * ▫️ Этап 3. Подсчёт day_adexpenses\n *      ╠ Бренд: …\n *      ╠ Артикулы селлера: N из M\n *      ╠ Артикулов всего: i из T\n *      ╚ Прогресс: ▮▮▯▯▯▯▯▯▯▯ 20 %\n * </blockquote>\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* — счётчики для прогресса — */\nconst totalCount = items.length;\nconst totalsPerSeller = {};\nitems.forEach(({ json }) => {\n\tconst sid = String(json.seller_id ?? '');\n\ttotalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n});\n\n/* — формируем textg — */\nconst countersPerSeller = {};\nitems.forEach((elem, idx) => {\n\tconst d   = elem.json;\n\tconst sid = String(d.seller_id ?? '');\n\tcountersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n\tconst localIdx   = countersPerSeller[sid];\n\tconst localTotal = totalsPerSeller[sid];\n\tconst frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n\tconst barFilled  = Math.floor(frac * 10);\n\tconst bar        = '▮'.repeat(barFilled) + '▯'.repeat(10 - barFilled);\n\tconst percent    = Math.round(frac * 100);\n\tconst brand      = d.wb_api_brand || d.brand || '';\n\n\td.textg =\n\t\t`<b>10 GS RNP | Сводная</b>\\n` +\n\t\t`<blockquote>☑️ Этап 1. Подсчёт day_metrics\\n` +\n\t\t`☑️ Этап 2. Подсчёт day_storage\\n` +\n\t\t`▫️ Этап 3. Подсчёт day_adexpenses\\n` +\n\t\t`     ╠ Бренд: ${brand}\\n` +\n\t\t`     ╠ Артикулы селлера: ${localIdx} из ${localTotal}\\n` +\n\t\t`     ╠ Артикулов всего: ${idx + 1} из ${totalCount}\\n` +\n\t\t`     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\nreturn items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3104,
+        1552
+      ],
+      "id": "cd10495e-ca0b-49d7-a6fb-d77499a99cd3",
+      "name": "Code17"
+    },
+    {
+      "parameters": {
+        "batchSize": 250,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3392,
+        1552
+      ],
+      "id": "3b1e7a11-a9ac-4ab6-9d65-8e5fc69132c6",
+      "name": "Loop_weakly4"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* входной параметр из n8n */\nSET @seller_id := '{{ $json[\"seller_id\"] }}';\n\n/* —————————————————————————— UPDATE-JOIN —————————————————————————— */\nUPDATE GS_RNP_ReportDetail_daily   AS g\n/* рекламные списания */\nLEFT JOIN WB_ad_expenses_daily     AS a\n       ON a.seller_bc_month_year_key = g.seller_bc_month_year_key\n/* платная приёмка */\nLEFT JOIN WB_acceptance_daily      AS ac\n       ON ac.seller_bc_month_year_key = g.seller_bc_month_year_key\n/* платное хранение */\nLEFT JOIN WB_storage_fee_daily     AS st\n       ON st.seller_bc_month_year_key = g.seller_bc_month_year_key\n\n/* ——— актуализируем только найденные поля ——— */\nSET\n    g.day_adexpenses = COALESCE(a.day_adexpenses, g.day_adexpenses),\n    g.day_acceptance = COALESCE(ac.day_acceptance, g.day_acceptance),\n    g.day_storage    = COALESCE(st.day_storage,    g.day_storage)\n\n/* ——— только строки нужного продавца;            */\n/* ——— и только те, у кого есть хотя бы одно совпадение */\nWHERE g.seller_id = @seller_id\n  AND (\n        a.day_adexpenses IS NOT NULL\n     OR ac.day_acceptance IS NOT NULL\n     OR st.day_storage    IS NOT NULL\n  );",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        4560
+      ],
+      "id": "0086872f-100a-47b1-81cb-9ab2fee2787e",
+      "name": "json_merge",
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* ────────── входящие параметры из n8n ────────── */\nSET @seller_id     := '{{ $json[\"seller_id\"] }}';\nSET @nmid          := '{{ $json[\"nmid\"] }}';\nSET @barcodes_json := '{{ JSON.stringify($json[\"barcodes\"]) }}';\nSET @bc_cnt        := JSON_LENGTH(@barcodes_json);   -- сколько ШК нужно поделить\n\n/* ────────── INSERT … SELECT (одна строка на месяц) ────────── */\nINSERT INTO WB_acceptance_daily\n        (seller_bc_month_year_key,\n         seller_id,\n         month,\n         year,\n         nmid,\n         barcode,\n         day_acceptance)\n\nSELECT\n    /* ключ вида seller_barcode_MM_YYYY */\n    CONCAT(@seller_id,'_',calc.barcode,'_',\n           DATE_FORMAT(calc.acc_date,'%m_%Y'))           AS seller_bc_month_year_key,\n\n    @seller_id                                           AS seller_id,\n    MONTH(calc.acc_date)                                 AS month,\n    YEAR(calc.acc_date)                                  AS year,\n    @nmid                                                AS nmid,\n    calc.barcode                                         AS barcode,\n\n    /* плоский массив объектов {date, storage} */\n    JSON_ARRAYAGG(\n        JSON_OBJECT(\n            'date',    DATE_FORMAT(calc.acc_date,'%Y-%m-%d'),\n            'acceptance', calc.alloc_sum\n        )\n    )                                                    AS day_acceptance\n\nFROM (\n        /* ----------- «математика» по каждому дню ----------- */\n        SELECT\n            bc.bc               AS barcode,\n            ds.acc_date,\n            ROUND(ds.day_sum / @bc_cnt, 2) AS alloc_sum     -- равное распределение\n        FROM\n            /* все переданные ШК */\n            JSON_TABLE(@barcodes_json,'$[*]'\n                       COLUMNS (bc VARCHAR(24) PATH '$')\n            ) AS bc\n        /* дневная сумма принятия по продавцу + артикулу */\n        JOIN (\n              SELECT\n                  DATE(shkCreateDate)   AS acc_date,\n                  SUM(total)            AS day_sum\n              FROM WB_acceptance_final\n              WHERE seller_id = @seller_id\n                AND nmID      = @nmid\n              GROUP BY DATE(shkCreateDate)\n            ) AS ds\n          /* CROSS JOIN → каждая дата × каждый ШК */\n    ) AS calc\n\n/* одна строка на каждый barcode-месяц */\nGROUP BY\n    calc.barcode,\n    YEAR(calc.acc_date),\n    MONTH(calc.acc_date)\n\n/* если запись уже есть – перезаписываем JSON-массив ровно одним присвоением */\nON DUPLICATE KEY UPDATE\n    day_acceptance = VALUES(day_acceptance),\n    month          = VALUES(month),\n    year           = VALUES(year),\n    nmid           = VALUES(nmid);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3440,
+        2368
+      ],
+      "id": "2bc05b90-8394-4d6b-a7dd-ceb3bbc6ec6f",
+      "name": "json_acceptance",
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly4').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        1808
+      ],
+      "id": "02a63311-c631-4fa2-997a-47848b4cd2b0",
+      "name": "send_logs_finish8",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — просто добавляет / обновляет поле textg\n * для каждого входного элемента (никаких расчётов дат).\n *\n * Формат текста:\n * ------------------------------------------------------------\n * <b>10 GS RNP | Сводная</b>\n * <blockquote>☑️ Этап 1. Подсчёт day_metrics\n * ☑️ Этап 2. Подсчёт day_storage\n * ▫️ Этап 3. Подсчёт day_adexpenses\n *      ╠ Бренд: …\n *      ╠ Артикулы селлера: N из M\n *      ╠ Артикулов всего: i из T\n *      ╚ Прогресс: ▮▮▯▯▯▯▯▯▯▯ 20 %\n * </blockquote>\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n/* — счётчики для прогресса — */\nconst totalCount = items.length;\nconst totalsPerSeller = {};\nitems.forEach(({ json }) => {\n\tconst sid = String(json.seller_id ?? '');\n\ttotalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n});\n\n/* — формируем textg — */\nconst countersPerSeller = {};\nitems.forEach((elem, idx) => {\n\tconst d   = elem.json;\n\tconst sid = String(d.seller_id ?? '');\n\tcountersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n\tconst localIdx   = countersPerSeller[sid];\n\tconst localTotal = totalsPerSeller[sid];\n\tconst frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n\tconst barFilled  = Math.floor(frac * 10);\n\tconst bar        = '▮'.repeat(barFilled) + '▯'.repeat(10 - barFilled);\n\tconst percent    = Math.round(frac * 100);\n\tconst brand      = d.wb_api_brand || d.brand || '';\n\n\td.textg =\n\t\t`<b>10 GS RNP | Сводная</b>\\n` +\n\t\t`<blockquote>☑️ Этап 1. Подсчёт day_metrics\\n` +\n\t\t`☑️ Этап 2. Подсчёт day_storage\\n` +\n      \t`☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n\t\t`▫️ Этап 4. Подсчёт day_acceptance\\n` +\n\t\t`     ╠ Бренд: ${brand}\\n` +\n\t\t`     ╠ Артикулы селлера: ${localIdx} из ${localTotal}\\n` +\n\t\t`     ╠ Артикулов всего: ${idx + 1} из ${totalCount}\\n` +\n\t\t`     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\nreturn items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3104,
+        2096
+      ],
+      "id": "65dbc168-7838-4d91-b4d4-b50c1ee85a74",
+      "name": "Code18"
+    },
+    {
+      "parameters": {
+        "batchSize": 250,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3376,
+        2096
+      ],
+      "id": "e4bdb6a1-e959-422c-b10b-7e33985dbe4c",
+      "name": "Loop_weakly5"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly5').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        2368
+      ],
+      "id": "1c85607d-dc05-4788-93c0-331aaa704830",
+      "name": "send_logs_finish9",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 100,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3376,
+        4272
+      ],
+      "id": "46464c4a-4dba-424e-956f-a98f5a07518b",
+      "name": "Loop_weakly6"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly6').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        4560
+      ],
+      "id": "0304eda4-b1fc-4bf4-b44b-5ab55b11cbdf",
+      "name": "send_logs_finish10",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node  \n * На выходе остаётся всего два поля:\n *   • seller_id  — кто обработан  \n *   • texttg     — готовый HTML-отчёт\n */\n\nconst itemsIn = $input.all();\nif (!itemsIn.length) return [];\n\n/* — общее количество селлеров для прогресса — */\nconst totalCount = itemsIn.length;\n\n/* — готовим результат — */\nconst result = itemsIn.map((elem, idx) => {\n\tconst d = elem.json;\n\n\t/* расчёт прогресс-бара */\n\tconst frac      = totalCount > 1 ? idx / (totalCount - 1) : 1; // 0…1\n\tconst barFilled = Math.floor(frac * 10);\n\tconst bar       = '▮'.repeat(barFilled) + '▯'.repeat(10 - barFilled);\n\tconst percent   = Math.round(frac * 100);\n\n\tconst brand = d.wb_api_brand || d.brand || '';\n\n\t/* формируем текст */\n\tconst texttg =\n\t\t`<b>10 GS RNP | Сводная</b>\\n` +\n\t\t`<blockquote>☑️ Этап 1. Подсчёт day_metrics\\n` +\n\t\t`☑️ Этап 2. Подсчёт day_storage\\n` +\n\t\t`☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n\t\t`☑️ Этап 4. Подсчёт day_acceptance\\n` +\n\t\t`▫️ Этап 5. Мерж всех затрат\\n` +\n\t\t`     ╠ Селлер: ${brand}\\n` +\n\t\t`     ╠ Селлеров всего: ${idx + 1} из ${totalCount}\\n` +\n\t\t`     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n\t/* возвращаем только нужные поля */\n\treturn {\n\t\tjson: {\n\t\t\tseller_id: d.seller_id,\n\t\t\ttexttg,\n\t\t},\n\t};\n});\n\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2864,
+        4272
+      ],
+      "id": "f61b0996-e6eb-4f98-b0b6-7f3ed5823550",
+      "name": "Code19"
+    },
+    {
+      "parameters": {
+        "batchSize": 250,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3376,
+        3728
+      ],
+      "id": "6232fd74-67a1-4904-b608-a615bb3e50ef",
+      "name": "Loop_weakly7"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly7').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        4016
+      ],
+      "id": "6f4f3d6e-6390-4a30-9223-07117f58eb19",
+      "name": "send_logs_finish12",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node  \n * На выходе остаётся всего два поля:\n *   • seller_id  — кто обработан  \n *   • texttg     — готовый HTML-отчёт\n */\n\nconst itemsIn = $input.all();\nif (!itemsIn.length) return [];\n\n/* — общее количество селлеров для прогресса — */\nconst totalCount = itemsIn.length;\n\n/* — готовим результат — */\nconst result = itemsIn.map((elem, idx) => {\n\tconst d = elem.json;\n\n\t/* расчёт прогресс-бара */\n\tconst frac      = totalCount > 1 ? idx / (totalCount - 1) : 1; // 0…1\n\tconst barFilled = Math.floor(frac * 10);\n\tconst bar       = '▮'.repeat(barFilled) + '▯'.repeat(10 - barFilled);\n\tconst percent   = Math.round(frac * 100);\n\n\tconst brand = d.wb_api_brand || d.brand || '';\n\n\t/* формируем текст */\n\tconst texttg =\n\t\t`<b>10 GS RNP | Сводная</b>\\n` +\n\t\t`<blockquote>☑️ Этап 1. Подсчёт day_metrics\\n` +\n\t\t`☑️ Этап 2. Подсчёт day_storage\\n` +\n\t\t`☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n\t\t`☑️ Этап 4. Подсчёт day_acceptance\\n` +\n\t\t`▫️ Этап 5. Подсчёт day_ad_stats\\n` +\n\t\t`     ╠ Селлер: ${brand}\\n` +\n\t\t`     ╠ Селлеров всего: ${idx + 1} из ${totalCount}\\n` +\n\t\t`     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n\t/* возвращаем только нужные поля */\n\treturn {\n\t\tjson: {\n\t\t\tseller_id: d.seller_id,\n\t\t\ttexttg,\n\t\t},\n\t};\n});\n\nreturn result;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2864,
+        3728
+      ],
+      "id": "89b375b1-3ab1-4137-8799-674e274db387",
+      "name": "Code20"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO WB_ad_stats_daily\n        (seller_adid_month_year_key,\n         seller_id,\n         month,\n         year,\n         nmid,\n         advert_id,\n         day_adstats,\n         wb_api_brand,\n         `Subject`,\n         title,\n         photo,\n         supplierArticle)\n\n/* ───────────── агрегируем рекламную кампанию помесячно ───────────── */\nSELECT\n    /* sellerId_advertId_MM_YYYY  (месяц с ведущим 0) */\n    CONCAT('{{ $json[\"seller_id\"] }}', '_',\n           d.advert_id, '_',\n           LPAD(MONTH(d.stat_date),2,'0'), '_', YEAR(d.stat_date))  AS seller_adid_month_year_key,\n\n    '{{ $json[\"seller_id\"] }}'                                       AS seller_id,\n    MONTH(d.stat_date)                                               AS month,\n    YEAR(d.stat_date)                                                AS year,\n    ANY_VALUE(d.nmID)                                                AS nmid,       -- nmID для кампании\n    d.advert_id,\n\n    /* массив объектов {date, …}  — без ORDER BY → совместимо с < 8.0.22 */\n    JSON_ARRAYAGG(\n        JSON_OBJECT(\n            'date',        DATE_FORMAT(d.stat_date,'%Y-%m-%d'),\n            'views',       d.views_sum,\n            'clicks',      d.clicks_sum,\n            'ctr',         d.ctr_avg,\n            'cpc',         d.cpc_avg,\n            'adexp',       d.ad_exp_sum,\n            'atbs',        d.atbs_sum,\n            'orders_cnt',  d.orders_cnt,\n            'cr',          d.cr_avg,\n            'shks',        d.shks_sum,\n            'orders_sum',  d.orders_sum,\n            'avg_pos',     d.avg_pos_avg\n        )\n    )                                                                 AS day_adstats,\n\n    /* новые поля */\n    ANY_VALUE(s.wb_api_brand)                                         AS wb_api_brand,\n    ANY_VALUE(p.subjectName)                                          AS `Subject`,\n    ANY_VALUE(p.title)                                                AS title,\n    ANY_VALUE(p.photo)                                                AS photo,\n    ANY_VALUE(p.vendorCode)                                           AS supplierArticle\n\nFROM (\n        /* — суточная агрегация по каждой кампании продавца — */\n        SELECT\n            `date`                       AS stat_date,\n            advert_id,\n            ANY_VALUE(nmID)              AS nmID,\n\n            SUM(views)                   AS views_sum,\n            SUM(clicks)                  AS clicks_sum,\n            AVG(ctr)                     AS ctr_avg,\n            AVG(cpc)                     AS cpc_avg,\n            SUM(ad_expenses)             AS ad_exp_sum,\n            SUM(atbs)                    AS atbs_sum,\n            SUM(orders)                  AS orders_cnt,\n            AVG(cr)                      AS cr_avg,\n            SUM(shks)                    AS shks_sum,\n            SUM(sum_price)               AS orders_sum,\n            AVG(avg_position)            AS avg_pos_avg\n        FROM WB_ad_stats\n        WHERE seller_id = '{{ $json[\"seller_id\"] }}'\n        GROUP BY `date`, advert_id\n) AS d\n/* связываем товар по nmID и бренд по seller_id */\nLEFT JOIN WB_products p\n       ON p.nmID = d.nmID\nLEFT JOIN WB_sellers s\n       ON s.seller_id = '{{ $json[\"seller_id\"] }}'\n\n/* одна строка на (seller_id, advert_id, месяц) */\nGROUP BY d.advert_id, YEAR(d.stat_date), MONTH(d.stat_date)\n\n/* — повторный запуск: полностью перезаписываем JSON и новые поля — */\nON DUPLICATE KEY UPDATE\n    day_adstats      = VALUES(day_adstats),\n    month            = VALUES(month),\n    year             = VALUES(year),\n    nmid             = VALUES(nmid),\n    wb_api_brand     = VALUES(wb_api_brand),\n    `Subject`        = VALUES(`Subject`),\n    title            = VALUES(title),\n    photo            = VALUES(photo),\n    supplierArticle  = VALUES(supplierArticle);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        4016
+      ],
+      "id": "0e0cb165-5bae-46f6-959a-f578b13b3e8a",
+      "name": "json_adstats",
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — чанки по карточке (seller_id + nmid)\n * ▸ Вход: возможны дубликаты по nmID (раньше — по ШК/размеру)\n * ▸ Выход: по одной записи на каждую уникальную (seller_id, nmid) × чанк\n * ▸ Особенность: date_to = завтра (today + 1 день) для полного захвата сегодняшнего дня\n */\n\nconst srcItems = $input.all();\nif (!srcItems.length) return [];\n\n/* — Утилиты — */\nconst pad  = n => String(n).padStart(2, '0');\nconst fmt  = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;\nconst firstDayOfMonth = d => new Date(d.getFullYear(), d.getMonth(), 1);\nconst dayMs = 86_400_000;\n\n/* — Константы — */\nconst now          = new Date();\nconst today        = new Date(now.getFullYear(), now.getMonth(), now.getDate()); // обнуляем время\nconst tomorrow     = new Date(today.getTime() + dayMs);                          // date_to всегда «завтра»\nconst startOf2025  = new Date(2025, 0, 1);   // 2025-01-01\nconst maxChunkDays = 90;                     // включительно\nconst lookBackDays = 62;                     // «свежесть» (например, по d.Date_order)\n\n/* 0) Аггрегация до уникальных (seller_id, nmid) */\nconst byCard = new Map(); // key = `${seller_id}#${nmid}` → { baseItem, fresh }\nfor (const it of srcItems) {\n  const j = it.json || {};\n  const key = `${j.seller_id ?? ''}#${j.nmid ?? ''}`;\n  if (!byCard.has(key)) {\n    byCard.set(key, {\n      baseItem: it,                                 // берём первую как «репрезентативную»\n      fresh: j.rnp_reportdetail_daily != null,      // есть свежая активность?\n    });\n  } else {\n    // если хоть у одной строки по карточке есть признак свежести — считаем карточку свежей\n    if (j.rnp_reportdetail_daily != null) {\n      byCard.get(key).fresh = true;\n    }\n  }\n}\n\n/* 1) Генерируем чанки для каждой карточки */\nconst out = [];\nfor (const { baseItem, fresh } of byCard.values()) {\n  const base   = baseItem.json;\n  const chunks = [];\n\n  if (fresh) {\n    // один чанк: от 1-го числа месяца, куда попадает today - 62 дня, до \"завтра\"\n    const earliest = new Date(today.getTime() - lookBackDays * dayMs);\n    chunks.push([ firstDayOfMonth(earliest), tomorrow ]);\n  } else {\n    // нет продаж — шагаем назад кусками ≤90 дней до 2025-01-01\n    // первый чанк заканчивается \"завтра\", чтобы включить весь сегодняшний день\n    let chunkEnd = new Date(tomorrow);\n    while (chunkEnd >= startOf2025) {\n      let chunkStart = new Date(chunkEnd.getTime() - (maxChunkDays - 1) * dayMs);\n      chunkStart = firstDayOfMonth(chunkStart);\n      if (chunkStart < startOf2025) chunkStart = new Date(startOf2025);\n\n      chunks.push([ chunkStart, chunkEnd ]);\n\n      // следующий чанк: день перед текущим start\n      chunkEnd = new Date(chunkStart.getTime() - dayMs);\n    }\n  }\n\n  // клонируем базовый item на каждый чанк\n  for (const [from, to] of chunks) {\n    const clone = JSON.parse(JSON.stringify(baseItem)); // deep copy\n    clone.json.date_from = fmt(from);\n    clone.json.date_to   = fmt(to);                     // всегда завтрашняя для верхнего чанка\n    out.push(clone);\n  }\n}\n\n/* 2) Прогресс-бар по чанкам (обновлённые подписи под nmID) */\nconst totalCount = out.length;\n\nconst totalsPerSeller = {};\nout.forEach(({ json }) => {\n  const sid = String(json.seller_id ?? \"\");\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n});\n\nconst countersPerSeller = {};\nout.forEach((elem, idx) => {\n  const d   = elem.json;\n  const sid = String(d.seller_id ?? \"\");\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n  const frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n  const bar        = '▮'.repeat(Math.floor(frac * 10)) + '▯'.repeat(10 - Math.floor(frac * 10));\n  const percent    = Math.round(frac * 100);\n  const brand      = d.wb_api_brand || d.brand || '';\n  const nmId       = d.nmid ?? '';\n  const vc         = d.vendorCode ?? d.supplierArticle ?? d.sellerArticle ?? '';\n\n  d.textg =\n    `<b>10 GS RNP | Сводная (по nmID)</b>\\n` +\n    `<blockquote>☑️ Этап 1. Подсчёт day_metrics для barcode\\n` +\n    \t`☑️ Этап 2. Подсчёт day_storage\\n` +\n\t\t`☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n\t\t`☑️ Этап 4. Подсчёт day_acceptance\\n` +\n\t\t`☑️ Этап 5. Мерж всех затрат\\n` +\n    `▫️Этап 6. Подсчёт day_metrics для nmid\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ nmID: ${nmId} ${vc ? `| ${vc}` : ''}\\n` +\n    `     ╠ Карточки (nmID) по селлеру: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Всего чанков: ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\n/* — Готово — */\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        4848
+      ],
+      "id": "7493ba8d-8a25-4f84-92a4-dac3f7645e7b",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "batchSize": 25,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3392,
+        4848
+      ],
+      "id": "6f2a28eb-2d36-46ee-9052-d035284fee92",
+      "name": "Loop_weakly"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/*  ──────────────────────────────────────────────────────────────────────────\n   Данные по (seller_id, nmID) за период {{ $json[\"date_from\"] }}–{{ $json[\"date_to\"] }}\n   База — уникальная карточка p(seller_id, nmID); детализация — d по d.nmId\n────────────────────────────────────────────────────────────────────────── */\n\nSELECT\n    /* системные метки периода и карточки товара — ALWAYS not NULL */\n    '{{ $json[\"date_from\"] }}' AS date_from,\n    '{{ $json[\"date_to\"]   }}' AS date_to,\n    COALESCE(p.title, '{{ $json[\"title\"] }}') AS title,\n    COALESCE(p.photo, '{{ $json[\"photo\"] }}') AS photo,\n\n    /* ключевые поля */\n    d.BC                                    AS BC,          -- BC теперь берём из детализации\n    p.nmID,\n    p.seller_id,\n    s.wb_api_brand,\n\n    /* гарантируемые поля */\n    d.Size,                                                 -- размер из детализации (по nmID)\n    COALESCE(d.supplierArticle, p.vendorCode)  AS supplierArticle,\n    COALESCE(d.Subject,         p.subjectName) AS Subject,\n\n    /* показатели из GS_RNP_ReportDetail (могут быть NULL) */\n    d.id,\n    d.status,\n    d.srid_seller_sale_key,\n    d.Date_order,\n    d.Date_cancel,\n    d.date_sales,\n    d.date_return,\n    d.Warehouse,\n    d.Warehouse_type,\n    d.Country,\n    d.Okrug,\n    d.Region,\n    d.nmId                AS nmId_sale,\n    d.SPP,\n    d.TotalPrice,\n    d.Discount,\n    d.priceWithDisc,\n    d.finishedPrice,\n    d.gNumber,\n    d.srid,\n    d.orderType,\n    d.finishedPriceFact,\n    d.paymentSaleAmount,\n    d.forPay,\n    d.ComWBRub,\n    d.ComWBPercent,\n    d.Pur_price,\n    d.Logistics_toclient_cost,\n    d.Logistics_return_cost,\n    d.Pur_date\n\nFROM (\n    /* одна строка на карточку (seller_id, nmID) + базовые поля для \"подсветки\" */\n    SELECT\n        seller_id,\n        nmID,\n        MIN(vendorCode)   AS vendorCode,\n        MIN(subjectName)  AS subjectName,\n        MIN(title)        AS title,\n        MIN(photo)        AS photo\n    FROM WB_products\n    WHERE seller_id = '{{ $json[\"seller_id\"] }}'\n      AND nmID      = '{{ $json[\"nmid\"] }}'\n    GROUP BY seller_id, nmID\n) AS p\n\n/* продажи/возвраты только внутри заданного диапазона — по nmID */\nLEFT JOIN GS_RNP_ReportDetail AS d\n       ON  d.seller_id = p.seller_id\n       AND d.nmId      = p.nmID\n       AND d.Date_order BETWEEN '{{ $json[\"date_from\"] }}' AND '{{ $json[\"date_to\"] }}'\n\n/* бренд продавца */\nLEFT JOIN WB_sellers AS s\n       ON s.seller_id = p.seller_id",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3424,
+        5120
+      ],
+      "id": "8e99b22a-66e0-4a4c-9039-1378deb683eb",
+      "name": "get_sales_rows",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function-node\n * Агрегируем ЗАКАЗЫ покарточно (seller_id + nmID) ПОМЕСЯЧНО → JSON\n * Без barcodes/sizes/списков supplierArticles — только единичный supplierArticle.\n *\n * Доработки:\n *  - fact_* — метрики по ФАКТИЧЕСКИМ датам событий (date_sales / Date_cancel / date_return)\n *  - ord_*  — те же метрики, но «привязка к дате заказа» (воронка дня, Date_order)\n *  - cogs/forpay/spp разделены на fact_* и ord_*\n *  - in_way — количество строк со статусом \"Доставка\" (по дате заказа)\n *  - log_from → fact_log_from (и добавлен ord_log_from)\n */\n\nconst inputItems = items;\nconst groups = {};\n\n/* ── Утилиты времени (UTC) ── */\nconst parseYMD = (s) => {\n  if (!s) return null;\n  const [Y, M, D] = s.slice(0, 10).split('-').map(Number);\n  return new Date(Date.UTC(Y, (M || 1) - 1, D || 1));\n};\nfunction comboKey(seller, nmid, mStr, y) {\n  return `${seller}_${nmid}_${mStr}_${y}`; // ключ с «01»\n}\nfunction monthYear(dateStr) {\n  const d = new Date(dateStr);\n  const mStr = String(d.getUTCMonth() + 1).padStart(2, '0'); // \"01\" … \"12\"\n  return [mStr, d.getUTCFullYear()];\n}\n/* обходит сплошной диапазон месяцев от from до to и вызывает cb(date,mStr) */\nfunction addMonthSpan(from, to, cb) {\n  let d = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));\n  while (d <= to) {\n    const mStr = String(d.getUTCMonth() + 1).padStart(2, '0');\n    cb(d, mStr);\n    d.setUTCMonth(d.getUTCMonth() + 1);\n  }\n}\n\n/* ────────────────────────────────────────────────────────────────\n   1) ГРУППИРОВКА по seller_id + nmID + месяц + год\n   ──────────────────────────────────────────────────────────────── */\nfor (const itm of inputItems) {\n  const o = itm.json;\n\n  const months = new Set();\n  ['Date_order', 'date_sales', 'Date_cancel', 'date_return'].forEach((f) => {\n    if (o[f]) {\n      const [mStr, y] = monthYear(o[f]);\n      months.add(`${mStr}-${y}`);\n    }\n  });\n\n  // если событий нет — заполняем месячный диапазон по date_from/date_to\n  if (months.size === 0) {\n    const from = parseYMD(o.date_from);\n    const to   = parseYMD(o.date_to);\n    addMonthSpan(from, to, (_d, mStr) => months.add(`${mStr}-${_d.getUTCFullYear()}`));\n  }\n\n  for (const m of months) {\n    const [monthStr, year] = m.split('-'); // \"01\"-\"12\"\n    const key = comboKey(o.seller_id, o.nmID, monthStr, year);\n\n    if (!groups[key]) {\n      groups[key] = {\n        meta: {\n          seller_nm_month_year_key: key,\n          month: +monthStr,                     // 1…12 (числом)\n          year:  +year,\n          seller_id: o.seller_id,\n          wb_api_brand: o.wb_api_brand ?? '',\n          Subject: o.Subject ?? '',\n          // карточка:\n          nmid: o.nmID ?? null,\n          title: o.title ?? '',\n          photo: o.photo ?? '',\n          // единичное представительное значение:\n          supplierArticle: '',                  // заполним при первом же попадании\n        },\n        orders: [],\n      };\n    }\n\n    // накапливаем события\n    groups[key].orders.push(o);\n\n    // единственный supplierArticle (первое ненулевое значение)\n    if (!groups[key].meta.supplierArticle) {\n      const sa = o.supplierArticle ?? o.vendorCode ?? o.sellerArticle;\n      if (sa) groups[key].meta.supplierArticle = String(sa);\n    }\n  }\n}\n\n/* ────────────────────────────────────────────────────────────────\n   2) ДНЕВНЫЕ МЕТРИКИ (по всем ШК карточки)\n   ──────────────────────────────────────────────────────────────── */\nconst sum = (arr, f) => arr.reduce((a, v) => a + (parseFloat(v[f]) || 0), 0);\nconst avg = (arr, f) =>\n  arr.length ? arr.reduce((a, v) => a + (parseFloat(v[f]) || 0), 0) / arr.length : null;\n\nconst outputs = [];\n\nfor (const g of Object.values(groups)) {\n  const { month, year } = g.meta;\n  const first = new Date(Date.UTC(year, month - 1, 1));\n  const last  = new Date(Date.UTC(year, month, 0));\n\n  const dayMetrics = [];\n\n  for (let d = new Date(first); d <= last; d.setUTCDate(d.getUTCDate() + 1)) {\n    const dateStr = d.toISOString().slice(0, 10);\n\n    // ── СРЕЗ ПО ДАТЕ ЗАКАЗА (ord_*) ──\n    const ord = g.orders.filter((o) => (o.Date_order ?? '').startsWith(dateStr));\n    const ordBuy  = ord.filter((o) => o.status === 'Выкуп');\n    const ordCanc = ord.filter((o) => o.status === 'Отмена');\n    const ordRet  = ord.filter((o) => o.status === 'Возврат');\n    const inWay   = ord.filter((o) => o.status === 'Доставка').length;\n\n    // финальные статусы в «воронке дня» (для процентов)\n    const buyCnt  = ordBuy.length;\n    const cancCnt = ordCanc.length;\n    const retCnt  = ordRet.length;\n    const denom   = buyCnt + cancCnt + retCnt;\n    const pct = (num) => (denom ? +((num / denom) * 100).toFixed(2) : 0);\n\n    // ── СРЕЗ ПО ФАКТИЧЕСКИМ ДАТАМ СОБЫТИЙ (fact_*) ──\n    const buyEvt  = g.orders.filter((o) => o.status === 'Выкуп'   && (o.date_sales   ?? '').startsWith(dateStr));\n    const cancEvt = g.orders.filter((o) => o.status === 'Отмена'  && (o.Date_cancel  ?? '').startsWith(dateStr));\n    const retEvt  = g.orders.filter((o) => o.status === 'Возврат' && (o.date_return ?? '').startsWith(dateStr));\n\n    // spp расчёт как среднее ((pre-post)/pre*100)\n    const calcSpp = (arr) => {\n      if (!arr.length) return null;\n      const v = arr.reduce((a, o) => {\n        const pre  = parseFloat(o.priceWithDisc)  || 0;\n        const post = parseFloat(o.finishedPrice)  || 0;\n        return a + (pre ? (pre - post) / pre : 0);\n      }, 0) / arr.length * 100;\n      return +v.toFixed(2);\n    };\n\n    dayMetrics.push({\n      date:            dateStr,\n\n      // БАЗА по дате заказа (для совместимости)\n      orders_sum_pre:  sum(ord, 'priceWithDisc'),\n      orders_sum_post: sum(ord, 'finishedPrice'),\n      orders_cnt:      ord.length,\n      log_to:          sum(ord, 'Logistics_toclient_cost'),\n\n      // Проценты статусов в разрезе ДАТЫ ЗАКАЗА (воронка дня)\n      cancel_perc:     pct(cancCnt),\n      sales_buyout:    pct(buyCnt),\n      returns_perc:    pct(retCnt),\n\n      // ───────────── ФАКТ (по датам событий) ─────────────\n      fact_sales_cnt:        buyEvt.length,\n      fact_sales_prep_rev:   sum(buyEvt,  'priceWithDisc'),\n      fact_sales_post_rev:   sum(buyEvt,  'finishedPrice'),\n      fact_commission_sum:   sum(buyEvt,  'ComWBRub'),\n      fact_commission_perc:  avg(buyEvt,  'ComWBPercent'),\n      fact_cancels_cnt:      cancEvt.length,\n      fact_cancels_sum:      sum(cancEvt, 'finishedPrice'),\n      fact_returns_cnt:      retEvt.length,\n      fact_returns_sum:      sum(retEvt,  'finishedPrice'),\n      fact_log_from:         sum(cancEvt, 'Logistics_return_cost') + sum(retEvt, 'Logistics_return_cost'),\n      fact_cogs:             sum(buyEvt,  'Pur_price'),\n      fact_forpay:           sum(buyEvt,  'forPay'),\n      fact_spp:              calcSpp(buyEvt),\n\n      // ───────────── ДАТА ЗАКАЗА (воронка дня) ─────────────\n      ord_sales_cnt:         ordBuy.length,\n      ord_sales_prep_rev:    sum(ordBuy,  'priceWithDisc'),\n      ord_sales_post_rev:    sum(ordBuy,  'finishedPrice'),\n      ord_commission_sum:    sum(ordBuy,  'ComWBRub'),\n      ord_commission_perc:   avg(ordBuy,  'ComWBPercent'),\n      ord_cancels_cnt:       ordCanc.length,\n      ord_cancels_sum:       sum(ordCanc, 'finishedPrice'),\n      ord_returns_cnt:       ordRet.length,\n      ord_returns_sum:       sum(ordRet,  'finishedPrice'),\n      ord_log_from:          sum(ordCanc, 'Logistics_return_cost') + sum(ordRet, 'Logistics_return_cost'),\n      ord_cogs:              sum(ordBuy,  'Pur_price'),\n      ord_forpay:            sum(ordBuy,  'forPay'),\n      ord_spp:               calcSpp(ord),\n\n      // «В пути» по дате заказа\n      in_way:                inWay,\n    });\n  }\n\n  // ── ВЫХОД ──\n  outputs.push({\n    json: {\n      ...g.meta,\n      day_metrics: dayMetrics,\n    },\n  });\n}\n\nreturn outputs;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3632,
+        5120
+      ],
+      "id": "dfa28df1-1498-4e01-9c19-0a8d39f4d687",
+      "name": "create_data"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_weakly').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4096,
+        5120
+      ],
+      "id": "3bdebe39-d7fe-4461-867d-1326fa2f8f7f",
+      "name": "send_logs_finish",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "table": {
+          "__rl": true,
+          "value": "GS_RNP_ReportDetail_daily_nmid",
+          "mode": "list",
+          "cachedResultName": "GS_RNP_ReportDetail_daily_nmid"
+        },
+        "dataMode": "defineBelow",
+        "columnToMatchOn": "seller_nmid_month_year_key",
+        "valueToMatchOn": "={{ $json.seller_nm_month_year_key }}",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "seller_id",
+              "value": "={{ $json.seller_id }}"
+            },
+            {
+              "column": "month",
+              "value": "={{ $json.month }}"
+            },
+            {
+              "column": "year",
+              "value": "={{ $json.year }}"
+            },
+            {
+              "column": "wb_api_brand",
+              "value": "={{ $json.wb_api_brand }}"
+            },
+            {
+              "column": "Subject",
+              "value": "={{ $json.Subject }}"
+            },
+            {
+              "column": "title",
+              "value": "={{ $json.title }}"
+            },
+            {
+              "column": "photo",
+              "value": "={{ $json.photo }}"
+            },
+            {
+              "column": "supplierArticle",
+              "value": "={{ $json.supplierArticle }}"
+            },
+            {
+              "column": "day_metrics",
+              "value": "={{ JSON.stringify($json.day_metrics) }}"
+            },
+            {
+              "column": "nmid",
+              "value": "={{ $json.nmid }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3872,
+        5120
+      ],
+      "id": "9e9015a2-587e-45a6-a777-0564c470867c",
+      "name": "upsert_rows",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  p.seller_id,\n  p.nmid,\n  ANY_VALUE(p.vendorCode)     AS vendorCode,     -- или supplierArticle\n  ANY_VALUE(p.subjectName)    AS subjectName,\n  ANY_VALUE(p.title)          AS title,\n  ANY_VALUE(p.photo)          AS photo,\n  ANY_VALUE(s.wb_api_brand)   AS wb_api_brand,\n  ANY_VALUE(su.rnp_reportdetail_daily) AS rnp_reportdetail_daily\nFROM WB_products p\nLEFT JOIN WB_sellers         s  ON s.seller_id  = p.seller_id\nLEFT JOIN WB_sellers_updates su ON su.seller_id = p.seller_id\nWHERE p.seller_id = '{{ $json.seller_id }}'\nGROUP BY p.seller_id, p.nmid\nORDER BY p.nmid;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2096,
+        6064
+      ],
+      "id": "30b2d6a3-a917-4e5e-af43-73c08ff883cd",
+      "name": "get_all_nmid",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE GS_RNP_ReportDetail_daily_nmid AS r\nJOIN (\n  SELECT\n    COALESCE((\n      SELECT JSON_ARRAYAGG(j)\n      FROM (\n        /* Агрегируем по дате и берём максимум по стоимости и логистике */\n        SELECT JSON_OBJECT(\n                 'Date',           DATE_FORMAT(a.`Date`, '%Y-%m-%d'),\n                 'Pur_price',      a.max_pur_price,\n                 'Logistics_cost', a.max_log_cost\n               ) AS j\n        FROM (\n          SELECT\n            p.`Date`,\n            MAX(p.`Pur_price`)      AS max_pur_price,\n            MAX(p.`Logistics_cost`) AS max_log_cost\n          FROM GS_RNP_PurPrice p\n          WHERE p.seller_id = '{{ $json.seller_id }}'\n            AND p.nmid      = {{ $json.nmid }}\n          GROUP BY p.`Date`\n        ) a\n        ORDER BY a.`Date`\n      ) AS ordered_rows\n    ), JSON_ARRAY()) AS pp_json\n) AS src\nSET r.pur_price = src.pp_json\nWHERE r.seller_id = '{{ $json.seller_id }}'\n  AND r.nmid      = {{ $json.nmid }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3440,
+        5728
+      ],
+      "id": "5a4550e7-9dbd-4944-ae2b-4b6ecd83badb",
+      "name": "get_sales_rows1",
+      "alwaysOutputData": false,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — уникальные пары (seller_id + nmid) для UPDATE pur_price\n * ▸ Вход: любые записи (возможны дубли)\n * ▸ Выход: по одной записи на каждую уникальную пару { seller_id, nmid } + textg\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n// Нормализация значения\nconst norm = (v) => (v === undefined || v === null ? null : (typeof v === 'string' ? v.trim() : v));\n\nconst map = new Map(); // key = `${seller_id}#${nmid}` -> { seller_id, nmid, brand, vc }\n\n// 1) Собираем уникальные пары + метаданные для текстга\nfor (const it of items) {\n  const j = it.json || {};\n  const seller_id = norm(j.seller_id ?? j.sellerId ?? j.seller);\n  const nmid      = norm(j.nmid ?? j.nmId ?? j.nmID ?? j.NMID);\n  if (!seller_id || !nmid) continue;\n\n  const key = `${seller_id}#${nmid}`;\n  if (!map.has(key)) {\n    map.set(key, {\n      seller_id,\n      nmid,\n      brand: norm(j.wb_api_brand ?? j.brand) || '',\n      vc:    norm(j.vendorCode ?? j.supplierArticle ?? j.sellerArticle) || '',\n    });\n  }\n}\n\n// 2) Подсчёты для прогресса\nconst uniqArr = Array.from(map.values());\nconst totalCount = uniqArr.length;\n\nconst totalsPerSeller = {};\nfor (const r of uniqArr) {\n  const sid = String(r.seller_id);\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n}\n\n// 3) Формируем выход с textg и глобальным прогресс-баром\nconst countersPerSeller = {};\nconst steps = 10; // длина прогресс-бара\n\nconst out = uniqArr.map((r, idx) => {\n  const sid = String(r.seller_id);\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n\n  const frac    = totalCount > 1 ? (idx / (totalCount - 1)) : 1;\n  const filled  = Math.max(0, Math.min(steps, Math.floor(frac * steps)));\n  const bar     = '▮'.repeat(filled) + '▯'.repeat(steps - filled);\n  const percent = Math.round(frac * 100);\n\n  const brand = r.brand;\n  const nmId  = r.nmid;\n  const vc    = r.vc;\n\n  const textg =\n    `<b>10 GS RNP | Сводная (по nmID)</b>\\n` +\n    `<blockquote>☑️ Этап 1. Подсчёт day_metrics для barcode\\n` +\n    `☑️ Этап 2. Подсчёт day_storage\\n` +\n    `☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n    `☑️ Этап 4. Подсчёт day_acceptance\\n` +\n    `☑️ Этап 5. Мерж всех затрат\\n` +\n    `☑️ Этап 6. Подсчёт day_metrics для nmid\\n` +\n    `▫️Этап 7. Подсчёт себеста для nmid\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ nmID: ${nmId}${vc ? ` | ${vc}` : ''}\\n` +\n    `     ╠ Карточки (nmID) по селлеру: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Всего карточек (уникальных пар): ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n  return { json: { seller_id: r.seller_id, nmid: r.nmid, textg } };\n});\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3024,
+        5488
+      ],
+      "id": "d4ccd241-71cc-4dc7-8102-941954cdc68d",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_pur').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3680,
+        5728
+      ],
+      "id": "5655b351-1170-4d86-b0d0-2645aeba22e2",
+      "name": "send_logs_finish1",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 25,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3424,
+        5488
+      ],
+      "id": "5aa5ef2e-6d1f-441c-af9d-ac0218fda0c0",
+      "name": "Loop_pur"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d63bbf24-10c2-4627-b906-1c1ce42fc469",
+              "leftValue": "={{ $json.wb_api_brand }}",
+              "rightValue": "Рыболовный край",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            },
+            {
+              "id": "51030025-348e-4fd8-a5da-b03d445a8195",
+              "leftValue": "={{ $json.wb_api_brand }}",
+              "rightValue": "Свияга",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        656,
+        3504
+      ],
+      "id": "84248ee4-a792-454a-b9b6-b9f1c171685e",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* Обновляем stock_history помесячно из WB_storage_fee для заданных seller_id + nmid */\nUPDATE GS_RNP_ReportDetail_daily_nmid AS r\nJOIN (\n  /* Источник: один ряд на (seller_id, nmid, year, month) + массив day-объектов */\n  SELECT\n    '{{ $json[\"seller_id\"] }}' AS seller_id,\n    {{ $json.nmid }}           AS nmid,\n    m.year,\n    m.month,\n    COALESCE((\n      /* Формируем упорядоченный по дате JSON-массив day-объектов */\n      SELECT JSON_ARRAYAGG(j)\n      FROM (\n        SELECT JSON_OBJECT(\n                 'date',        DATE_FORMAT(sf.`date`, '%Y-%m-%d'),\n                 'stocks_cnt',  SUM(sf.barcodesCount),\n                 'storage_fee', SUM(sf.warehousePrice)\n               ) AS j\n        FROM WB_storage_fee sf\n        WHERE sf.seller_id = '{{ $json[\"seller_id\"] }}'\n          AND sf.nmId      = {{ $json.nmid }}\n          AND YEAR(sf.`date`)  = m.year\n          AND MONTH(sf.`date`) = m.month\n        GROUP BY sf.`date`\n        ORDER BY sf.`date`\n      ) AS ordered_rows\n    ), JSON_ARRAY()) AS stock_json\n  FROM (\n    /* Берём ТОЛЬКО те месяцы, что уже есть в сводной (т.е. есть продажи) */\n    SELECT r.year, r.month\n    FROM GS_RNP_ReportDetail_daily_nmid r\n    WHERE r.seller_id = '{{ $json[\"seller_id\"] }}'\n      AND r.nmid      = {{ $json.nmid }}\n    GROUP BY r.year, r.month\n  ) AS m\n  /* Пересекаем с месяцами, где вообще есть списания хранения, чтобы не писать пустые [] */\n  INNER JOIN (\n    SELECT DISTINCT YEAR(sf.`date`) AS year, MONTH(sf.`date`) AS month\n    FROM WB_storage_fee sf\n    WHERE sf.seller_id = '{{ $json[\"seller_id\"] }}'\n      AND sf.nmId      = {{ $json.nmid }}\n  ) AS s\n    ON s.year  = m.year\n   AND s.month = m.month\n) AS src\n  ON  r.seller_id = src.seller_id\n  AND r.nmid      = src.nmid\n  AND r.year      = src.year\n  AND r.month     = src.month\nSET r.stock_history = src.stock_json\nWHERE r.seller_id = '{{ $json[\"seller_id\"] }}'\n  AND r.nmid      = {{ $json.nmid }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3456,
+        6304
+      ],
+      "id": "4f8018a1-a1b2-43a4-8a3a-ce622dd6a96d",
+      "name": "get_sales_rows2",
+      "alwaysOutputData": false,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — уникальные пары (seller_id + nmid) для UPDATE pur_price\n * ▸ Вход: любые записи (возможны дубли)\n * ▸ Выход: по одной записи на каждую уникальную пару { seller_id, nmid } + textg\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n// Нормализация значения\nconst norm = (v) => (v === undefined || v === null ? null : (typeof v === 'string' ? v.trim() : v));\n\nconst map = new Map(); // key = `${seller_id}#${nmid}` -> { seller_id, nmid, brand, vc }\n\n// 1) Собираем уникальные пары + метаданные для текстга\nfor (const it of items) {\n  const j = it.json || {};\n  const seller_id = norm(j.seller_id ?? j.sellerId ?? j.seller);\n  const nmid      = norm(j.nmid ?? j.nmId ?? j.nmID ?? j.NMID);\n  if (!seller_id || !nmid) continue;\n\n  const key = `${seller_id}#${nmid}`;\n  if (!map.has(key)) {\n    map.set(key, {\n      seller_id,\n      nmid,\n      brand: norm(j.wb_api_brand ?? j.brand) || '',\n      vc:    norm(j.vendorCode ?? j.supplierArticle ?? j.sellerArticle) || '',\n    });\n  }\n}\n\n// 2) Подсчёты для прогресса\nconst uniqArr = Array.from(map.values());\nconst totalCount = uniqArr.length;\n\nconst totalsPerSeller = {};\nfor (const r of uniqArr) {\n  const sid = String(r.seller_id);\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n}\n\n// 3) Формируем выход с textg и глобальным прогресс-баром\nconst countersPerSeller = {};\nconst steps = 10; // длина прогресс-бара\n\nconst out = uniqArr.map((r, idx) => {\n  const sid = String(r.seller_id);\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n\n  const frac    = totalCount > 1 ? (idx / (totalCount - 1)) : 1;\n  const filled  = Math.max(0, Math.min(steps, Math.floor(frac * steps)));\n  const bar     = '▮'.repeat(filled) + '▯'.repeat(steps - filled);\n  const percent = Math.round(frac * 100);\n\n  const brand = r.brand;\n  const nmId  = r.nmid;\n  const vc    = r.vc;\n\n  const textg =\n    `<b>10 GS RNP | Сводная (по nmID)</b>\\n` +\n    `<blockquote>☑️ Этап 1. Подсчёт day_metrics для barcode\\n` +\n    `☑️ Этап 2. Подсчёт day_storage\\n` +\n    `☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n    `☑️ Этап 4. Подсчёт day_acceptance\\n` +\n    `☑️ Этап 5. Мерж всех затрат\\n` +\n    `☑️ Этап 6. Подсчёт day_metrics для nmid\\n` +\n    `☑️ Этап 7. Подсчёт себеста для nmid\\n` +\n    `▫️Этап 8. Подсчёт истории остатков для nmid\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ nmID: ${nmId}${vc ? ` | ${vc}` : ''}\\n` +\n    `     ╠ Карточки (nmID) по селлеру: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Всего карточек (уникальных пар): ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n  return { json: { seller_id: r.seller_id, nmid: r.nmid, textg } };\n});\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        6064
+      ],
+      "id": "cdaf156c-6102-4a45-8190-9d326dfe0af8",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_pur1').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3696,
+        6304
+      ],
+      "id": "5c0223c3-d283-4d31-ad13-e8c83279b920",
+      "name": "send_logs_finish2",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3440,
+        6064
+      ],
+      "id": "8b007862-41d8-47d8-979c-84f78ca39713",
+      "name": "Loop_pur1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE GS_RNP_ReportDetail_daily_nmid AS r\nJOIN (\n  SELECT\n    COALESCE((\n      SELECT JSON_ARRAYAGG(w_row)\n      FROM (\n        /* Последняя запись на СЕГОДНЯ по каждому складу, где есть любой остаток/движение */\n        SELECT JSON_OBJECT(\n                 'warehouseName', s.warehouseName,\n                 'lastdate',      DATE_FORMAT(s.lastChangeDate, '%Y-%m-%d %H:%i:%s'),\n                 'quantity',      s.quantity,\n                 'inWayToClient', s.inWayToClient,\n                 'inWayFromClient', s.inWayFromClient,\n                 'quantityFull',  s.quantityFull\n               ) AS w_row\n        FROM (\n          SELECT st.*\n          FROM WB_stocks st\n          JOIN (\n            SELECT warehouseName, MAX(lastChangeDate) AS max_dt\n            FROM WB_stocks\n            WHERE seller_id = '{{ $json.seller_id }}'\n              AND nmid      = {{ $json.nmid }}\n              AND COALESCE(quantityFull,\n                           quantity + inWayToClient + inWayFromClient, 0) > 0\n            GROUP BY warehouseName\n          ) latest\n            ON st.warehouseName = latest.warehouseName\n           AND st.lastChangeDate = latest.max_dt\n          WHERE st.seller_id = '{{ $json.seller_id }}'\n            AND st.nmid      = {{ $json.nmid }}\n            AND COALESCE(st.quantityFull,\n                         st.quantity + st.inWayToClient + st.inWayFromClient, 0) > 0\n        ) AS s\n        ORDER BY s.warehouseName\n      ) AS ordered_rows\n    ), JSON_ARRAY()) AS stock_json\n) AS src\nSET r.stock_today = src.stock_json\nWHERE r.seller_id = '{{ $json.seller_id }}'\n  AND r.nmid      = {{ $json.nmid }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3472,
+        6880
+      ],
+      "id": "f92273fc-c4b4-42d4-8437-9463bdea0ba5",
+      "name": "get_sales_rows3",
+      "alwaysOutputData": false,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — уникальные пары (seller_id + nmid) для UPDATE pur_price\n * ▸ Вход: любые записи (возможны дубли)\n * ▸ Выход: по одной записи на каждую уникальную пару { seller_id, nmid } + textg\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n// Нормализация значения\nconst norm = (v) => (v === undefined || v === null ? null : (typeof v === 'string' ? v.trim() : v));\n\nconst map = new Map(); // key = `${seller_id}#${nmid}` -> { seller_id, nmid, brand, vc }\n\n// 1) Собираем уникальные пары + метаданные для текстга\nfor (const it of items) {\n  const j = it.json || {};\n  const seller_id = norm(j.seller_id ?? j.sellerId ?? j.seller);\n  const nmid      = norm(j.nmid ?? j.nmId ?? j.nmID ?? j.NMID);\n  if (!seller_id || !nmid) continue;\n\n  const key = `${seller_id}#${nmid}`;\n  if (!map.has(key)) {\n    map.set(key, {\n      seller_id,\n      nmid,\n      brand: norm(j.wb_api_brand ?? j.brand) || '',\n      vc:    norm(j.vendorCode ?? j.supplierArticle ?? j.sellerArticle) || '',\n    });\n  }\n}\n\n// 2) Подсчёты для прогресса\nconst uniqArr = Array.from(map.values());\nconst totalCount = uniqArr.length;\n\nconst totalsPerSeller = {};\nfor (const r of uniqArr) {\n  const sid = String(r.seller_id);\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n}\n\n// 3) Формируем выход с textg и глобальным прогресс-баром\nconst countersPerSeller = {};\nconst steps = 10; // длина прогресс-бара\n\nconst out = uniqArr.map((r, idx) => {\n  const sid = String(r.seller_id);\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n\n  const frac    = totalCount > 1 ? (idx / (totalCount - 1)) : 1;\n  const filled  = Math.max(0, Math.min(steps, Math.floor(frac * steps)));\n  const bar     = '▮'.repeat(filled) + '▯'.repeat(steps - filled);\n  const percent = Math.round(frac * 100);\n\n  const brand = r.brand;\n  const nmId  = r.nmid;\n  const vc    = r.vc;\n\n  const textg =\n    `<b>10 GS RNP | Сводная (по nmID)</b>\\n` +\n    `<blockquote>☑️ Этап 1. Подсчёт day_metrics для barcode\\n` +\n    `☑️ Этап 2. Подсчёт day_storage\\n` +\n    `☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n    `☑️ Этап 4. Подсчёт day_acceptance\\n` +\n    `☑️ Этап 5. Мерж всех затрат\\n` +\n    `☑️ Этап 6. Подсчёт day_metrics для nmid\\n` +\n    `☑️ Этап 7. Подсчёт себеста для nmid\\n` +\n    `☑️ Этап 8. Подсчёт истории остатков для nmid\\n` +\n    `▫️ Этап 8. Подсчёт остатков на сегодня для nmid\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ nmID: ${nmId}${vc ? ` | ${vc}` : ''}\\n` +\n    `     ╠ Карточки (nmID) по селлеру: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Всего карточек (уникальных пар): ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n  return { json: { seller_id: r.seller_id, nmid: r.nmid, textg } };\n});\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3056,
+        6640
+      ],
+      "id": "3533c856-417a-4913-bacd-32ca29de05ba",
+      "name": "Code3"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_pur2').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3712,
+        6880
+      ],
+      "id": "0d33f252-6868-43b4-81b9-f831606d64a5",
+      "name": "send_logs_finish3",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3456,
+        6640
+      ],
+      "id": "2e576cd0-5ee3-4cf1-8a3b-7a06654ff519",
+      "name": "Loop_pur2"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "/* WB → GS_RNP: обновление funnel_metrics помесячно по seller_id + nmid */\nUPDATE GS_RNP_ReportDetail_daily_nmid AS r\nJOIN (\n  /* Готовим JSON-массив по каждому месяцу */\n  SELECT\n      a.seller_id,\n      a.nmID                         AS nmid,\n      YEAR(a.dt)                     AS year,\n      MONTH(a.dt)                    AS month,\n      COALESCE((\n        SELECT JSON_ARRAYAGG(day_row)\n        FROM (\n          /* ВАЖНО: порядок по дате внутри массива */\n          SELECT JSON_OBJECT(\n                   'date',                 DATE_FORMAT(a2.dt, '%Y-%m-%d'),\n                   'openCardCount',        a2.openCardCount,\n                   'addToCartCount',       a2.addToCartCount,\n                   'addToCartConversion',  a2.addToCartConversion,\n                   'ordersCount',          a2.ordersCount,\n                   'ordersSumRub',         a2.ordersSumRub,\n                   'cartToOrderConversion',a2.cartToOrderConversion,\n                   'buyoutsCount',         a2.buyoutsCount,\n                   'buyoutsSumRub',        a2.buyoutsSumRub,\n                   'buyoutPercent',        a2.buyoutPercent\n                 ) AS day_row\n          FROM WB_analytics a2\n          WHERE a2.seller_id = '{{ $json.seller_id }}'\n            AND a2.nmID      = {{ $json.nmid }}\n            AND YEAR(a2.dt)  = YEAR(a.dt)\n            AND MONTH(a2.dt) = MONTH(a.dt)\n          ORDER BY a2.dt\n        ) AS ordered_rows\n      ), JSON_ARRAY()) AS funnel_json\n  FROM WB_analytics a\n  WHERE a.seller_id = '{{ $json.seller_id }}'\n    AND a.nmID      = {{ $json.nmid }}\n  GROUP BY a.seller_id, a.nmID, YEAR(a.dt), MONTH(a.dt)\n) AS src\n  ON  r.seller_id = src.seller_id\n  AND r.nmid      = src.nmid\n  AND r.year      = src.year\n  AND r.month     = src.month\nSET r.funnel_metrics = src.funnel_json\nWHERE r.seller_id = '{{ $json.seller_id }}'\n  AND r.nmid      = {{ $json.nmid }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        3488,
+        7616
+      ],
+      "id": "f97c54f1-6fc1-40f1-b96b-cab2ddb7d015",
+      "name": "get_sales_rows4",
+      "alwaysOutputData": false,
+      "retryOnFail": false,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "mySql": {
+          "id": "FZVYiypFGkcOz2Ce",
+          "name": "mvlipatov DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — уникальные пары (seller_id + nmid) для UPDATE pur_price\n * ▸ Вход: любые записи (возможны дубли)\n * ▸ Выход: по одной записи на каждую уникальную пару { seller_id, nmid } + textg\n */\n\nconst items = $input.all();\nif (!items.length) return [];\n\n// Нормализация значения\nconst norm = (v) => (v === undefined || v === null ? null : (typeof v === 'string' ? v.trim() : v));\n\nconst map = new Map(); // key = `${seller_id}#${nmid}` -> { seller_id, nmid, brand, vc }\n\n// 1) Собираем уникальные пары + метаданные для текстга\nfor (const it of items) {\n  const j = it.json || {};\n  const seller_id = norm(j.seller_id ?? j.sellerId ?? j.seller);\n  const nmid      = norm(j.nmid ?? j.nmId ?? j.nmID ?? j.NMID);\n  if (!seller_id || !nmid) continue;\n\n  const key = `${seller_id}#${nmid}`;\n  if (!map.has(key)) {\n    map.set(key, {\n      seller_id,\n      nmid,\n      brand: norm(j.wb_api_brand ?? j.brand) || '',\n      vc:    norm(j.vendorCode ?? j.supplierArticle ?? j.sellerArticle) || '',\n    });\n  }\n}\n\n// 2) Подсчёты для прогресса\nconst uniqArr = Array.from(map.values());\nconst totalCount = uniqArr.length;\n\nconst totalsPerSeller = {};\nfor (const r of uniqArr) {\n  const sid = String(r.seller_id);\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n}\n\n// 3) Формируем выход с textg и глобальным прогресс-баром\nconst countersPerSeller = {};\nconst steps = 10; // длина прогресс-бара\n\nconst out = uniqArr.map((r, idx) => {\n  const sid = String(r.seller_id);\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n\n  const frac    = totalCount > 1 ? (idx / (totalCount - 1)) : 1;\n  const filled  = Math.max(0, Math.min(steps, Math.floor(frac * steps)));\n  const bar     = '▮'.repeat(filled) + '▯'.repeat(steps - filled);\n  const percent = Math.round(frac * 100);\n\n  const brand = r.brand;\n  const nmId  = r.nmid;\n  const vc    = r.vc;\n\n  const textg =\n    `<b>10 GS RNP | Сводная (по nmID)</b>\\n` +\n    `<blockquote>☑️ Этап 1. Подсчёт day_metrics для barcode\\n` +\n    `☑️ Этап 2. Подсчёт day_storage\\n` +\n    `☑️ Этап 3. Подсчёт day_adexpenses\\n` +\n    `☑️ Этап 4. Подсчёт day_acceptance\\n` +\n    `☑️ Этап 5. Мерж всех затрат\\n` +\n    `☑️ Этап 6. Подсчёт day_metrics для nmid\\n` +\n    `☑️ Этап 7. Подсчёт себеста для nmid\\n` +\n    `☑️ Этап 8. Подсчёт истории остатков для nmid\\n` +\n    `☑️ Этап 9. Подсчёт истории остатков для nmid\\n` +\n    `▫️ Этап 10. Подсчёт воронки для nmid\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ nmID: ${nmId}${vc ? ` | ${vc}` : ''}\\n` +\n    `     ╠ Карточки (nmID) по селлеру: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Всего карточек (уникальных пар): ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n\n  return { json: { seller_id: r.seller_id, nmid: r.nmid, textg } };\n});\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3072,
+        7376
+      ],
+      "id": "efab92c2-8ddb-4cd5-b9fd-a46fd27ea3c5",
+      "name": "Code4"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "={{ $('Loop_pur3').first().json.textg }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3728,
+        7616
+      ],
+      "id": "a280cea0-80ce-4709-8c3a-237b20538233",
+      "name": "send_logs_finish5",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3472,
+        7376
+      ],
+      "id": "f5afd44c-923d-48b9-a4ea-27e07f9b4f51",
+      "name": "Loop_pur3"
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "-1002613685383",
+        "messageId": "={{ $('send_logs_start_report').first().json.result.message_id }}",
+        "text": "=☑️ Этап 1. Подсчёт day_metrics для barcode\n☑️ Этап 2. Подсчёт day_storage\n☑️ Этап 3. Подсчёт day_adexpenses\n☑️ Этап 4. Подсчёт day_acceptance\n☑️ Этап 5. Мерж всех затрат\n☑️ Этап 6. Подсчёт day_metrics для nmid\n☑️ Этап 7. Подсчёт себеста для nmid\n☑️ Этап 8. Подсчёт истории остатков для nmid\n☑️ Этап 9. Подсчёт остатков на сегодня для nmid\n☑️ Этап 10. Подсчёт воронки для nmid\n\n✅ Все подсчеты завершены.",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3728,
+        7376
+      ],
+      "id": "c2b10513-6348-44b3-91b7-0d1cf649a92e",
+      "name": "total_finish1",
+      "webhookId": "dd89b9a1-e499-40f3-ab41-13f5b5d9a316",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5,
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "GSmlZGOkVOmHyivA",
+          "name": "Мия AI [WFR]"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Code-node — добавляет textg + date_from/date_to (помесячно)\n *\n * 1 входной элемент → 1..N выходных по числу месячных чанков.\n * Логика:\n *  - Если есть rnp_reportdetail_daily: старт = 1-е число месяца (сегодня-62д), но не раньше 01.01.2025; далее по месяцам до сегодня.\n *  - Если нет rnp_reportdetail_daily: весь период по месяцам назад от текущего месяца до 01.01.2025.\n */\n\nconst srcItems = $input.all();\nif (!srcItems.length) return [];\n\n/* — Утилиты — */\nconst pad = n => String(n).padStart(2, '0');\nconst fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;\nconst firstDayOfMonth = d => new Date(d.getFullYear(), d.getMonth(), 1);\nconst lastDayOfMonth  = d => new Date(d.getFullYear(), d.getMonth() + 1, 0); // 0-й день сл. месяца\nconst addMonths = (d, delta) => new Date(d.getFullYear(), d.getMonth() + delta, 1);\nconst dayMs = 86_400_000;\n\n/* — Константы — */\nconst today       = new Date();                  // «сейчас» узла\nconst startOf2025 = new Date(2025, 0, 1);        // 01-01-2025\nconst lookBackDays = 62;                         // «свежесть» d.Date_order\n\n/* — Генерируем помесячные чанки для каждого входного элемента — */\nconst out = [];\n\nfor (const item of srcItems) {\n  const base   = item.json;\n  const chunks = [];\n\n  if (base.rnp_reportdetail_daily != null) {\n    // Старт — 1-е число месяца, в котором (сегодня - 62 дня), но не раньше 01.01.2025\n    const earliest = new Date(today.getTime() - lookBackDays * dayMs);\n    let monthStart = firstDayOfMonth(earliest);\n    if (monthStart < startOf2025) monthStart = new Date(startOf2025);\n\n    // Идём помесячно вперёд до текущего месяца\n    for (let cur = new Date(monthStart); ; cur = addMonths(cur, 1)) {\n      const start = firstDayOfMonth(cur);\n      let end = lastDayOfMonth(cur);\n      if (end > today) end = today; // текущий месяц обрезаем по today\n\n      // Страховка: end не раньше start\n      if (end < start) break;\n\n      chunks.push([start, end]);\n\n      // Если уже достигли месяца today — выходим\n      const isCurrentMonth = (start.getFullYear() === today.getFullYear() && start.getMonth() === today.getMonth());\n      if (isCurrentMonth) break;\n    }\n  } else {\n    // Продаж нет — идём помесячно НАЗАД от текущего месяца до 01.01.2025\n    for (let cur = firstDayOfMonth(today); cur >= startOf2025; cur = addMonths(cur, -1)) {\n      const start = cur;\n      let end = lastDayOfMonth(cur);\n      if (end > today) end = today; // на случай, если cur = текущий месяц\n\n      // Страховка: не заходим левее 01.01.2025\n      const safeStart = start < startOf2025 ? new Date(startOf2025) : start;\n      if (end < safeStart) continue;\n\n      chunks.push([safeStart, end]);\n    }\n\n    // По желанию, можно развернуть, чтобы шли от старых к новым:\n    // chunks.reverse();\n  }\n\n  /* клонируем элемент на каждый чанк */\n  for (const [from, to] of chunks) {\n    const clone = JSON.parse(JSON.stringify(item)); // deep copy\n    clone.json.date_from = fmt(from);\n    clone.json.date_to   = fmt(to);\n    out.push(clone);\n  }\n}\n\n/* — Прогресс-бар (по чанкам) — */\nconst totalCount = out.length;\nconst totalsPerSeller = {};\nout.forEach(({ json }) => {\n  const sid = String(json.seller_id ?? \"\");\n  totalsPerSeller[sid] = (totalsPerSeller[sid] || 0) + 1;\n});\n\nconst countersPerSeller = {};\nout.forEach((elem, idx) => {\n  const d   = elem.json;\n  const sid = String(d.seller_id ?? \"\");\n  countersPerSeller[sid] = (countersPerSeller[sid] || 0) + 1;\n\n  const localIdx   = countersPerSeller[sid];\n  const localTotal = totalsPerSeller[sid];\n  const frac       = totalCount > 1 ? idx / (totalCount - 1) : 1;\n  const filled     = Math.min(10, Math.max(0, Math.floor(frac * 10)));\n  const bar        = '▮'.repeat(filled) + '▯'.repeat(10 - filled);\n  const percent    = Math.round(frac * 100);\n  const brand      = d.wb_api_brand || d.brand || '';\n\n  d.textg =\n    `<b>10 GS RNP | Сводная</b>\\n` +\n    `<blockquote>▫️Этап 1. Подсчет day_metrics\\n` +\n    `     ╠ Бренд: ${brand}\\n` +\n    `     ╠ Артикулы селлера: ${localIdx} из ${localTotal}\\n` +\n    `     ╠ Артикулов всего: ${idx + 1} из ${totalCount}\\n` +\n    `     ╚ Прогресс: ${bar} ${percent}%</blockquote>`;\n});\n\n/* — Готово — */\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3104,
+        144
+      ],
+      "id": "5e9ae9fa-9a9d-4e5f-a4f5-e71482e81143",
+      "name": "Code13"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "get_all_sellers": {
+      "main": [
+        [
+          {
+            "node": "Code5",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_barcode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_start_report": {
+      "main": [
+        [
+          {
+            "node": "get_all_sellers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "send_logs_start_report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code5": {
+      "main": [
+        [
+          {
+            "node": "Code20",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code19",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_nmid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_barcode": {
+      "main": [
+        [
+          {
+            "node": "Code12",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_products1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_stocks1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "get_all_nmids1": {
+      "main": [
+        [
+          {
+            "node": "create_link1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_link1": {
+      "main": [
+        [
+          {
+            "node": "parsing_cart1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parsing_cart1": {
+      "main": [
+        [
+          {
+            "node": "create_data_cards1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_data_cards1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 6
+          }
+        ]
+      ]
+    },
+    "Loop1": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_adexpenses1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_storage_fee2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_nmids1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_products1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_sales1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_all_stocks1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "get_storage_fee3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_body1": {
+      "main": [
+        [
+          {
+            "node": "insert_data1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_sales1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "get_adexpenses1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "get_storage_fee2": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "get_storage_fee3": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      ]
+    },
+    "Code12": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly2": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_sales_rows5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_data2": {
+      "main": [
+        [
+          {
+            "node": "upsert_rows2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_sales_rows5": {
+      "main": [
+        [
+          {
+            "node": "create_data2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish4": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "upsert_rows2": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_nmids3": {
+      "main": [
+        [
+          {
+            "node": "Code17",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "json_storage": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "json_adexpense": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish8",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly3": {
+      "main": [
+        [],
+        [
+          {
+            "node": "json_storage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish7": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code16": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code17": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly4": {
+      "main": [
+        [],
+        [
+          {
+            "node": "json_adexpense",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "json_merge": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "json_acceptance": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish8": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code18": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly5": {
+      "main": [
+        [],
+        [
+          {
+            "node": "json_acceptance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish9": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly6": {
+      "main": [
+        [],
+        [
+          {
+            "node": "json_merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish10": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code19": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly7": {
+      "main": [
+        [],
+        [
+          {
+            "node": "json_adstats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish12": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code20": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "json_adstats": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish12",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_weakly": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_sales_rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_sales_rows": {
+      "main": [
+        [
+          {
+            "node": "create_data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create_data": {
+      "main": [
+        [
+          {
+            "node": "upsert_rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish": {
+      "main": [
+        [
+          {
+            "node": "Loop_weakly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "upsert_rows": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_all_nmid": {
+      "main": [
+        [
+          {
+            "node": "Code4",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code3",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_sales_rows1": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish1": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_pur": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_sales_rows1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        []
+      ]
+    },
+    "get_sales_rows2": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish2": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_pur1": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_sales_rows2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_sales_rows3": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code3": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish3": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_pur2": {
+      "main": [
+        [],
+        [
+          {
+            "node": "get_sales_rows3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_sales_rows4": {
+      "main": [
+        [
+          {
+            "node": "send_logs_finish5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code4": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_logs_finish5": {
+      "main": [
+        [
+          {
+            "node": "Loop_pur3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop_pur3": {
+      "main": [
+        [
+          {
+            "node": "total_finish1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "get_sales_rows4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "16c2446e-e093-4de7-b235-0559bc04e64d",
+  "meta": {
+    "instanceId": "567ebcbef8c8ce1fb12fdd04a97b222531f36025a2cc7ca2f67ac82c9772deb7"
+  },
+  "id": "RIUATesmfx120JH9",
+  "tags": []
+}

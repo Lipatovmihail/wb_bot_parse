@@ -54,6 +54,8 @@ AD_STATS_RIGHT_COOLDOWN_MINUTES = 30
 TOTAL_NMID_RIGHT_COOLDOWN_MINUTES = 30
 TOTAL_NMID_CSV_HOST_PATH = "/data/csv/GS_RNP_total_metrics_nmid.csv"
 TOTAL_NMID_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_metrics_nmid.csv"
+TOTAL_NMID_STOCK_HISTORY_CSV_HOST_PATH = "/data/csv/GS_RNP_total_metrics_nmid_stock_history.csv"
+TOTAL_NMID_STOCK_HISTORY_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/GS_RNP_total_metrics_nmid_stock_history.csv"
 WB_PRODUCTS_CSV_HOST_PATH = "/data/csv/WB_products_import.csv"
 WB_PRODUCTS_CSV_MYSQL_PATH = "/var/lib/mysql-files/csv/WB_products_import.csv"
 WB_AD_LIST_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
@@ -2207,7 +2209,8 @@ SELECT
   ANY_VALUE(s.wb_api_brand)      AS wb_api_brand,
   MAX(su.orders_status)          AS orders_status,
   MAX(su.sales_status)           AS sales_status,
-  MAX(su.total_nmid_status)      AS total_nmid_status
+  MAX(su.total_nmid_status)      AS total_nmid_status,
+  MAX(su.paid_storage_status)    AS paid_storage_status
 FROM WB_products p
 LEFT JOIN WB_sellers         s  ON s.seller_id  = p.seller_id
 LEFT JOIN WB_sellers_updates su ON su.seller_id = p.seller_id
@@ -2280,6 +2283,86 @@ LEFT JOIN GS_RNP_ReportDetail AS d
        AND d.nmId      = p.nmID
        AND d.Date_order >= %s
        AND d.Date_order < %s
+"""
+
+TOTAL_NMID_FETCH_BY_SELLER_SQL = """
+SELECT
+    p.seller_id,
+    p.nmID,
+    p.vendorCode,
+    p.subjectName,
+    p.title,
+    p.photo,
+    COALESCE(s.wb_api_brand, '') AS wb_api_brand,
+    d.BC,
+    d.Size,
+    d.supplierArticle,
+    d.Subject,
+    d.id,
+    d.status,
+    d.srid_seller_sale_key,
+    d.Date_order,
+    d.Date_cancel,
+    d.date_sales,
+    d.date_return,
+    d.Warehouse,
+    d.Warehouse_type,
+    d.Country,
+    d.Okrug,
+    d.Region,
+    d.nmId                AS nmId_sale,
+    d.SPP,
+    d.TotalPrice,
+    d.Discount,
+    d.priceWithDisc,
+    d.finishedPrice,
+    d.gNumber,
+    d.srid,
+    d.orderType,
+    d.finishedPriceFact,
+    d.paymentSaleAmount,
+    d.forPay,
+    d.ComWBRub,
+    d.ComWBPercent,
+    d.Pur_price,
+    d.Logistics_toclient_cost,
+    d.Logistics_return_cost,
+    d.Pur_date
+FROM (
+    SELECT
+        seller_id,
+        nmID,
+        MIN(vendorCode)   AS vendorCode,
+        MIN(subjectName)  AS subjectName,
+        MIN(title)        AS title,
+        MIN(photo)        AS photo
+    FROM WB_products
+    WHERE seller_id = %s
+    GROUP BY seller_id, nmID
+) AS p
+LEFT JOIN WB_sellers AS s
+       ON s.seller_id = p.seller_id
+LEFT JOIN GS_RNP_ReportDetail AS d
+       ON  d.seller_id = p.seller_id
+       AND d.nmId      = p.nmID
+       AND d.Date_order >= %s
+       AND d.Date_order < %s
+"""
+
+TOTAL_NMID_STORAGE_FEE_BY_SELLER_SQL = """
+SELECT
+  seller_id,
+  nmId,
+  `date`,
+  warehousePrice,
+  barcodesCount,
+  size,
+  warehouse
+FROM WB_storage_fee
+WHERE seller_id = %s
+  AND `date` >= %s
+  AND `date` < %s
+ORDER BY nmId, `date`
 """
 
 TOTAL_NMID_STOCK_HISTORY_SQL = """
@@ -2367,6 +2450,52 @@ WHERE r.seller_id = %s
   AND r.nmid      = %s
 """
 
+TOTAL_NMID_FUNNEL_METRICS_SQL = """
+UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+JOIN (
+  SELECT
+      a.seller_id,
+      a.nmID                         AS nmid,
+      YEAR(a.dt)                     AS year,
+      MONTH(a.dt)                    AS month,
+      COALESCE((
+        SELECT JSON_ARRAYAGG(day_row)
+        FROM (
+          SELECT JSON_OBJECT(
+                   'date',                 DATE(a2.dt),
+                   'openCardCount',        a2.openCardCount,
+                   'addToCartCount',       a2.addToCartCount,
+                   'addToCartConversion',  a2.addToCartConversion,
+                   'ordersCount',          a2.ordersCount,
+                   'ordersSumRub',         a2.ordersSumRub,
+                   'cartToOrderConversion', a2.cartToOrderConversion,
+                   'buyoutsCount',         a2.buyoutsCount,
+                   'buyoutsSumRub',        a2.buyoutsSumRub,
+                   'buyoutPercent',        a2.buyoutPercent,
+                   'addToWishlistCount',   a2.addToWishlistCount  
+                 ) AS day_row
+          FROM WB_analytics a2
+          WHERE a2.seller_id = %s
+            AND a2.nmID      = %s
+            AND YEAR(a2.dt)  = YEAR(a.dt)
+            AND MONTH(a2.dt) = MONTH(a.dt)
+          ORDER BY a2.dt
+        ) AS ordered_rows
+      ), JSON_ARRAY()) AS funnel_json
+  FROM WB_analytics a
+  WHERE a.seller_id = %s
+    AND a.nmID      = %s
+  GROUP BY a.seller_id, a.nmID, YEAR(a.dt), MONTH(a.dt)
+) AS src
+  ON  r.seller_id = src.seller_id
+  AND r.nmid      = src.nmid
+  AND r.year      = src.year
+  AND r.month     = src.month
+SET r.funnel_metrics = src.funnel_json
+WHERE r.seller_id = %s
+  AND r.nmid      = %s
+"""
+
 
 def fetch_total_nmid_cards(
     cursor: mysql.connector.cursor.MySQLCursorDict,
@@ -2381,6 +2510,7 @@ def fetch_total_nmid_cards(
         card["orders_status"] = parse_json_field(card.get("orders_status"))
         card["sales_status"] = parse_json_field(card.get("sales_status"))
         card["total_nmid_status"] = parse_json_field(card.get("total_nmid_status"))
+        card["paid_storage_status"] = parse_json_field(card.get("paid_storage_status"))
         result.append(card)
     return result
 
@@ -2397,6 +2527,69 @@ def fetch_total_nmid_rows(
         (
             seller_id,
             nmid,
+            date_from,
+            date_to,
+        ),
+    )
+    return cursor.fetchall()
+
+
+def fetch_total_nmid_rows_by_seller(
+    cursor: mysql.connector.cursor.MySQLCursorDict,
+    seller_id: str,
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    """Выгружает все данные по селлеру за период (все артикулы одним запросом)"""
+    cursor.execute(
+        TOTAL_NMID_FETCH_BY_SELLER_SQL,
+        (
+            seller_id,
+            date_from,
+            date_to,
+        ),
+    )
+    return cursor.fetchall()
+
+
+def get_stock_history_date_range(
+    paid_storage_status: Optional[Dict],
+    today: date,
+) -> tuple[str, str]:
+    """
+    Определяет период для выгрузки WB_storage_fee на основе paid_storage_status.
+    Возвращает (date_from, date_to).
+    """
+    tomorrow = today + timedelta(days=1)
+    
+    if isinstance(paid_storage_status, dict):
+        max_begin_date = paid_storage_status.get("maxBeginDate")
+        if max_begin_date:
+            max_date = parse_ymd_date(max_begin_date)
+            if max_date:
+                # Берём от maxBeginDate до сегодня
+                date_from = first_day_of_month(max_date)
+                date_to = tomorrow.isoformat()
+                return (date_from.isoformat(), date_to)
+    
+    # Если нет maxBeginDate - берём последние 15 дней (с захватом полного месяца)
+    start_candidate = today - timedelta(days=15)
+    date_from = first_day_of_month(start_candidate)
+    date_to = tomorrow.isoformat()
+    return (date_from.isoformat(), date_to)
+
+
+def fetch_storage_fee_by_seller(
+    cursor: mysql.connector.cursor.MySQLCursorDict,
+    seller_id: str,
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    """Выгружает все строки WB_storage_fee по селлеру за период"""
+    cursor.execute(
+        TOTAL_NMID_STORAGE_FEE_BY_SELLER_SQL,
+        (
+            seller_id,
             date_from,
             date_to,
         ),
@@ -2474,6 +2667,20 @@ def _float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def normalize_date_value(value: Any) -> str:
+    """Нормализует значение даты в строку формата YYYY-MM-DD"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 def aggregate_total_nmid_rows(
     card: Dict,
     rows: List[Dict],
@@ -2495,18 +2702,6 @@ def aggregate_total_nmid_rows(
         range_end = range_start
 
     groups: Dict[Tuple[str, Any, int, int], Dict[str, Any]] = {}
-
-    def normalize_date_value(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if hasattr(value, "isoformat"):
-            try:
-                return value.isoformat()
-            except Exception:
-                return str(value)
-        return str(value)
 
     for row in rows:
         row_seller = row.get("seller_id") or seller_id
@@ -3136,6 +3331,275 @@ def create_stocks_report(token: str) -> Optional[str]:
         return None
 
 
+def aggregate_stock_history_rows(
+    storage_fee_rows: List[Dict],
+    existing_records: Dict[str, Dict],
+) -> List[Dict]:
+    """
+    Агрегирует строки WB_storage_fee по (seller_id, nmid, year, month)
+    и формирует stock_history JSON для каждого месяца.
+    
+    Args:
+        storage_fee_rows: список строк из WB_storage_fee
+        existing_records: словарь существующих записей из GS_RNP_ReportDetail_daily_nmid
+                          ключ: seller_nmid_month_year_key, значение: запись с year, month
+    
+    Returns:
+        список записей для обновления с полями:
+        - seller_nmid_month_year_key
+        - seller_id, nmid, year, month
+        - stock_history (JSON массив)
+    """
+    # Группировка: key = "seller_id|nmid|year|month"
+    groups: Dict[str, Dict] = {}
+    
+    for row in storage_fee_rows:
+        seller_id = str(row.get("seller_id") or "")
+        nmid = row.get("nmId")
+        if not seller_id or nmid is None:
+            continue
+        
+        date_str_raw = str(row.get("date") or "")[:10]
+        if not date_str_raw or len(date_str_raw) < 10:
+            continue
+        
+        try:
+            parts = date_str_raw.split("-")
+            if len(parts) != 3:
+                continue
+            year = int(parts[0])
+            month = int(parts[1])  # 1..12
+        except (ValueError, IndexError):
+            continue
+        
+        barcodes_count = _float_or_zero(row.get("barcodesCount"))
+        warehouse_price = _float_or_zero(row.get("warehousePrice"))
+        size = str(row.get("size") or "").strip()
+        warehouse_name = str(row.get("warehouse") or "").strip()
+        
+        group_key = f"{seller_id}|{nmid}|{year}|{month}"
+        
+        if group_key not in groups:
+            groups[group_key] = {
+                "seller_id": seller_id,
+                "nmid": nmid,
+                "year": year,
+                "month": month,
+                "_days": {},  # dateStr -> агрегат по дню
+            }
+        
+        group = groups[group_key]
+        
+        if date_str_raw not in group["_days"]:
+            group["_days"][date_str_raw] = {
+                "date": date_str_raw,
+                "stocks_cnt": 0.0,
+                "storage_fee": 0.0,
+                "_sizes": {},  # size -> stocks_cnt
+                "_warehouses": {},  # warehouse -> { warehouse, storage_fee, stocks_cnt }
+            }
+        
+        day = group["_days"][date_str_raw]
+        
+        # Общие по дню
+        day["stocks_cnt"] += barcodes_count
+        day["storage_fee"] += warehouse_price
+        
+        # Детализация по размерам
+        if size:
+            if size not in day["_sizes"]:
+                day["_sizes"][size] = 0.0
+            day["_sizes"][size] += barcodes_count
+        
+        # Детализация по складам
+        if warehouse_name:
+            if warehouse_name not in day["_warehouses"]:
+                day["_warehouses"][warehouse_name] = {
+                    "warehouse": warehouse_name,
+                    "storage_fee": 0.0,
+                    "stocks_cnt": 0.0,
+                }
+            wh = day["_warehouses"][warehouse_name]
+            wh["storage_fee"] += warehouse_price
+            wh["stocks_cnt"] += barcodes_count
+    
+    # Формируем финальный результат
+    aggregated = []
+    
+    for group_key, group in groups.items():
+        seller_id = group["seller_id"]
+        nmid = group["nmid"]
+        year = group["year"]
+        month = group["month"]
+        
+        seller_nmid_month_year_key = f"{seller_id}_{nmid}_{str(month).zfill(2)}_{year}"
+        
+        # Проверяем, есть ли такая запись в existing_records (только те месяцы, где есть продажи)
+        if seller_nmid_month_year_key not in existing_records:
+            continue
+        
+        day_keys = sorted(group["_days"].keys())  # сортировка по дате
+        stock_history = []
+        
+        for date_str in day_keys:
+            day = group["_days"][date_str]
+            
+            # sizes
+            sizes_arr = []
+            if day["_sizes"]:
+                for size_key in sorted(day["_sizes"].keys(), key=lambda x: str(x)):
+                    sizes_arr.append({
+                        "size": size_key,
+                        "stocks_cnt": int(day["_sizes"][size_key]),
+                    })
+            
+            # warehouses
+            warehouses_arr = []
+            if day["_warehouses"]:
+                for wh in sorted(day["_warehouses"].values(), key=lambda x: str(x.get("warehouse", ""))):
+                    warehouses_arr.append({
+                        "warehouse": wh["warehouse"],
+                        "storage_fee": float(wh["storage_fee"]),
+                        "stocks_cnt": int(wh["stocks_cnt"]),
+                    })
+            
+            day_obj: Dict[str, Any] = {
+                "date": day["date"],
+                "stocks_cnt": int(day["stocks_cnt"]),
+                "storage_fee": float(day["storage_fee"]),
+            }
+            
+            if sizes_arr:
+                day_obj["sizes"] = sizes_arr
+            
+            if warehouses_arr:
+                day_obj["warehouses"] = warehouses_arr
+            
+            stock_history.append(day_obj)
+        
+        aggregated.append({
+            "seller_nmid_month_year_key": seller_nmid_month_year_key,
+            "seller_id": seller_id,
+            "nmid": nmid,
+            "year": year,
+            "month": month,
+            "stock_history": stock_history,
+        })
+    
+    return aggregated
+
+
+def write_stock_history_csv(rows: List[Dict], path: str) -> None:
+    """Записывает агрегированные stock_history данные в CSV с Base64 кодированием JSON"""
+    import csv
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "seller_nmid_month_year_key",
+        "seller_id",
+        "nmid",
+        "year",
+        "month",
+        "stock_history",
+    ]
+
+    with target.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            # Кодируем stock_history в Base64, как для warehouses в STOCKS
+            stock_history = row.get("stock_history") or []
+            stock_history_base64 = None
+            if stock_history:
+                try:
+                    stock_history_json = json.dumps(stock_history, ensure_ascii=False, separators=(',', ':'))
+                    json.loads(stock_history_json)  # Проверка валидности
+                    stock_history_base64 = base64.b64encode(stock_history_json.encode("utf-8")).decode("ascii")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stock_history_base64 = None
+            
+            writer.writerow(
+                {
+                    "seller_nmid_month_year_key": row.get("seller_nmid_month_year_key"),
+                    "seller_id": row.get("seller_id"),
+                    "nmid": row.get("nmid"),
+                    "year": row.get("year"),
+                    "month": row.get("month"),
+                    "stock_history": stock_history_base64,
+                }
+            )
+
+
+def load_stock_history_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    """
+    UPSERT через временную таблицу для обновления stock_history:
+    1. Создаём временную таблицу
+    2. LOAD DATA INFILE во временную таблицу (быстро)
+    3. UPDATE из временной таблицы в целевую (обновляем только stock_history)
+    """
+    temp_table = "GS_RNP_ReportDetail_daily_nmid_stock_history_temp"
+    
+    try:
+        # 1. Создаём временную таблицу (только нужные поля)
+        cursor.execute(f"""
+            CREATE TEMPORARY TABLE {temp_table} (
+              seller_nmid_month_year_key VARCHAR(255) PRIMARY KEY,
+              seller_id VARCHAR(255),
+              nmid BIGINT,
+              year INT,
+              month INT,
+              stock_history JSON
+            )
+        """)
+        
+        # 2. Загружаем данные во временную таблицу через LOAD DATA INFILE
+        cursor.execute(f"""
+            LOAD DATA INFILE '{TOTAL_NMID_STOCK_HISTORY_CSV_MYSQL_PATH}'
+            INTO TABLE {temp_table}
+            CHARACTER SET utf8mb4
+            FIELDS TERMINATED BY ','
+            ENCLOSED BY '"'
+            LINES TERMINATED BY '\\n'
+            IGNORE 1 LINES
+            (
+              seller_nmid_month_year_key,
+              @seller_id,
+              @nmid,
+              @year,
+              @month,
+              @stock_history
+            )
+            SET
+              seller_id = NULLIF(@seller_id, ''),
+              nmid = NULLIF(@nmid, ''),
+              year = NULLIF(@year, ''),
+              month = NULLIF(@month, ''),
+              stock_history = CASE
+                WHEN @stock_history IS NULL OR @stock_history = '' THEN JSON_ARRAY()
+                WHEN JSON_VALID(CONVERT(FROM_BASE64(@stock_history) USING utf8mb4)) THEN CAST(CONVERT(FROM_BASE64(@stock_history) USING utf8mb4) AS JSON)
+                WHEN JSON_VALID(@stock_history) THEN CAST(@stock_history AS JSON)
+                WHEN JSON_VALID(REPLACE(@stock_history, '""', '"')) THEN CAST(REPLACE(@stock_history, '""', '"') AS JSON)
+                ELSE JSON_ARRAY()
+              END
+        """)
+        
+        # 3. UPDATE из временной таблицы в целевую (обновляем только stock_history)
+        cursor.execute(f"""
+            UPDATE GS_RNP_ReportDetail_daily_nmid AS r
+            INNER JOIN {temp_table} AS t
+              ON r.seller_nmid_month_year_key = t.seller_nmid_month_year_key
+            SET r.stock_history = t.stock_history
+        """)
+        
+        # 4. Временная таблица удалится автоматически при закрытии соединения
+        
+    except Error as exc:
+        raise RuntimeError(f"UPSERT via temp table for stock_history failed: {exc}") from exc
+
+
 def write_total_nmid_csv(rows: List[Dict], path: str) -> None:
     import csv
     from pathlib import Path
@@ -3190,12 +3654,25 @@ def write_total_nmid_csv(rows: List[Dict], path: str) -> None:
 
 
 def load_total_nmid_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
+    """
+    UPSERT через временную таблицу для сохранения stock_history и stock_today:
+    1. Создаём временную таблицу
+    2. LOAD DATA INFILE во временную таблицу (быстро)
+    3. INSERT ... ON DUPLICATE KEY UPDATE из временной в целевую
+       (обновляем только day_metrics и метаданные, сохраняем stock_history и stock_today)
+    """
+    temp_table = "GS_RNP_ReportDetail_daily_nmid_temp"
+    
     try:
-        cursor.execute(
-            f"""
+        # 1. Создаём временную таблицу (копия структуры целевой)
+        cursor.execute(f"""
+            CREATE TEMPORARY TABLE {temp_table} LIKE GS_RNP_ReportDetail_daily_nmid
+        """)
+        
+        # 2. Загружаем данные во временную таблицу через LOAD DATA INFILE (быстро!)
+        cursor.execute(f"""
             LOAD DATA INFILE '{TOTAL_NMID_CSV_MYSQL_PATH}'
-            REPLACE
-            INTO TABLE GS_RNP_ReportDetail_daily_nmid
+            INTO TABLE {temp_table}
             CHARACTER SET utf8mb4
             FIELDS TERMINATED BY ','
             ENCLOSED BY '"'
@@ -3234,10 +3711,31 @@ def load_total_nmid_into_db(cursor: mysql.connector.cursor.MySQLCursor) -> None:
                 WHEN JSON_VALID(REPLACE(@day_metrics, '""', '"')) THEN CAST(REPLACE(@day_metrics, '""', '"') AS JSON)
                 ELSE JSON_ARRAY()
               END
-            """
-        )
+        """)
+        
+        # 3. UPSERT из временной таблицы в целевую
+        # Обновляем только day_metrics и метаданные, сохраняем stock_history и stock_today
+        cursor.execute(f"""
+            INSERT INTO GS_RNP_ReportDetail_daily_nmid
+            SELECT * FROM {temp_table}
+            ON DUPLICATE KEY UPDATE
+              seller_id = VALUES(seller_id),
+              wb_api_brand = VALUES(wb_api_brand),
+              nmid = VALUES(nmid),
+              month = VALUES(month),
+              year = VALUES(year),
+              title = VALUES(title),
+              photo = VALUES(photo),
+              Subject = VALUES(Subject),
+              supplierArticle = VALUES(supplierArticle),
+              day_metrics = VALUES(day_metrics)
+              -- stock_history и stock_today НЕ обновляем - они заполняются в следующих циклах
+        """)
+        
+        # 4. Временная таблица удалится автоматически при закрытии соединения
+        
     except Error as exc:
-        raise RuntimeError(f"LOAD DATA INFILE for total nmid failed: {exc}") from exc
+        raise RuntimeError(f"UPSERT via temp table for total nmid failed: {exc}") from exc
 
 
 def update_stock_history_for_card(
@@ -3279,6 +3777,26 @@ def update_stock_today_for_card(
         return cursor.rowcount
     except Error as exc:
         raise RuntimeError(f"UPDATE stock_today failed for seller_id={seller_id}, nmid={nmid}: {exc}") from exc
+
+
+def update_funnel_metrics_for_card(
+    cursor: mysql.connector.cursor.MySQLCursor,
+    seller_id: str,
+    nmid: Any,
+) -> int:
+    """Обновляет funnel_metrics для одного артикула (seller_id + nmid)"""
+    try:
+        cursor.execute(
+            TOTAL_NMID_FUNNEL_METRICS_SQL,
+            (
+                seller_id, nmid,  # для WHERE в подзапросе WB_analytics (a2)
+                seller_id, nmid,  # для WHERE в основном запросе WB_analytics (a)
+                seller_id, nmid,  # для WHERE в UPDATE
+            ),
+        )
+        return cursor.rowcount
+    except Error as exc:
+        raise RuntimeError(f"UPDATE funnel_metrics failed for seller_id={seller_id}, nmid={nmid}: {exc}") from exc
 
 
 def check_stocks_status(task_id: str, token: str) -> Optional[str]:
@@ -6785,6 +7303,11 @@ def main() -> int:
             # Сохраняем cards для использования во втором цикле (stock_history)
             total_cards_by_seller[seller_id] = cards
 
+            # Оптимизация: собираем все чанки для всех артикулов, затем делаем один запрос по селлеру
+            cards_with_chunks: List[Tuple[Dict, List[Dict]]] = []
+            seller_min_date_from: Optional[str] = None
+            seller_max_date_to: Optional[str] = None
+            
             for card in cards:
                 card_nmid = card.get("nmid") or card.get("nmID")
                 if card_nmid is None:
@@ -6806,47 +7329,87 @@ def main() -> int:
                 if not chunks:
                     continue
                 total_summary[seller_id]["cards"] += 1
-
-                # Собираем все строки для одного nmid по всем чанкам (как в n8n)
-                all_rows_for_card: List[Dict] = []
-                min_date_from: Optional[str] = None
-                max_date_to: Optional[str] = None
+                cards_with_chunks.append((card_meta, chunks))
                 
+                # Определяем общий период для селлера
                 for chunk in chunks:
                     date_from = chunk["date_from"]
                     date_to = chunk["date_to"]
-                    if min_date_from is None or date_from < min_date_from:
-                        min_date_from = date_from
-                    if max_date_to is None or date_to > max_date_to:
-                        max_date_to = date_to
+                    if seller_min_date_from is None or date_from < seller_min_date_from:
+                        seller_min_date_from = date_from
+                    if seller_max_date_to is None or date_to > seller_max_date_to:
+                        seller_max_date_to = date_to
+
+            # Один запрос по селлеру за весь период (все артикулы сразу)
+            if cards_with_chunks and seller_min_date_from and seller_max_date_to:
+                try:
+                    all_seller_rows = fetch_total_nmid_rows_by_seller(
+                        cursor_dict, seller_id, seller_min_date_from, seller_max_date_to
+                    )
+                    print(
+                        f"[WB-bot] TOTAL: выгружено {len(all_seller_rows)} строк для {brand} за период {seller_min_date_from}→{seller_max_date_to}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    error_line = f"{brand} | fetch_rows_by_seller {seller_min_date_from}→{seller_max_date_to} | {exc}"
+                    total_errors.append(error_line)
+                    print(f"[WB-bot] Ошибка TOTAL (fetch rows by seller): {error_line}", file=sys.stderr, flush=True)
+                    continue
+                
+                # Группируем данные по nmID в Python
+                rows_by_nmid: Dict[Any, List[Dict]] = {}
+                for row in all_seller_rows:
+                    row_nmid = row.get("nmID") or row.get("nmid") or row.get("nmId_sale")
+                    if row_nmid:
+                        if row_nmid not in rows_by_nmid:
+                            rows_by_nmid[row_nmid] = []
+                        rows_by_nmid[row_nmid].append(row)
+                
+                # Обрабатываем каждый артикул с его чанками
+                for card_meta, chunks in cards_with_chunks:
+                    card_nmid = card_meta["nmid"]
+                    card_rows = rows_by_nmid.get(card_nmid, [])
                     
-                    try:
-                        rows = fetch_total_nmid_rows(cursor_dict, seller_id, card_nmid, date_from, date_to)
-                        all_rows_for_card.extend(rows)
-                    except Exception as exc:
-                        error_line = (
-                            f"{brand} | nmID:{card_nmid} | fetch_rows {date_from}→{date_to} | {exc}"
-                        )
-                        total_errors.append(error_line)
-                        print(f"[WB-bot] Ошибка TOTAL (fetch rows): {error_line}", file=sys.stderr, flush=True)
-                        continue
-                    total_chunks += 1
+                    # Фильтруем строки по чанкам артикула
+                    all_rows_for_card: List[Dict] = []
+                    min_date_from: Optional[str] = None
+                    max_date_to: Optional[str] = None
+                    
+                    for chunk in chunks:
+                        date_from = chunk["date_from"]
+                        date_to = chunk["date_to"]
+                        if min_date_from is None or date_from < min_date_from:
+                            min_date_from = date_from
+                        if max_date_to is None or date_to > max_date_to:
+                            max_date_to = date_to
+                        
+                        # Фильтруем строки по периоду чанка
+                        for row in card_rows:
+                            date_order = row.get("Date_order")
+                            if date_order:
+                                date_order_str = normalize_date_value(date_order)
+                                # Сравниваем только дату (первые 10 символов YYYY-MM-DD)
+                                date_order_ymd = date_order_str[:10] if len(date_order_str) >= 10 else date_order_str
+                                if date_order_ymd >= date_from and date_order_ymd < date_to:
+                                    all_rows_for_card.append(row)
+                    
+                    total_chunks += len(chunks)
 
-                # Агрегируем все строки разом (как в n8n)
-                if all_rows_for_card and min_date_from and max_date_to:
-                    try:
-                        aggregated = aggregate_total_nmid_rows(card_meta, all_rows_for_card, min_date_from, max_date_to)
-                    except Exception as exc:
-                        error_line = (
-                            f"{brand} | nmID:{card_nmid} | aggregate | {exc}"
-                        )
-                        total_errors.append(error_line)
-                        print(f"[WB-bot] Ошибка TOTAL (aggregate): {error_line}", file=sys.stderr, flush=True)
-                        continue
+                    # Агрегируем все строки разом (как в n8n)
+                    if all_rows_for_card and min_date_from and max_date_to:
+                        try:
+                            aggregated = aggregate_total_nmid_rows(card_meta, all_rows_for_card, min_date_from, max_date_to)
+                        except Exception as exc:
+                            error_line = (
+                                f"{brand} | nmID:{card_nmid} | aggregate | {exc}"
+                            )
+                            total_errors.append(error_line)
+                            print(f"[WB-bot] Ошибка TOTAL (aggregate): {error_line}", file=sys.stderr, flush=True)
+                            continue
 
-                    if aggregated:
-                        total_outputs.extend(aggregated)
-                        total_summary[seller_id]["months"] += len(aggregated)
+                        if aggregated:
+                            total_outputs.extend(aggregated)
+                            total_summary[seller_id]["months"] += len(aggregated)
 
         total_db_loaded = False
         if total_outputs:
@@ -6868,7 +7431,8 @@ def main() -> int:
                     "<b>⚡️ Сводная</b>\n"
                     "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                     "▫️ 2. Подсчёт истории остатков\n"
-                    "▫️ 3. Подсчёт текущих остатков</blockquote>"
+                    "▫️ 3. Подсчёт текущих остатков\n"
+                    "▫️ 4. Подсчёт воронки</blockquote>"
                 )
                 stage_msg_reply = send_to_telegram(stage1_message)
                 stage_msg_id: Optional[int] = None
@@ -6876,31 +7440,75 @@ def main() -> int:
                     result = stage_msg_reply.get("result") or {}
                     stage_msg_id = result.get("message_id")
                 
-                # Второй цикл: подсчёт истории остатков (stock_history)
+                # Второй цикл: подсчёт истории остатков (stock_history) - оптимизированная версия
                 if total_cards_by_seller:
                     stock_history_updated = 0
                     stock_history_errors: List[str] = []
+                    all_aggregated: List[Dict] = []
                     
                     for seller_id, cards in total_cards_by_seller.items():
                         brand = total_summary.get(seller_id, {}).get("brand", seller_id)
                         
-                        for card in cards:
-                            card_nmid = card.get("nmid") or card.get("nmID")
-                            if card_nmid is None:
+                        if not cards:
+                            continue
+                        
+                        # Получаем paid_storage_status из первой карточки (они все одинаковые для селлера)
+                        paid_storage_status = cards[0].get("paid_storage_status")
+                        
+                        # Определяем период для stock_history
+                        date_from, date_to = get_stock_history_date_range(paid_storage_status, today_date)
+                        
+                        try:
+                            # Выгружаем все строки WB_storage_fee по селлеру за период
+                            storage_fee_rows = fetch_storage_fee_by_seller(
+                                cursor_dict, seller_id, date_from, date_to
+                            )
+                            print(
+                                f"[WB-bot] TOTAL: выгружено {len(storage_fee_rows)} строк WB_storage_fee для {brand} за период {date_from}→{date_to}",
+                                flush=True,
+                            )
+                            
+                            if not storage_fee_rows:
                                 continue
                             
-                            try:
-                                affected = update_stock_history_for_card(cursor, seller_id, card_nmid)
-                                if affected > 0:
-                                    stock_history_updated += affected
-                            except Exception as exc:
-                                error_line = f"{brand} | nmID:{card_nmid} | stock_history | {exc}"
-                                stock_history_errors.append(error_line)
-                                print(f"[WB-bot] Ошибка TOTAL (stock_history): {error_line}", file=sys.stderr, flush=True)
+                            # Получаем существующие записи из GS_RNP_ReportDetail_daily_nmid
+                            # (чтобы обновлять только те месяцы, где есть продажи)
+                            cursor_dict.execute("""
+                                SELECT seller_nmid_month_year_key, year, month
+                                FROM GS_RNP_ReportDetail_daily_nmid
+                                WHERE seller_id = %s
+                            """, (seller_id,))
+                            existing_records = {
+                                row["seller_nmid_month_year_key"]: row
+                                for row in cursor_dict.fetchall()
+                            }
+                            
+                            # Агрегируем данные
+                            aggregated = aggregate_stock_history_rows(storage_fee_rows, existing_records)
+                            
+                            if aggregated:
+                                all_aggregated.extend(aggregated)
+                                print(
+                                    f"[WB-bot] TOTAL: агрегировано stock_history для {len(aggregated)} записей ({brand})",
+                                    flush=True,
+                                )
+                        except Exception as exc:
+                            error_line = f"{brand} | stock_history | {exc}"
+                            stock_history_errors.append(error_line)
+                            print(f"[WB-bot] Ошибка TOTAL (stock_history): {error_line}", file=sys.stderr, flush=True)
                     
-                    if stock_history_updated > 0:
-                        connection.commit()
-                        print(f"[WB-bot] TOTAL: обновлено stock_history для {stock_history_updated} записей.", flush=True)
+                    # Записываем все данные в CSV и загружаем в БД одним запросом
+                    if all_aggregated:
+                        try:
+                            write_stock_history_csv(all_aggregated, TOTAL_NMID_STOCK_HISTORY_CSV_HOST_PATH)
+                            load_stock_history_into_db(cursor)
+                            connection.commit()
+                            stock_history_updated = len(all_aggregated)
+                            print(f"[WB-bot] TOTAL: обновлено stock_history для {stock_history_updated} записей (всего).", flush=True)
+                        except Exception as exc:
+                            error_line = f"stock_history CSV/DB | {exc}"
+                            stock_history_errors.append(error_line)
+                            print(f"[WB-bot] Ошибка TOTAL (stock_history CSV/DB): {error_line}", file=sys.stderr, flush=True)
                     
                     if stock_history_errors:
                         errors_text = html.escape("\n".join(stock_history_errors))
@@ -6916,7 +7524,8 @@ def main() -> int:
                         "<b>⚡️ Сводная</b>\n"
                         "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                         "☑️ 2. Подсчёт истории остатков\n"
-                        "▫️ 3. Подсчёт текущих остатков</blockquote>"
+                        "▫️ 3. Подсчёт текущих остатков\n"
+                        "▫️ 4. Подсчёт воронки</blockquote>"
                     )
                     if stage_msg_id is not None:
                         try:
@@ -6965,7 +7574,8 @@ def main() -> int:
                         "<b>⚡️ Сводная</b>\n"
                         "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
                         "☑️ 2. Подсчёт истории остатков\n"
-                        "☑️ 3. Подсчёт текущих остатков</blockquote>"
+                        "☑️ 3. Подсчёт текущих остатков\n"
+                        "▫️ 4. Подсчёт воронки</blockquote>"
                     )
                     if stage_msg_id is not None:
                         try:
@@ -6974,6 +7584,56 @@ def main() -> int:
                             pass
                     else:
                         send_to_telegram(stage3_message)
+                    
+                    # Четвёртый цикл: подсчёт воронки (funnel_metrics)
+                    funnel_metrics_updated = 0
+                    funnel_metrics_errors: List[str] = []
+                    
+                    for seller_id, cards in total_cards_by_seller.items():
+                        brand = total_summary.get(seller_id, {}).get("brand", seller_id)
+                        
+                        for card in cards:
+                            card_nmid = card.get("nmid") or card.get("nmID")
+                            if card_nmid is None:
+                                continue
+                            
+                            try:
+                                affected = update_funnel_metrics_for_card(cursor, seller_id, card_nmid)
+                                if affected > 0:
+                                    funnel_metrics_updated += affected
+                            except Exception as exc:
+                                error_line = f"{brand} | nmID:{card_nmid} | funnel_metrics | {exc}"
+                                funnel_metrics_errors.append(error_line)
+                                print(f"[WB-bot] Ошибка TOTAL (funnel_metrics): {error_line}", file=sys.stderr, flush=True)
+                    
+                    if funnel_metrics_updated > 0:
+                        connection.commit()
+                        print(f"[WB-bot] TOTAL: обновлено funnel_metrics для {funnel_metrics_updated} записей.", flush=True)
+                    
+                    if funnel_metrics_errors:
+                        errors_text = html.escape("\n".join(funnel_metrics_errors))
+                        funnel_error_message = (
+                            "<b>⚡️ Сводная</b>\n"
+                            "<blockquote><b>Ошибки при обновлении funnel_metrics</b>\n"
+                            f"<code>{errors_text}</code></blockquote>"
+                        )
+                        send_to_telegram(funnel_error_message)
+                    
+                    # Редактируем сообщение о завершении четвёртого этапа
+                    stage4_message = (
+                        "<b>⚡️ Сводная</b>\n"
+                        "<blockquote>☑️ 1. Подсчёт day_metrics для nmid\n"
+                        "☑️ 2. Подсчёт истории остатков\n"
+                        "☑️ 3. Подсчёт текущих остатков\n"
+                        "☑️ 4. Подсчёт воронки</blockquote>"
+                    )
+                    if stage_msg_id is not None:
+                        try:
+                            edit_telegram_message(stage_msg_id, stage4_message)
+                        except Exception:
+                            pass
+                    else:
+                        send_to_telegram(stage4_message)
             except Exception as db_err:
                 print(f"[WB-bot] Ошибка LOAD DATA для TOTAL: {db_err}", file=sys.stderr, flush=True)
                 error_line = f"Ошибка загрузки данных в GS_RNP_ReportDetail_daily_nmid: {db_err}"
